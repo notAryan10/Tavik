@@ -1,0 +1,21 @@
+[package]
+name = "tavik-common"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+bytes.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+futures-util.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

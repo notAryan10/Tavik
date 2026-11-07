@@ -1,0 +1,28 @@
+[package]
+name = "tavik-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tavik"
+path = "src/main.rs"
+
+[dependencies]
+tavik-common.workspace = true
+tavik-daemon.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

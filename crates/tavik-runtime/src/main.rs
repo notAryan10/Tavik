@@ -63,6 +63,17 @@ enum Commands {
 
     /// Output a standard default OCI spec (config.json)
     Spec,
+
+    /// Internal container init entrypoint
+    #[command(name = "init")]
+    Init {
+        /// Container identifier
+        id: String,
+
+        /// State directory
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
 }
 
 fn parse_signal(sig: &str) -> i32 {
@@ -120,6 +131,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Spec => {
             let spec = Spec::default_linux();
             println!("{}", serde_json::to_string_pretty(&spec)?);
+        }
+        Commands::Init { id, state_dir } => {
+            if let Err(e) = tavik_runtime::init::run_init_trampoline(&state_dir, &id) {
+                eprintln!("tavikr init error: {}", e);
+                std::process::exit(1);
+            }
         }
     }
 

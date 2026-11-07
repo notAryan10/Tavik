@@ -1,0 +1,362 @@
+#[cfg(target_os = "linux")]
+use crate::spec::{ContainerState, ContainerStatus, Spec};
+#[cfg(target_os = "linux")]
+use std::fs;
+use std::path::Path;
+use tavik_common::error::{Result, TavikError};
+
+#[cfg(target_os = "linux")]
+pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
+    use std::ffi::CString;
+
+    let container_dir = state_dir.join(id);
+    let start_fifo_path = container_dir.join("start.fifo");
+    let pid_file = container_dir.join("container.pid");
+
+    let state_file = container_dir.join("state.json");
+    let state_json = fs::read_to_string(&state_file).map_err(|e| {
+        TavikError::Io(format!(
+            "Failed to read state file at {:?}: {}",
+            state_file, e
+        ))
+    })?;
+    let state: ContainerState = serde_json::from_str(&state_json)?;
+    let spec = Spec::load_from_bundle(&state.bundle)?;
+
+    // 1. Prepare start FIFO for future start signal
+    if start_fifo_path.exists() {
+        let _ = fs::remove_file(&start_fifo_path);
+    }
+    let c_fifo = CString::new(start_fifo_path.to_str().unwrap()).unwrap();
+    let fifo_res = unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) };
+    if fifo_res != 0 {
+        return Err(TavikError::Io(format!(
+            "Failed to create start FIFO at {:?}: {}",
+            start_fifo_path,
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    // 2. Prepare ready pipe for synchronous handshake between child init and trampoline
+    let mut ready_pipe = [0i32; 2];
+    if unsafe { libc::pipe(ready_pipe.as_mut_ptr()) } != 0 {
+        return Err(TavikError::Io(format!(
+            "Failed to create ready pipe: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    // 3. Unshare PID namespace in trampoline process
+    // Note: Calling unshare(CLONE_NEWPID) puts the NEXT child into the new PID namespace!
+    if unsafe { libc::unshare(libc::CLONE_NEWPID) } != 0 {
+        return Err(TavikError::Execution(format!(
+            "Failed to unshare PID namespace in trampoline: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    // 4. Fork container init process (this child is PID 1 in the new PID namespace!)
+    let child_pid = unsafe { libc::fork() };
+    if child_pid < 0 {
+        return Err(TavikError::Io(format!(
+            "Failed to fork container init child: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    if child_pid == 0 {
+        // --- CHILD PROCESS (PID 1 in new PID namespace) ---
+        unsafe {
+            libc::close(ready_pipe[0]); // Close read end in child
+        }
+        if let Err(e) =
+            run_container_init_child(&spec, &state.bundle, ready_pipe[1], &start_fifo_path)
+        {
+            eprintln!("[tavikr init child error] {}", e);
+            unsafe { libc::_exit(1) };
+        }
+        unsafe { libc::_exit(0) };
+    }
+
+    // --- TRAMPOLINE PARENT PROCESS ---
+    unsafe {
+        libc::close(ready_pipe[1]); // Close write end in parent
+    }
+
+    // Wait for child to signal readiness over pipe
+    let mut buf = [0u8; 16];
+    let n = unsafe {
+        libc::read(
+            ready_pipe[0],
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+        )
+    };
+    unsafe {
+        libc::close(ready_pipe[0]);
+    }
+
+    if n <= 0 || &buf[..n as usize] != b"ready\n" {
+        return Err(TavikError::Execution(format!(
+            "Container init child failed to signal readiness: {:?}",
+            if n > 0 { &buf[..n as usize] } else { &[] }
+        )));
+    }
+
+    // Record host PID and update state to Created
+    fs::write(&pid_file, child_pid.to_string()).map_err(|e| {
+        TavikError::Io(format!("Failed to write pid_file at {:?}: {}", pid_file, e))
+    })?;
+
+    let mut updated_state = state;
+    updated_state.status = ContainerStatus::Created;
+    updated_state.pid = Some(child_pid as u32);
+    let json = serde_json::to_string_pretty(&updated_state)?;
+    fs::write(&state_file, json).map_err(|e| {
+        TavikError::Io(format!(
+            "Failed to write state_file at {:?}: {}",
+            state_file, e
+        ))
+    })?;
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn run_container_init_child(
+    spec: &Spec,
+    bundle: &Path,
+    ready_pipe_write_fd: i32,
+    start_fifo_path: &Path,
+) -> Result<()> {
+    use std::ffi::CString;
+    use std::path::PathBuf;
+
+    // 1. Open start FIFO with O_RDWR before pivot_root so open does not block
+    let c_fifo = CString::new(start_fifo_path.to_str().unwrap()).unwrap();
+    let fifo_fd = unsafe { libc::open(c_fifo.as_ptr(), libc::O_RDWR) };
+    if fifo_fd < 0 {
+        return Err(TavikError::Io(format!(
+            "Failed to open start FIFO in child: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    // 2. Unshare Mount, UTS, IPC, Network namespaces for the container
+    let mut child_flags = libc::CLONE_NEWNS;
+    if let Some(linux) = &spec.linux {
+        for ns in &linux.namespaces {
+            match ns.ns_type {
+                crate::spec::LinuxNamespaceType::Ipc => child_flags |= libc::CLONE_NEWIPC,
+                crate::spec::LinuxNamespaceType::Uts => child_flags |= libc::CLONE_NEWUTS,
+                crate::spec::LinuxNamespaceType::Network => child_flags |= libc::CLONE_NEWNET,
+                _ => {}
+            }
+        }
+    }
+    if unsafe { libc::unshare(child_flags) } != 0 {
+        return Err(TavikError::Execution(format!(
+            "Failed to unshare container namespaces in child: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    // 3. Set Hostname
+    if let Some(hostname) = &spec.hostname {
+        let c_host = CString::new(hostname.as_str()).unwrap();
+        unsafe {
+            libc::sethostname(c_host.as_ptr(), hostname.len());
+        }
+    }
+
+    // 3. Make mount namespace recursively private
+    let slash = CString::new("/").unwrap();
+    unsafe {
+        if libc::mount(
+            std::ptr::null(),
+            slash.as_ptr(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE,
+            std::ptr::null(),
+        ) != 0
+        {
+            return Err(TavikError::Execution(format!(
+                "Failed to make mount namespace private: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+
+    // 4. Resolve rootfs and bind mount it to itself
+    let root = spec
+        .root
+        .as_ref()
+        .ok_or_else(|| TavikError::Config("Spec missing rootfs definition".to_string()))?;
+    let rootfs_path = if Path::new(&root.path).is_absolute() {
+        PathBuf::from(&root.path)
+    } else {
+        bundle.join(&root.path)
+    };
+
+    let c_rootfs = CString::new(rootfs_path.to_str().unwrap()).unwrap();
+    unsafe {
+        if libc::mount(
+            c_rootfs.as_ptr(),
+            c_rootfs.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND | libc::MS_REC,
+            std::ptr::null(),
+        ) != 0
+        {
+            return Err(TavikError::Execution(format!(
+                "Failed to bind mount rootfs to itself: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+
+    // 5. Mount proc inside container rootfs
+    let proc_target = rootfs_path.join("proc");
+    let _ = fs::create_dir_all(&proc_target);
+    let c_proc_target = CString::new(proc_target.to_str().unwrap()).unwrap();
+    let proc_type = CString::new("proc").unwrap();
+    unsafe {
+        libc::mount(
+            proc_type.as_ptr(),
+            c_proc_target.as_ptr(),
+            proc_type.as_ptr(),
+            libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV,
+            std::ptr::null(),
+        );
+    }
+
+    // 6. pivot_root
+    let old_root_rel = ".pivot_root";
+    let old_root_path = rootfs_path.join(old_root_rel);
+    let _ = fs::create_dir_all(&old_root_path);
+    let c_old_root = CString::new(old_root_path.to_str().unwrap()).unwrap();
+
+    unsafe {
+        let ret = libc::syscall(libc::SYS_pivot_root, c_rootfs.as_ptr(), c_old_root.as_ptr());
+        if ret != 0 {
+            return Err(TavikError::Execution(format!(
+                "pivot_root failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        // Chdir to new root
+        if libc::chdir(slash.as_ptr()) != 0 {
+            return Err(TavikError::Execution(format!(
+                "chdir to new root failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        // Unmount old root
+        let old_root_unmount = CString::new(format!("/{}", old_root_rel)).unwrap();
+        if libc::umount2(old_root_unmount.as_ptr(), libc::MNT_DETACH) != 0 {
+            return Err(TavikError::Execution(format!(
+                "umount2 old root failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let _ = libc::rmdir(old_root_unmount.as_ptr());
+    }
+
+    // 7. Security: set PR_SET_NO_NEW_PRIVS
+    let proc = spec
+        .process
+        .as_ref()
+        .ok_or_else(|| TavikError::Config("Spec missing process definition".to_string()))?;
+
+    if proc.no_new_privileges {
+        unsafe {
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                return Err(TavikError::Execution(format!(
+                    "Failed to set PR_SET_NO_NEW_PRIVS: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+        }
+    }
+
+    // 8. Change working directory
+    let c_cwd = CString::new(proc.cwd.as_str()).unwrap_or_else(|_| slash.clone());
+    unsafe {
+        libc::chdir(c_cwd.as_ptr());
+    }
+
+    // 9. Signal readiness to trampoline
+    unsafe {
+        libc::write(
+            ready_pipe_write_fd,
+            b"ready\n".as_ptr() as *const libc::c_void,
+            6,
+        );
+        libc::close(ready_pipe_write_fd);
+    }
+
+    // 10. Block waiting for start signal on start FIFO
+    let mut start_buf = [0u8; 1];
+    let n = unsafe { libc::read(fifo_fd, start_buf.as_mut_ptr() as *mut libc::c_void, 1) };
+    unsafe {
+        libc::close(fifo_fd);
+    }
+
+    if n <= 0 {
+        return Err(TavikError::Execution(
+            "Start FIFO closed without receiving start signal".to_string(),
+        ));
+    }
+
+    // 11. File descriptor sanitization: close fds >= 3
+    unsafe {
+        libc::close_range(3, !0u32, 0);
+    }
+
+    // 12. Set user UID/GID if specified
+    if proc.user.gid > 0 {
+        unsafe {
+            libc::setgid(proc.user.gid as libc::gid_t);
+        }
+    }
+    if proc.user.uid > 0 {
+        unsafe {
+            libc::setuid(proc.user.uid as libc::uid_t);
+        }
+    }
+
+    // 13. execve entrypoint
+    let c_args: Vec<CString> = proc
+        .args
+        .iter()
+        .map(|s| CString::new(s.as_str()).unwrap())
+        .collect();
+    let mut c_args_ptrs: Vec<*const libc::c_char> = c_args.iter().map(|s| s.as_ptr()).collect();
+    c_args_ptrs.push(std::ptr::null());
+
+    let c_envs: Vec<CString> = proc
+        .env
+        .iter()
+        .map(|s| CString::new(s.as_str()).unwrap())
+        .collect();
+    let mut c_envs_ptrs: Vec<*const libc::c_char> = c_envs.iter().map(|s| s.as_ptr()).collect();
+    c_envs_ptrs.push(std::ptr::null());
+
+    unsafe {
+        libc::execve(c_args_ptrs[0], c_args_ptrs.as_ptr(), c_envs_ptrs.as_ptr());
+    }
+
+    Err(TavikError::Execution(format!(
+        "Failed to execve container entrypoint: {}",
+        std::io::Error::last_os_error()
+    )))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn run_init_trampoline(_state_dir: &Path, _id: &str) -> Result<()> {
+    Err(TavikError::Unsupported(
+        "Container init trampoline requires Linux".to_string(),
+    ))
+}

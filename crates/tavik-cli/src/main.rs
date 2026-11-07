@@ -62,7 +62,7 @@ enum Commands {
         id: String,
 
         /// Custom termination signal number (e.g. 15 for SIGTERM, 9 for SIGKILL)
-        #[arg(short, long)]
+        #[arg(short = 'S', long)]
         signal: Option<i32>,
     },
 

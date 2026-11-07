@@ -2,6 +2,7 @@ use crate::spec::{ContainerState, ContainerStatus, Spec};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tavik_common::error::{Result, TavikError};
+#[allow(unused_imports)]
 use tracing::{info, warn};
 
 pub struct ContainerExecutor {
@@ -194,58 +195,38 @@ impl ContainerExecutor {
     fn platform_create(
         &self,
         id: &str,
-        spec: &Spec,
-        bundle: &Path,
-        mut state: ContainerState,
+        _spec: &Spec,
+        _bundle: &Path,
+        _state: ContainerState,
     ) -> Result<ContainerState> {
-        use std::os::unix::net::UnixDatagram;
+        let state_dir_str = self.state_dir.to_str().ok_or_else(|| {
+            TavikError::Config("Invalid UTF-8 in state directory path".to_string())
+        })?;
 
-        // Create socketpair for synchronization between parent runtime and child container init
-        let (parent_sock, child_sock) = UnixDatagram::pair()
-            .map_err(|e| TavikError::Io(format!("Failed to create IPC sync socketpair: {}", e)))?;
+        if let Some(tavikr_bin) = find_tavikr_binary() {
+            info!(
+                "Launching container init via dedicated helper: {:?}",
+                tavikr_bin
+            );
+            let status = std::process::Command::new(tavikr_bin)
+                .args(["init", "--state-dir", state_dir_str, id])
+                .status()
+                .map_err(|e| {
+                    TavikError::Execution(format!("Failed to spawn tavikr init helper: {}", e))
+                })?;
 
-        let sync_dir = self.container_dir(id);
-        let pid_file = sync_dir.join("container.pid");
-
-        let pid = unsafe { libc::fork() };
-        if pid < 0 {
-            return Err(TavikError::Io(format!(
-                "Failed to fork container process: {}",
-                std::io::Error::last_os_error()
-            )));
+            if !status.success() {
+                return Err(TavikError::Execution(format!(
+                    "tavikr init failed with exit status: {:?}",
+                    status
+                )));
+            }
+        } else {
+            info!("Executing in-process container init trampoline");
+            crate::init::run_init_trampoline(&self.state_dir, id)?;
         }
 
-        if pid == 0 {
-            // In child process: configure isolation namespaces and enter jail
-            drop(parent_sock);
-            if let Err(e) = run_container_child(spec, bundle, child_sock) {
-                eprintln!("[tavikr init error] {}", e);
-                unsafe { libc::_exit(1) };
-            }
-            unsafe { libc::_exit(0) };
-        }
-
-        // In parent runtime process:
-        drop(child_sock);
-
-        // Wait for child init process to signal it is prepared inside namespaces
-        let mut buf = [0u8; 16];
-        match parent_sock.recv(&mut buf) {
-            Ok(n) if n > 0 && &buf[..n] == b"ready" => {
-                info!("Container init PID {} reported ready in namespaces", pid);
-            }
-            Ok(_) | Err(_) => {
-                return Err(TavikError::Execution(
-                    "Container child failed to signal readiness".to_string(),
-                ));
-            }
-        }
-
-        fs::write(&pid_file, pid.to_string())?;
-
-        state.pid = Some(pid as u32);
-        state.status = ContainerStatus::Created;
-        Ok(state)
+        self.load_state(id)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -265,20 +246,28 @@ impl ContainerExecutor {
     }
 
     #[cfg(target_os = "linux")]
-    fn platform_start(&self, id: &str, state: &ContainerState) -> Result<()> {
-        let pid = state.pid.ok_or_else(|| {
-            TavikError::InvalidState(format!("Container '{}' has no recorded PID", id))
-        })?;
+    fn platform_start(&self, id: &str, _state: &ContainerState) -> Result<()> {
+        use std::io::Write;
 
-        // Signal container child process to exec entrypoint via SIGCONT or IPC trigger
-        let res = unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT) };
-        if res != 0 {
-            return Err(TavikError::Execution(format!(
-                "Failed to send start signal to container PID {}: {}",
-                pid,
-                std::io::Error::last_os_error()
+        let start_fifo = self.container_dir(id).join("start.fifo");
+        if !start_fifo.exists() {
+            return Err(TavikError::InvalidState(format!(
+                "Container '{}' start FIFO not found at {:?}",
+                id, start_fifo
             )));
         }
+
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(&start_fifo)
+            .map_err(|e| TavikError::Io(format!("Failed to open container start FIFO: {}", e)))?;
+
+        file.write_all(b"1").map_err(|e| {
+            TavikError::Io(format!(
+                "Failed to write start signal to container FIFO: {}",
+                e
+            ))
+        })?;
 
         Ok(())
     }
@@ -293,145 +282,28 @@ impl ContainerExecutor {
 }
 
 #[cfg(target_os = "linux")]
-fn run_container_child(
-    spec: &Spec,
-    bundle: &Path,
-    sync_sock: std::os::unix::net::UnixDatagram,
-) -> Result<()> {
-    use std::ffi::CString;
-
-    // 1. Unshare Linux namespaces
-    let mut clone_flags = libc::CLONE_NEWNS;
-    if let Some(linux) = &spec.linux {
-        for ns in &linux.namespaces {
-            match ns.ns_type {
-                crate::spec::LinuxNamespaceType::Pid => clone_flags |= libc::CLONE_NEWPID,
-                crate::spec::LinuxNamespaceType::Ipc => clone_flags |= libc::CLONE_NEWIPC,
-                crate::spec::LinuxNamespaceType::Uts => clone_flags |= libc::CLONE_NEWUTS,
-                crate::spec::LinuxNamespaceType::Network => clone_flags |= libc::CLONE_NEWNET,
-                _ => {}
+fn find_tavikr_binary() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("TAVIKR_PATH") {
+        let p = PathBuf::from(path);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    if let Ok(cur) = std::env::current_exe() {
+        if let Some(parent) = cur.parent() {
+            let p1 = parent.join("tavikr");
+            if p1.exists() {
+                return Some(p1);
+            }
+            if let Some(grandparent) = parent.parent() {
+                let p2 = grandparent.join("tavikr");
+                if p2.exists() {
+                    return Some(p2);
+                }
             }
         }
     }
-
-    if unsafe { libc::unshare(clone_flags) } != 0 {
-        return Err(TavikError::Execution(format!(
-            "Failed to unshare namespaces: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-
-    // 2. Set Hostname
-    if let Some(hostname) = &spec.hostname {
-        let c_host = CString::new(hostname.as_str()).unwrap();
-        unsafe {
-            libc::sethostname(c_host.as_ptr(), hostname.len());
-        }
-    }
-
-    // 3. Make mount namespace private
-    let none_c = CString::new("none").unwrap();
-    let slash_c = CString::new("/").unwrap();
-    unsafe {
-        libc::mount(
-            std::ptr::null(),
-            slash_c.as_ptr(),
-            std::ptr::null(),
-            libc::MS_REC | libc::MS_PRIVATE,
-            std::ptr::null(),
-        );
-    }
-
-    // 4. Resolve and bind mount rootfs
-    let root = spec
-        .root
-        .as_ref()
-        .ok_or_else(|| TavikError::Config("Spec missing rootfs definition".to_string()))?;
-
-    let rootfs_path = if Path::new(&root.path).is_absolute() {
-        PathBuf::from(&root.path)
-    } else {
-        bundle.join(&root.path)
-    };
-
-    let c_rootfs = CString::new(rootfs_path.to_str().unwrap()).unwrap();
-    unsafe {
-        libc::mount(
-            c_rootfs.as_ptr(),
-            c_rootfs.as_ptr(),
-            std::ptr::null(),
-            libc::MS_BIND | libc::MS_REC,
-            std::ptr::null(),
-        );
-    }
-
-    // 5. Mount proc inside container rootfs
-    let proc_target = rootfs_path.join("proc");
-    let _ = fs::create_dir_all(&proc_target);
-    let c_proc_target = CString::new(proc_target.to_str().unwrap()).unwrap();
-    let proc_type = CString::new("proc").unwrap();
-    unsafe {
-        libc::mount(
-            proc_type.as_ptr(),
-            c_proc_target.as_ptr(),
-            proc_type.as_ptr(),
-            libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV,
-            std::ptr::null(),
-        );
-    }
-
-    // 6. Chroot into rootfs
-    unsafe {
-        if libc::chroot(c_rootfs.as_ptr()) != 0 {
-            return Err(TavikError::Execution(format!(
-                "Failed to chroot into container rootfs: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        let slash = CString::new("/").unwrap();
-        libc::chdir(slash.as_ptr());
-    }
-
-    // 7. Signal readiness to parent runtime
-    sync_sock
-        .send(b"ready")
-        .map_err(|e| TavikError::Io(format!("Failed to send readiness to parent: {}", e)))?;
-
-    // 8. Pause until start signal received (SIGCONT or trigger)
-    unsafe {
-        libc::raise(libc::SIGSTOP);
-    }
-
-    // 9. Execute container process
-    let proc = spec
-        .process
-        .as_ref()
-        .ok_or_else(|| TavikError::Config("Spec missing process definition".to_string()))?;
-
-    let c_args: Vec<CString> = proc
-        .args
-        .iter()
-        .map(|s| CString::new(s.as_str()).unwrap())
-        .collect();
-    let mut c_args_ptrs: Vec<*const libc::c_char> = c_args.iter().map(|s| s.as_ptr()).collect();
-    c_args_ptrs.push(std::ptr::null());
-
-    let c_envs: Vec<CString> = proc
-        .env
-        .iter()
-        .map(|s| CString::new(s.as_str()).unwrap())
-        .collect();
-    let mut c_envs_ptrs: Vec<*const libc::c_char> = c_envs.iter().map(|s| s.as_ptr()).collect();
-    c_envs_ptrs.push(std::ptr::null());
-
-    unsafe {
-        libc::execve(c_args_ptrs[0], c_args_ptrs.as_ptr(), c_envs_ptrs.as_ptr());
-    }
-
-    Err(TavikError::Execution(format!(
-        "Failed to execve container entrypoint: {}",
-        std::io::Error::last_os_error()
-    )))
+    None
 }
 
 fn is_pid_alive(pid: u32) -> bool {

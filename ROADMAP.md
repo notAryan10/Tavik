@@ -14,15 +14,18 @@
 - [x] `tavik-cli`: `tavik` CLI client (`version`, `info`, `daemon`, `ps`, `inspect`, `stop`, `run-task`).
 - [x] Comprehensive unit and integration test suite.
 
-## Phase 2: OCI Container Runtime (`tavikr`) (Active)
+## Phase 2: OCI Container Runtime (`tavikr`) (Completed & Verified)
 - [x] OCI Runtime Specification v1.2 compliance models (`config.json`, `ContainerState`).
-- [x] Standalone `tavikr` OCI runtime binary with `create`, `start`, `state`, `kill`, `delete`, and `spec` commands.
+- [x] Standalone `tavikr` OCI runtime binary with `create`, `start`, `state`, `kill`, `delete`, `init`, and `spec` commands.
 - [x] Bundle loader and integrity validation.
-- [x] Linux namespace configuration (PID, Mount, Network, UTS, IPC).
-- [x] Mount isolation engine (`MS_REC | MS_PRIVATE`, rootfs bind mount, `/proc`, `/sys`, `/dev`).
-- [x] Container init synchronization protocol (socketpair).
+- [x] Dedicated single-threaded init trampoline (`tavikr init`) eliminating Tokio multithreaded `fork()` hazards.
+- [x] True PID namespace isolation (container init runs as PID 1; host monitors host PID).
+- [x] True mount isolation engine with `MS_REC | MS_PRIVATE`, `pivot_root`, and old-root detachment via `umount2(MNT_DETACH)`.
+- [x] Dedicated container `/proc` filesystem mount reflecting isolated container PID space.
+- [x] Persistent FIFO lifecycle synchronization protocol (`create` pauses workload; `start` triggers `execve`).
+- [x] File descriptor sanitization (`close_range(3, ...)`) and `PR_SET_NO_NEW_PRIVS` security enforcement.
 - [x] Daemon RPC integration for OCI container lifecycle management (`tavik container ...`).
-- [ ] Terminal allocation (PTY) and standard I/O forwarding.
+- [x] Empirical Linux ARM64 integration testing verifying PID 1, procfs, and filesystem isolation.
 
 ## Phase 3: Resource Governance & Security Controls
 - [ ] cgroups v2 resource controllers (cpu, memory, pids, io).

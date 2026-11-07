@@ -182,6 +182,13 @@ impl ContainerExecutor {
             }
         }
 
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(cgroup_mgr) = tavik_cgroups::CgroupManager::new() {
+                let _ = cgroup_mgr.destroy_container_cgroup(id);
+            }
+        }
+
         let container_dir = self.container_dir(id);
         if container_dir.exists() {
             fs::remove_dir_all(&container_dir)?;

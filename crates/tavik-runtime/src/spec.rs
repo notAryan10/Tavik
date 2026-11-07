@@ -131,6 +131,10 @@ pub struct Linux {
     pub gid_mappings: Vec<LinuxIdMapping>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cgroups_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resources: Option<tavik_cgroups::CgroupResources>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seccomp: Option<tavik_security::SeccompProfile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -175,6 +179,33 @@ pub struct LinuxCapabilities {
     pub permitted: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ambient: Vec<String>,
+}
+
+impl LinuxCapabilities {
+    pub fn to_capability_sets(
+        &self,
+    ) -> std::result::Result<tavik_security::CapabilitySets, tavik_security::SecurityError> {
+        let parse_set = |names: &[String]| -> std::result::Result<
+            Option<Vec<tavik_security::Capability>>,
+            tavik_security::SecurityError,
+        > {
+            if names.is_empty() {
+                Ok(Some(Vec::new()))
+            } else {
+                let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+                let caps = tavik_security::CapabilityMap::parse_all(refs)?;
+                Ok(Some(caps))
+            }
+        };
+
+        Ok(tavik_security::CapabilitySets {
+            bounding: parse_set(&self.bounding)?,
+            effective: parse_set(&self.effective)?,
+            permitted: parse_set(&self.permitted)?,
+            inheritable: parse_set(&self.inheritable)?,
+            ambient: parse_set(&self.ambient)?,
+        })
+    }
 }
 
 impl Spec {
@@ -354,6 +385,8 @@ impl Spec {
                 uid_mappings: vec![],
                 gid_mappings: vec![],
                 cgroups_path: None,
+                resources: None,
+                seccomp: None,
             }),
             annotations: HashMap::new(),
         }

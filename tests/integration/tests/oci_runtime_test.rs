@@ -106,7 +106,10 @@ fn test_linux_container_pid_namespace_and_lifecycle() {
         let bundle_dir = temp.path().join("bundle");
         let rootfs = bundle_dir.join("rootfs");
         let bin_dir = rootfs.join("bin");
+        let dev_dir = rootfs.join("dev");
         fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&dev_dir).unwrap();
+        let _ = fs::File::create(dev_dir.join("null"));
 
         // Copy static busybox into container rootfs
         if Path::new("/usr/bin/busybox").exists() {
@@ -187,6 +190,338 @@ fn test_linux_container_pid_namespace_and_lifecycle() {
         assert_ne!(host_pid, 1, "Host PID cannot be 1");
 
         // Clean up
+        let _ = executor.kill(container_id, 9);
+        let _ = executor.delete(container_id, true);
+    }
+}
+
+#[test]
+fn test_cgroups_pids_limit() {
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping rootful cgroup test (requires root)");
+            return;
+        }
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let bundle_dir = temp.path().join("bundle");
+        let rootfs = bundle_dir.join("rootfs");
+        let bin_dir = rootfs.join("bin");
+        let dev_dir = rootfs.join("dev");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&dev_dir).unwrap();
+        let _ = fs::File::create(dev_dir.join("null"));
+
+        let busybox_path = if Path::new("/usr/bin/busybox").exists() {
+            "/usr/bin/busybox"
+        } else {
+            "/bin/busybox"
+        };
+        fs::copy(busybox_path, bin_dir.join("busybox")).unwrap();
+
+        let mut spec = Spec::default_linux();
+        // Limit pids to 5
+        if let Some(linux) = &mut spec.linux {
+            linux.resources = Some(tavik_cgroups::CgroupResources {
+                pids: Some(tavik_cgroups::PidResources { limit: Some(5) }),
+                cpu: None,
+                memory: None,
+            });
+        }
+
+        // Inside container: attempt to spawn 20 background processes.
+        // The cgroup pids limit (5) must cause forks to fail.
+        if let Some(proc) = &mut spec.process {
+            proc.args = vec![
+                "/bin/busybox".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "fork_failed=0; for i in $(seq 1 20); do (/bin/busybox sleep 5 &) 2>/dev/null || { fork_failed=1; break; }; done; if [ $fork_failed -eq 1 ]; then echo \"fork_limited\" > /result.txt; else echo \"no_limit\" > /result.txt; fi; sleep 1".to_string(),
+            ];
+        }
+
+        let config_path = bundle_dir.join("config.json");
+        fs::write(&config_path, serde_json::to_string_pretty(&spec).unwrap()).unwrap();
+
+        let executor = ContainerExecutor::new(state_dir).unwrap();
+        let container_id = "test-cgroup-pids-01";
+
+        let _ = executor.create(container_id, &bundle_dir).unwrap();
+        let _ = executor.start(container_id).unwrap();
+
+        // Wait for result.txt
+        let mut result = String::new();
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(50));
+            if let Ok(content) = fs::read_to_string(rootfs.join("result.txt")) {
+                let trimmed = content.trim().to_string();
+                if !trimmed.is_empty() {
+                    result = trimmed;
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(
+            result, "fork_limited",
+            "Cgroup pids.max did not prevent fork bomb!"
+        );
+
+        // Verify cgroup tracking: processes in cgroup should be <= 5
+        if let Ok(cgroup_mgr) = tavik_cgroups::CgroupManager::new() {
+            if let Ok(procs) = cgroup_mgr.get_processes(container_id) {
+                assert!(
+                    procs.len() <= 5,
+                    "Cgroup exceeded pids.max limit of 5: {:?}",
+                    procs
+                );
+            }
+        }
+
+        let _ = executor.kill(container_id, 9);
+        let _ = executor.delete(container_id, true);
+    }
+}
+
+#[test]
+fn test_cgroups_memory_accounting() {
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping rootful cgroup test (requires root)");
+            return;
+        }
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let bundle_dir = temp.path().join("bundle");
+        let rootfs = bundle_dir.join("rootfs");
+        let bin_dir = rootfs.join("bin");
+        let dev_dir = rootfs.join("dev");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&dev_dir).unwrap();
+        let _ = fs::File::create(dev_dir.join("null"));
+
+        let busybox_path = if Path::new("/usr/bin/busybox").exists() {
+            "/usr/bin/busybox"
+        } else {
+            "/bin/busybox"
+        };
+        fs::copy(busybox_path, bin_dir.join("busybox")).unwrap();
+
+        let mut spec = Spec::default_linux();
+        // Limit memory to 32MB
+        if let Some(linux) = &mut spec.linux {
+            linux.resources = Some(tavik_cgroups::CgroupResources {
+                memory: Some(tavik_cgroups::MemoryResources {
+                    limit: Some(33554432), // 32 MB
+                    high: None,
+                    swap: Some(0),
+                }),
+                cpu: None,
+                pids: None,
+            });
+        }
+
+        if let Some(proc) = &mut spec.process {
+            proc.args = vec![
+                "/bin/busybox".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo \"running\" > /ready.txt && sleep 3".to_string(),
+            ];
+        }
+
+        let config_path = bundle_dir.join("config.json");
+        fs::write(&config_path, serde_json::to_string_pretty(&spec).unwrap()).unwrap();
+
+        let executor = ContainerExecutor::new(state_dir).unwrap();
+        let container_id = "test-cgroup-mem-01";
+
+        let _ = executor.create(container_id, &bundle_dir).unwrap();
+        let _ = executor.start(container_id).unwrap();
+
+        // Wait for container to start
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(50));
+            if rootfs.join("ready.txt").exists() {
+                break;
+            }
+        }
+
+        // Query cgroup stats
+        let cgroup_mgr = tavik_cgroups::CgroupManager::new().unwrap();
+        let stats = cgroup_mgr.read_stats(container_id).unwrap();
+        assert!(
+            stats.memory_current.is_some() && stats.memory_current.unwrap() > 0,
+            "Cgroup memory accounting failed: stats={:?}",
+            stats
+        );
+
+        let _ = executor.kill(container_id, 9);
+        let _ = executor.delete(container_id, true);
+    }
+}
+
+#[test]
+fn test_capabilities_dropping() {
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping rootful capability test (requires root)");
+            return;
+        }
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let bundle_dir = temp.path().join("bundle");
+        let rootfs = bundle_dir.join("rootfs");
+        let bin_dir = rootfs.join("bin");
+        let dev_dir = rootfs.join("dev");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&dev_dir).unwrap();
+        let _ = fs::File::create(dev_dir.join("null"));
+
+        let busybox_path = if Path::new("/usr/bin/busybox").exists() {
+            "/usr/bin/busybox"
+        } else {
+            "/bin/busybox"
+        };
+        fs::copy(busybox_path, bin_dir.join("busybox")).unwrap();
+
+        let mut spec = Spec::default_linux();
+        // Drop CAP_SYS_ADMIN (and all caps except unprivileged ones)
+        if let Some(proc) = &mut spec.process {
+            proc.capabilities = Some(tavik_runtime::LinuxCapabilities {
+                bounding: vec!["CAP_KILL".to_string(), "CAP_CHOWN".to_string()],
+                effective: vec!["CAP_KILL".to_string(), "CAP_CHOWN".to_string()],
+                permitted: vec!["CAP_KILL".to_string(), "CAP_CHOWN".to_string()],
+                inheritable: vec![],
+                ambient: vec![],
+            });
+
+            // Container attempts to change hostname (which requires CAP_SYS_ADMIN)
+            proc.args = vec![
+                "/bin/busybox".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "if /bin/busybox hostname hacked-host 2>/dev/null; then echo \"cap_leaked\" > /cap.txt; else echo \"cap_dropped\" > /cap.txt; fi; sleep 1".to_string(),
+            ];
+        }
+
+        let config_path = bundle_dir.join("config.json");
+        fs::write(&config_path, serde_json::to_string_pretty(&spec).unwrap()).unwrap();
+
+        let executor = ContainerExecutor::new(state_dir).unwrap();
+        let container_id = "test-caps-drop-01";
+
+        let _ = executor.create(container_id, &bundle_dir).unwrap();
+        let _ = executor.start(container_id).unwrap();
+
+        // Wait for cap.txt
+        let mut result = String::new();
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(50));
+            if let Ok(content) = fs::read_to_string(rootfs.join("cap.txt")) {
+                let trimmed = content.trim().to_string();
+                if !trimmed.is_empty() {
+                    result = trimmed;
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(
+            result, "cap_dropped",
+            "Capability dropping failed: container without CAP_SYS_ADMIN changed hostname!"
+        );
+
+        let _ = executor.kill(container_id, 9);
+        let _ = executor.delete(container_id, true);
+    }
+}
+
+#[test]
+fn test_seccomp_filter_blocks_syscall() {
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping rootful seccomp test (requires root)");
+            return;
+        }
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let bundle_dir = temp.path().join("bundle");
+        let rootfs = bundle_dir.join("rootfs");
+        let bin_dir = rootfs.join("bin");
+        let dev_dir = rootfs.join("dev");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&dev_dir).unwrap();
+        let _ = fs::File::create(dev_dir.join("null"));
+
+        let busybox_path = if Path::new("/usr/bin/busybox").exists() {
+            "/usr/bin/busybox"
+        } else {
+            "/bin/busybox"
+        };
+        fs::copy(busybox_path, bin_dir.join("busybox")).unwrap();
+
+        let mut spec = Spec::default_linux();
+        // Configure seccomp profile blocking mkdirat with EPERM
+        if let Some(linux) = &mut spec.linux {
+            linux.seccomp = Some(tavik_security::SeccompProfile {
+                default_action: tavik_security::SeccompAction::Allow,
+                default_errno_ret: None,
+                architectures: vec![],
+                flags: vec![],
+                syscalls: vec![tavik_security::SyscallRule {
+                    names: vec!["mkdirat".to_string()],
+                    action: tavik_security::SeccompAction::Errno,
+                    errno_ret: Some(libc::EPERM as u32),
+                    args: vec![],
+                }],
+            });
+        }
+
+        if let Some(proc) = &mut spec.process {
+            proc.args = vec![
+                "/bin/busybox".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "if /bin/busybox mkdir /blocked_dir 2>/dev/null; then echo \"seccomp_allowed\" > /sec.txt; else echo \"seccomp_blocked\" > /sec.txt; fi; sleep 1".to_string(),
+            ];
+        }
+
+        let config_path = bundle_dir.join("config.json");
+        fs::write(&config_path, serde_json::to_string_pretty(&spec).unwrap()).unwrap();
+
+        let executor = ContainerExecutor::new(state_dir).unwrap();
+        let container_id = "test-seccomp-block-01";
+
+        let _ = executor.create(container_id, &bundle_dir).unwrap();
+        let _ = executor.start(container_id).unwrap();
+
+        // Wait for sec.txt
+        let mut result = String::new();
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(50));
+            if let Ok(content) = fs::read_to_string(rootfs.join("sec.txt")) {
+                let trimmed = content.trim().to_string();
+                if !trimmed.is_empty() {
+                    result = trimmed;
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(
+            result, "seccomp_blocked",
+            "Seccomp rule failed to block mkdirat syscall with EPERM"
+        );
+
         let _ = executor.kill(container_id, 9);
         let _ = executor.delete(container_id, true);
     }

@@ -1,9 +1,9 @@
 use tavik_security::error::SecurityError;
-#[cfg(target_os = "linux")]
-use tavik_security::seccomp::{SeccompArg, SeccompOperator, SyscallRule};
 use tavik_security::seccomp::{
     apply_seccomp, install_seccomp_filter, SeccompAction, SeccompProfile, SockFilter,
 };
+#[cfg(target_os = "linux")]
+use tavik_security::seccomp::{SeccompArg, SeccompOperator, SyscallRule};
 
 #[test]
 fn test_empty_program_rejected() {

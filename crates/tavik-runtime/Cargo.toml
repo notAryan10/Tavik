@@ -11,6 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 tavik-common.workspace = true
+tavik-cgroups.workspace = true
+tavik-security.workspace = true
 tokio.workspace = true
 clap.workspace = true
 serde.workspace = true

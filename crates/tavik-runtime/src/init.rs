@@ -46,7 +46,26 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
         )));
     }
 
-    // 3. Unshare PID namespace in trampoline process
+    // 3. Set up cgroups v2 resource limits if requested
+    let cgroup_mgr = tavik_cgroups::CgroupManager::new().ok();
+    if let (Some(mgr), Some(linux)) = (&cgroup_mgr, &spec.linux) {
+        if let Some(resources) = &linux.resources {
+            mgr.create_container_cgroup(id).map_err(|e| {
+                TavikError::Execution(format!(
+                    "Failed to create cgroup for container '{}': {}",
+                    id, e
+                ))
+            })?;
+            mgr.apply_resources(id, resources).map_err(|e| {
+                TavikError::Execution(format!(
+                    "Failed to apply cgroup resources for container '{}': {}",
+                    id, e
+                ))
+            })?;
+        }
+    }
+
+    // 4. Unshare PID namespace in trampoline process
     // Note: Calling unshare(CLONE_NEWPID) puts the NEXT child into the new PID namespace!
     if unsafe { libc::unshare(libc::CLONE_NEWPID) } != 0 {
         return Err(TavikError::Execution(format!(
@@ -55,7 +74,7 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
         )));
     }
 
-    // 4. Fork container init process (this child is PID 1 in the new PID namespace!)
+    // 5. Fork container init process (this child is PID 1 in the new PID namespace!)
     let child_pid = unsafe { libc::fork() };
     if child_pid < 0 {
         return Err(TavikError::Io(format!(
@@ -81,6 +100,18 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
     // --- TRAMPOLINE PARENT PROCESS ---
     unsafe {
         libc::close(ready_pipe[1]); // Close write end in parent
+    }
+
+    // Enroll child PID into cgroups v2 container group
+    if let (Some(mgr), Some(linux)) = (&cgroup_mgr, &spec.linux) {
+        if linux.resources.is_some() {
+            if let Err(e) = mgr.add_process(id, child_pid as u32) {
+                eprintln!(
+                    "[tavikr trampoline warning] Failed to enroll child PID {} in cgroup '{}': {}",
+                    child_pid, id, e
+                );
+            }
+        }
     }
 
     // Wait for child to signal readiness over pipe
@@ -264,30 +295,18 @@ fn run_container_init_child(
         let _ = libc::rmdir(old_root_unmount.as_ptr());
     }
 
-    // 7. Security: set PR_SET_NO_NEW_PRIVS
+    // 7. Change working directory
     let proc = spec
         .process
         .as_ref()
         .ok_or_else(|| TavikError::Config("Spec missing process definition".to_string()))?;
 
-    if proc.no_new_privileges {
-        unsafe {
-            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-                return Err(TavikError::Execution(format!(
-                    "Failed to set PR_SET_NO_NEW_PRIVS: {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
-        }
-    }
-
-    // 8. Change working directory
     let c_cwd = CString::new(proc.cwd.as_str()).unwrap_or_else(|_| slash.clone());
     unsafe {
         libc::chdir(c_cwd.as_ptr());
     }
 
-    // 9. Signal readiness to trampoline
+    // 8. Signal readiness to trampoline
     unsafe {
         libc::write(
             ready_pipe_write_fd,
@@ -297,7 +316,7 @@ fn run_container_init_child(
         libc::close(ready_pipe_write_fd);
     }
 
-    // 10. Block waiting for start signal on start FIFO
+    // 9. Block waiting for start signal on start FIFO
     let mut start_buf = [0u8; 1];
     let n = unsafe { libc::read(fifo_fd, start_buf.as_mut_ptr() as *mut libc::c_void, 1) };
     unsafe {
@@ -310,12 +329,39 @@ fn run_container_init_child(
         ));
     }
 
-    // 11. File descriptor sanitization: close fds >= 3
+    // --- CONTAINER START LIFECYCLE: Strict Security Enforcement ---
+    // 10. File descriptor sanitization: close all fds >= 3
     unsafe {
         libc::close_range(3, !0u32, 0);
     }
 
-    // 12. Set user UID/GID if specified
+    // 11. Security: PR_SET_NO_NEW_PRIVS barrier
+    if proc.no_new_privileges {
+        tavik_security::ensure_no_new_privs().map_err(|e| {
+            TavikError::Execution(format!("Failed to set PR_SET_NO_NEW_PRIVS: {}", e))
+        })?;
+    }
+
+    // 12. Security: Seccomp BPF filter
+    if let Some(linux) = &spec.linux {
+        if let Some(seccomp_profile) = &linux.seccomp {
+            tavik_security::apply_seccomp(seccomp_profile).map_err(|e| {
+                TavikError::Execution(format!("Failed to apply seccomp filter: {}", e))
+            })?;
+        }
+    }
+
+    // 13. Security: Linux Capabilities
+    if let Some(caps) = &proc.capabilities {
+        let cap_sets = caps.to_capability_sets().map_err(|e| {
+            TavikError::Execution(format!("Failed to parse capability sets: {}", e))
+        })?;
+        tavik_security::apply_capabilities(&cap_sets).map_err(|e| {
+            TavikError::Execution(format!("Failed to apply Linux capabilities: {}", e))
+        })?;
+    }
+
+    // 14. Set user UID/GID if specified
     if proc.user.gid > 0 {
         unsafe {
             libc::setgid(proc.user.gid as libc::gid_t);
@@ -327,7 +373,7 @@ fn run_container_init_child(
         }
     }
 
-    // 13. execve entrypoint
+    // 15. execve entrypoint
     let c_args: Vec<CString> = proc
         .args
         .iter()

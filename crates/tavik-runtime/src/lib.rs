@@ -3,4 +3,4 @@ pub mod init;
 pub mod spec;
 
 pub use executor::ContainerExecutor;
-pub use spec::{ContainerState, ContainerStatus, Spec};
+pub use spec::{ContainerState, ContainerStatus, Linux, LinuxCapabilities, Process, Spec};

@@ -56,6 +56,40 @@ impl CapabilitySets {
     }
 }
 
+/// Drops unrequested capabilities from the thread's bounding set.
+/// In Linux, PR_CAPBSET_DROP requires CAP_SETPCAP in the thread's user namespace,
+/// so this must be performed before transitioning to an unprivileged UID.
+pub fn drop_bounding_set(bounding: &[Capability]) -> Result<(), SecurityError> {
+    #[cfg(target_os = "linux")]
+    {
+        let last_cap = CapabilityMap::read_cap_last_cap()?;
+        for c in 0..=last_cap {
+            if let Some(cap) = Capability::from_u32(c) {
+                if !bounding.contains(&cap) {
+                    // PR_CAPBSET_READ = 23
+                    let is_set = unsafe { libc::prctl(23, c as libc::c_ulong, 0, 0, 0) };
+                    if is_set == 1 {
+                        // PR_CAPBSET_DROP = 24
+                        let drop_res = unsafe { libc::prctl(24, c as libc::c_ulong, 0, 0, 0) };
+                        if drop_res != 0 {
+                            return Err(SecurityError::SyscallFailed {
+                                syscall: format!("prctl(PR_CAPBSET_DROP, {})", cap.name()),
+                                os_error: std::io::Error::last_os_error().to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = bounding;
+        Err(SecurityError::UnsupportedPlatform)
+    }
+}
+
 /// Linux capability ABI version 3 header.
 #[cfg(target_os = "linux")]
 #[repr(C)]
@@ -241,6 +275,71 @@ pub fn apply_capabilities(sets: &CapabilitySets) -> Result<(), SecurityError> {
 
         // 6. Verification: Check /proc/self/status
         verify_applied_capabilities(sets)?;
+
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = sets;
+        Err(SecurityError::UnsupportedPlatform)
+    }
+}
+
+/// Re-applies the effective capability set after a UID transition.
+/// In Linux, changing from UID 0 to non-zero clears effective capabilities even when
+/// PR_SET_KEEPCAPS preserved permitted capabilities.
+pub fn restore_effective_capabilities(sets: &CapabilitySets) -> Result<(), SecurityError> {
+    #[cfg(target_os = "linux")]
+    {
+        if sets.effective.is_none() {
+            return Ok(());
+        }
+
+        let header = UserCapHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let mut current_data = [UserCapData::default(), UserCapData::default()];
+        let capget_res =
+            unsafe { libc::syscall(libc::SYS_capget, &header, current_data.as_mut_ptr()) };
+        if capget_res != 0 {
+            return Err(SecurityError::SyscallFailed {
+                syscall: "capget".to_string(),
+                os_error: std::io::Error::last_os_error().to_string(),
+            });
+        }
+
+        let curr_prm =
+            (current_data[0].permitted as u64) | ((current_data[1].permitted as u64) << 32);
+        let target_eff = sets
+            .effective
+            .as_ref()
+            .map(|c| CapabilityMap::to_mask(c.iter().copied()))
+            .unwrap_or(curr_prm);
+
+        // Effective must not exceed permitted
+        let eff = target_eff & curr_prm;
+
+        let new_data = [
+            UserCapData {
+                effective: eff as u32,
+                permitted: current_data[0].permitted,
+                inheritable: current_data[0].inheritable,
+            },
+            UserCapData {
+                effective: (eff >> 32) as u32,
+                permitted: current_data[1].permitted,
+                inheritable: current_data[1].inheritable,
+            },
+        ];
+
+        let capset_res = unsafe { libc::syscall(libc::SYS_capset, &header, new_data.as_ptr()) };
+        if capset_res != 0 {
+            return Err(SecurityError::SyscallFailed {
+                syscall: "capset(restore_effective)".to_string(),
+                os_error: std::io::Error::last_os_error().to_string(),
+            });
+        }
 
         Ok(())
     }

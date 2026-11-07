@@ -526,3 +526,202 @@ fn test_seccomp_filter_blocks_syscall() {
         let _ = executor.delete(container_id, true);
     }
 }
+
+#[test]
+fn test_privilege_transition_uid_gid_and_groups() {
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping rootful privilege transition test (requires root)");
+            return;
+        }
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let bundle_dir = temp.path().join("bundle");
+        let rootfs = bundle_dir.join("rootfs");
+        let bin_dir = rootfs.join("bin");
+        let dev_dir = rootfs.join("dev");
+        let tmp_dir = rootfs.join("tmp");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&dev_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let _ = fs::File::create(dev_dir.join("null"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&dev_dir.join("null"), fs::Permissions::from_mode(0o666));
+            let _ = fs::set_permissions(&tmp_dir, fs::Permissions::from_mode(0o777));
+        }
+
+        let busybox_path = if Path::new("/usr/bin/busybox").exists() {
+            "/usr/bin/busybox"
+        } else {
+            "/bin/busybox"
+        };
+        fs::copy(busybox_path, bin_dir.join("busybox")).unwrap();
+
+        let mut spec = Spec::default_linux();
+        if let Some(proc) = &mut spec.process {
+            proc.user = tavik_runtime::spec::User {
+                uid: 1000,
+                gid: 1000,
+                additional_gids: vec![1001],
+            };
+            proc.args = vec![
+                "/bin/busybox".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "/bin/busybox id > /tmp/id.txt; sleep 1".to_string(),
+            ];
+        }
+
+        let config_path = bundle_dir.join("config.json");
+        fs::write(&config_path, serde_json::to_string_pretty(&spec).unwrap()).unwrap();
+
+        let executor = ContainerExecutor::new(state_dir).unwrap();
+        let container_id = "test-priv-trans-01";
+
+        let _ = executor.create(container_id, &bundle_dir).unwrap();
+        let _ = executor.start(container_id).unwrap();
+
+        // Wait for id.txt
+        let mut id_output = String::new();
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(50));
+            if let Ok(content) = fs::read_to_string(rootfs.join("tmp/id.txt")) {
+                let trimmed = content.trim().to_string();
+                if !trimmed.is_empty() {
+                    id_output = trimmed;
+                    break;
+                }
+            }
+        }
+
+        assert!(
+            id_output.contains("uid=1000"),
+            "Expected uid=1000, got: {:?}",
+            id_output
+        );
+        assert!(
+            id_output.contains("gid=1000"),
+            "Expected gid=1000, got: {:?}",
+            id_output
+        );
+
+        let _ = executor.kill(container_id, 9);
+        let _ = executor.delete(container_id, true);
+    }
+}
+
+#[test]
+fn test_combined_security_hardening() {
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping rootful combined security test (requires root)");
+            return;
+        }
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let bundle_dir = temp.path().join("bundle");
+        let rootfs = bundle_dir.join("rootfs");
+        let bin_dir = rootfs.join("bin");
+        let dev_dir = rootfs.join("dev");
+        let tmp_dir = rootfs.join("tmp");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&dev_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let _ = fs::File::create(dev_dir.join("null"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&dev_dir.join("null"), fs::Permissions::from_mode(0o666));
+            let _ = fs::set_permissions(&tmp_dir, fs::Permissions::from_mode(0o777));
+        }
+
+        let busybox_path = if Path::new("/usr/bin/busybox").exists() {
+            "/usr/bin/busybox"
+        } else {
+            "/bin/busybox"
+        };
+        fs::copy(busybox_path, bin_dir.join("busybox")).unwrap();
+
+        let mut spec = Spec::default_linux();
+
+        // 1. Cgroup limit
+        if let Some(linux) = &mut spec.linux {
+            linux.resources = Some(tavik_cgroups::CgroupResources {
+                pids: Some(tavik_cgroups::PidResources { limit: Some(15) }),
+                cpu: None,
+                memory: None,
+            });
+            // 2. Seccomp blocking mkdirat
+            linux.seccomp = Some(tavik_security::SeccompProfile {
+                default_action: tavik_security::SeccompAction::Allow,
+                default_errno_ret: None,
+                architectures: vec![],
+                flags: vec![],
+                syscalls: vec![tavik_security::SyscallRule {
+                    names: vec!["mkdirat".to_string()],
+                    action: tavik_security::SeccompAction::Errno,
+                    errno_ret: Some(libc::EPERM as u32),
+                    args: vec![],
+                }],
+            });
+        }
+
+        // 3. User UID 1000 + Capabilities + NoNewPrivileges
+        if let Some(proc) = &mut spec.process {
+            proc.no_new_privileges = true;
+            proc.user = tavik_runtime::spec::User {
+                uid: 1000,
+                gid: 1000,
+                additional_gids: vec![],
+            };
+            proc.capabilities = Some(tavik_runtime::LinuxCapabilities {
+                bounding: vec!["CAP_KILL".to_string()],
+                effective: vec!["CAP_KILL".to_string()],
+                permitted: vec!["CAP_KILL".to_string()],
+                inheritable: vec![],
+                ambient: vec![],
+            });
+            proc.args = vec![
+                "/bin/busybox".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "if /bin/busybox mkdir /tmp/sec_dir 2>/dev/null; then echo \"leak\" > /tmp/hardened.txt; else echo \"hardened_ok\" > /tmp/hardened.txt; fi; sleep 1".to_string(),
+            ];
+        }
+
+        let config_path = bundle_dir.join("config.json");
+        fs::write(&config_path, serde_json::to_string_pretty(&spec).unwrap()).unwrap();
+
+        let executor = ContainerExecutor::new(state_dir).unwrap();
+        let container_id = "test-hardened-comb-01";
+
+        let _ = executor.create(container_id, &bundle_dir).unwrap();
+        let _ = executor.start(container_id).unwrap();
+
+        let mut result = String::new();
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(50));
+            if let Ok(content) = fs::read_to_string(rootfs.join("tmp/hardened.txt")) {
+                let trimmed = content.trim().to_string();
+                if !trimmed.is_empty() {
+                    result = trimmed;
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(
+            result, "hardened_ok",
+            "Hardened container failed: seccomp did not block mkdirat under non-root user"
+        );
+
+        let _ = executor.kill(container_id, 9);
+        let _ = executor.delete(container_id, true);
+    }
+}

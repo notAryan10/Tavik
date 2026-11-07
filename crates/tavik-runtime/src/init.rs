@@ -46,24 +46,42 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
         )));
     }
 
-    // 3. Set up cgroups v2 resource limits if requested
-    let cgroup_mgr = tavik_cgroups::CgroupManager::new().ok();
-    if let (Some(mgr), Some(linux)) = (&cgroup_mgr, &spec.linux) {
-        if let Some(resources) = &linux.resources {
+    // 3. Set up cgroups v2 resource limits if requested (FAIL-CLOSED)
+    let cgroup_mgr = if let Some(linux) = &spec.linux {
+        if linux.resources.is_some() {
+            let mgr = tavik_cgroups::CgroupManager::new().map_err(|e| {
+                TavikError::Execution(format!(
+                    "Failed to initialize cgroups v2 manager for requested container resources: {}",
+                    e
+                ))
+            })?;
+            mgr.validate_cgroup_v2().map_err(|e| {
+                TavikError::Execution(format!(
+                    "Requested container resources require cgroup v2 support: {}",
+                    e
+                ))
+            })?;
             mgr.create_container_cgroup(id).map_err(|e| {
                 TavikError::Execution(format!(
                     "Failed to create cgroup for container '{}': {}",
                     id, e
                 ))
             })?;
-            mgr.apply_resources(id, resources).map_err(|e| {
-                TavikError::Execution(format!(
-                    "Failed to apply cgroup resources for container '{}': {}",
-                    id, e
-                ))
-            })?;
+            if let Some(resources) = &linux.resources {
+                mgr.apply_resources(id, resources).map_err(|e| {
+                    TavikError::Execution(format!(
+                        "Failed to apply cgroup resources for container '{}': {}",
+                        id, e
+                    ))
+                })?;
+            }
+            Some(mgr)
+        } else {
+            tavik_cgroups::CgroupManager::new().ok()
         }
-    }
+    } else {
+        None
+    };
 
     // 4. Unshare PID namespace in trampoline process
     // Note: Calling unshare(CLONE_NEWPID) puts the NEXT child into the new PID namespace!
@@ -102,14 +120,21 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
         libc::close(ready_pipe[1]); // Close write end in parent
     }
 
-    // Enroll child PID into cgroups v2 container group
+    // Enroll child PID into cgroups v2 container group (FAIL-CLOSED)
     if let (Some(mgr), Some(linux)) = (&cgroup_mgr, &spec.linux) {
         if linux.resources.is_some() {
             if let Err(e) = mgr.add_process(id, child_pid as u32) {
-                eprintln!(
-                    "[tavikr trampoline warning] Failed to enroll child PID {} in cgroup '{}': {}",
+                // Abort container creation immediately: kill child, cleanup cgroup, fail closed
+                unsafe {
+                    libc::kill(child_pid, libc::SIGKILL);
+                    let mut status = 0;
+                    libc::waitpid(child_pid, &mut status, 0);
+                }
+                let _ = mgr.destroy_container_cgroup(id);
+                return Err(TavikError::Execution(format!(
+                    "Failed to enroll container child PID {} in cgroup '{}': {}",
                     child_pid, id, e
-                );
+                )));
             }
         }
     }
@@ -252,13 +277,19 @@ fn run_container_init_child(
     let c_proc_target = CString::new(proc_target.to_str().unwrap()).unwrap();
     let proc_type = CString::new("proc").unwrap();
     unsafe {
-        libc::mount(
+        let mount_res = libc::mount(
             proc_type.as_ptr(),
             c_proc_target.as_ptr(),
             proc_type.as_ptr(),
             libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV,
             std::ptr::null(),
         );
+        if mount_res != 0 {
+            return Err(TavikError::Execution(format!(
+                "Failed to mount /proc inside container rootfs: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
     }
 
     // 6. pivot_root
@@ -335,41 +366,101 @@ fn run_container_init_child(
         libc::close_range(3, !0u32, 0);
     }
 
-    // 11. Security: PR_SET_NO_NEW_PRIVS barrier
+    // 11. Parse capability sets if configured
+    let cap_sets = if let Some(caps) = &proc.capabilities {
+        Some(caps.to_capability_sets().map_err(|e| {
+            TavikError::Execution(format!("Failed to parse capability sets: {}", e))
+        })?)
+    } else {
+        None
+    };
+
+    // 12. If transitioning to non-root UID, drop the bounding set first while still root (UID 0),
+    // and enable PR_SET_KEEPCAPS so permitted capabilities are preserved across setuid().
+    if proc.user.uid > 0 {
+        if let Some(sets) = &cap_sets {
+            if let Some(bounding) = &sets.bounding {
+                tavik_security::drop_bounding_set(bounding).map_err(|e| {
+                    TavikError::Execution(format!("Failed to drop bounding capabilities: {}", e))
+                })?;
+            }
+        }
+        let keepcaps_res = unsafe { libc::prctl(libc::PR_SET_KEEPCAPS, 1, 0, 0, 0) };
+        if keepcaps_res != 0 {
+            return Err(TavikError::Execution(format!(
+                "Failed to set PR_SET_KEEPCAPS: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+
+    // 13. Privilege transition: supplementary groups, GID, UID (FAIL-CLOSED)
+    if !proc.user.additional_gids.is_empty() {
+        let gids: Vec<libc::gid_t> = proc
+            .user
+            .additional_gids
+            .iter()
+            .map(|&g| g as libc::gid_t)
+            .collect();
+        let setgroups_res = unsafe { libc::setgroups(gids.len(), gids.as_ptr()) };
+        if setgroups_res != 0 {
+            return Err(TavikError::Execution(format!(
+                "Failed to set supplementary groups: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+
+    if proc.user.gid > 0 {
+        let setgid_res = unsafe { libc::setgid(proc.user.gid as libc::gid_t) };
+        if setgid_res != 0 {
+            return Err(TavikError::Execution(format!(
+                "Failed to setgid to {}: {}",
+                proc.user.gid,
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+
+    if proc.user.uid > 0 {
+        let setuid_res = unsafe { libc::setuid(proc.user.uid as libc::uid_t) };
+        if setuid_res != 0 {
+            return Err(TavikError::Execution(format!(
+                "Failed to setuid to {}: {}",
+                proc.user.uid,
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+
+    // 14. Apply capabilities (bounding, permitted, effective, inheritable, ambient)
+    if let Some(sets) = &cap_sets {
+        tavik_security::apply_capabilities(sets).map_err(|e| {
+            TavikError::Execution(format!("Failed to apply Linux capabilities: {}", e))
+        })?;
+    }
+
+    if proc.user.uid > 0 {
+        // Clear PR_SET_KEEPCAPS so container process children do not retain keepcaps
+        unsafe {
+            libc::prctl(libc::PR_SET_KEEPCAPS, 0, 0, 0, 0);
+        }
+    }
+
+    // 14. Security: PR_SET_NO_NEW_PRIVS barrier
     if proc.no_new_privileges {
         tavik_security::ensure_no_new_privs().map_err(|e| {
             TavikError::Execution(format!("Failed to set PR_SET_NO_NEW_PRIVS: {}", e))
         })?;
     }
 
-    // 12. Security: Seccomp BPF filter
+    // 15. Security: Seccomp BPF filter
+    // Applied as the FINAL security gate immediately before execve so all prior setup calls succeed
     if let Some(linux) = &spec.linux {
         if let Some(seccomp_profile) = &linux.seccomp {
             tavik_security::apply_seccomp(seccomp_profile).map_err(|e| {
                 TavikError::Execution(format!("Failed to apply seccomp filter: {}", e))
             })?;
-        }
-    }
-
-    // 13. Security: Linux Capabilities
-    if let Some(caps) = &proc.capabilities {
-        let cap_sets = caps.to_capability_sets().map_err(|e| {
-            TavikError::Execution(format!("Failed to parse capability sets: {}", e))
-        })?;
-        tavik_security::apply_capabilities(&cap_sets).map_err(|e| {
-            TavikError::Execution(format!("Failed to apply Linux capabilities: {}", e))
-        })?;
-    }
-
-    // 14. Set user UID/GID if specified
-    if proc.user.gid > 0 {
-        unsafe {
-            libc::setgid(proc.user.gid as libc::gid_t);
-        }
-    }
-    if proc.user.uid > 0 {
-        unsafe {
-            libc::setuid(proc.user.uid as libc::uid_t);
         }
     }
 

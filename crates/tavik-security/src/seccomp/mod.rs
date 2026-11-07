@@ -9,6 +9,7 @@ pub use action::SeccompAction;
 pub use architecture::SeccompArchitecture;
 pub use argument::{SeccompArg, SeccompOperator};
 pub use compiler::{SeccompCompiler, SockFilter, SockFprog, BPF_MAXINSNS};
+pub use install::{apply_seccomp, install_seccomp_filter};
 pub use syscall::{SyscallResolver, SyscallRule};
 
 use crate::error::SecurityError;

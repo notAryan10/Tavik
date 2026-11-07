@@ -114,8 +114,9 @@ impl SeccompCompiler {
                     let ret_val = rule
                         .action
                         .bpf_ret_value(rule.errno_ret.or(profile.default_errno_ret));
-                    // JEQ syscall_nr -> jt: 1 (action), jf: 0 (skip action to next check)
-                    insns.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, syscall_nr, 1, 0));
+                    // JEQ syscall_nr -> jt: 0 (match: fall through to execute ret_val immediately),
+                    //                   jf: 1 (no match: skip ret_val to evaluate next rule/default)
+                    insns.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, syscall_nr, 0, 1));
                     insns.push(bpf_stmt(BPF_RET | BPF_K, ret_val));
                 } else {
                     // Rule with argument conditions:

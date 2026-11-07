@@ -9,6 +9,7 @@ pub use capability_map::{Capability, CapabilityMap};
 pub use error::SecurityError;
 pub use no_new_privs::{ensure_no_new_privs, is_no_new_privs, set_no_new_privs};
 pub use seccomp::{
-    SeccompAction, SeccompArchitecture, SeccompArg, SeccompCompiler, SeccompFlag, SeccompOperator,
-    SeccompProfile, SockFilter, SockFprog, SyscallRule,
+    apply_seccomp, install_seccomp_filter, SeccompAction, SeccompArchitecture, SeccompArg,
+    SeccompCompiler, SeccompFlag, SeccompOperator, SeccompProfile, SockFilter, SockFprog,
+    SyscallRule,
 };

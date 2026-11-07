@@ -79,6 +79,11 @@ fn test_compiler_syscall_matching_and_or_semantics() {
     assert!(has_read_check, "Missing read (63) check");
     assert!(has_write_check, "Missing write (64) check");
     assert!(has_allow_ret, "Missing ALLOW return instruction");
+
+    // Verify jump offsets: match executes RET (jt = 0), mismatch skips RET (jf = 1)
+    let read_insn = bpf.iter().find(|i| i.k == 63).unwrap();
+    assert_eq!(read_insn.jt, 0, "read match should fall through to RET (jt=0)");
+    assert_eq!(read_insn.jf, 1, "read mismatch should skip RET (jf=1)");
 }
 
 #[test]

@@ -8,6 +8,7 @@ members = [
     "crates/tavik-runtime",
     "crates/tavik-cgroups",
     "crates/tavik-security",
+    "crates/tavik-registry",
     "tests/integration",
 ]
 
@@ -27,6 +28,7 @@ tavik-daemon = { path = "crates/tavik-daemon" }
 tavik-runtime = { path = "crates/tavik-runtime" }
 tavik-cgroups = { path = "crates/tavik-cgroups" }
 tavik-security = { path = "crates/tavik-security" }
+tavik-registry = { path = "crates/tavik-registry" }
 
 tokio = { version = "1.41", features = ["full"] }
 clap = { version = "4.5", features = ["derive", "env"] }
@@ -44,3 +46,7 @@ chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3.14"
 rustix = { version = "1.1", features = ["process", "fs", "mount"] }
 libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+sha2 = "0.10"
+hex = "0.4"
+url = "2.5"

@@ -7,7 +7,7 @@ license.workspace = true
 description = "OCI Distribution and Docker Registry client for TAVIK"
 
 [dependencies]
-tokio = { workspace = true, features = ["sync", "io-util"] }
+tokio = { workspace = true, features = ["sync", "io-util", "fs"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -18,6 +18,7 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 url = { workspace = true }
 futures-util = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

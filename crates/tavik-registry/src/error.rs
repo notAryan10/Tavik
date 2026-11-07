@@ -33,6 +33,19 @@ pub enum RegistryError {
         actual: String,
     },
 
+    #[error("Blob size mismatch for '{digest}': expected {expected} bytes, got {actual} bytes")]
+    SizeMismatch {
+        digest: String,
+        expected: u64,
+        actual: u64,
+    },
+
+    #[error("Blob size exceeded configured limit: limit {limit} bytes, got {actual} bytes")]
+    SizeExceeded { limit: u64, actual: u64 },
+
+    #[error("Unsupported digest algorithm '{0}' (only sha256 is supported)")]
+    UnsupportedAlgorithm(String),
+
     #[error("Platform '{os}/{arch}' not found in manifest index")]
     PlatformNotFound { os: String, arch: String },
 

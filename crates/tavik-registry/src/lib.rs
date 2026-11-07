@@ -6,7 +6,7 @@ pub mod manifest;
 pub mod reference;
 
 pub use auth::{AuthChallenge, AuthManager, RegistryCredentials};
-pub use client::RegistryClient;
+pub use client::{DownloadedBlob, RegistryClient};
 pub use descriptor::{
     Descriptor, Platform, DOCKER_CONTAINER_CONFIG, DOCKER_LAYER_TAR_GZIP, DOCKER_MANIFEST_LIST_V2,
     DOCKER_MANIFEST_V2, OCI_CONFIG_JSON, OCI_IMAGE_INDEX_V1, OCI_LAYER_TAR, OCI_LAYER_TAR_GZIP,

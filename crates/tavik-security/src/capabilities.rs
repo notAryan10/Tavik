@@ -149,18 +149,35 @@ pub fn validate_capability_sets(sets: &CapabilitySets) -> Result<(), SecurityErr
 /// Applies the requested capability sets to the current calling process.
 /// The operation is executed in strict order:
 /// 1. Validation of ambient capability constraints.
-/// 2. Clearing of ambient capabilities.
-/// 3. Dropping excluded capabilities from the bounding set (PR_CAPBSET_DROP).
-/// 4. Applying permitted, effective, and inheritable sets via capset.
-/// 5. Raising requested ambient capabilities.
-/// 6. Verifying applied state via /proc/self/status.
+/// 2. Dropping excluded capabilities from the bounding set (PR_CAPBSET_DROP).
+/// 3. Applying thread capabilities (permitted, effective, inheritable, and ambient).
 pub fn apply_capabilities(sets: &CapabilitySets) -> Result<(), SecurityError> {
-    // 1. Validate Ambient Constraints first (cross-platform validation)
     validate_capability_sets(sets)?;
 
     #[cfg(target_os = "linux")]
     {
-        // 2. Clear Ambient Capabilities first
+        if let Some(bounding) = &sets.bounding {
+            drop_bounding_set(bounding)?;
+        }
+        apply_thread_capabilities(sets)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = sets;
+        Err(SecurityError::UnsupportedPlatform)
+    }
+}
+
+/// Applies thread-specific capability sets (permitted, effective, inheritable, and ambient)
+/// and verifies the applied state.
+/// Does NOT touch the bounding set (`PR_CAPBSET_DROP`), making this safe to call
+/// both as root and after changing to an unprivileged UID (e.g., following `PR_SET_KEEPCAPS` and `setuid`).
+pub fn apply_thread_capabilities(sets: &CapabilitySets) -> Result<(), SecurityError> {
+    validate_capability_sets(sets)?;
+
+    #[cfg(target_os = "linux")]
+    {
+        // 1. Clear Ambient Capabilities first
         // PR_CAP_AMBIENT_CLEAR_ALL = 4
         let clear_res = unsafe { libc::prctl(libc::PR_CAP_AMBIENT, 4, 0, 0, 0) };
         if clear_res != 0 {
@@ -174,30 +191,7 @@ pub fn apply_capabilities(sets: &CapabilitySets) -> Result<(), SecurityError> {
             }
         }
 
-        // 3. Drop unrequested capabilities from the Bounding Set
-        if let Some(bounding) = &sets.bounding {
-            let last_cap = CapabilityMap::read_cap_last_cap()?;
-            for c in 0..=last_cap {
-                if let Some(cap) = Capability::from_u32(c) {
-                    if !bounding.contains(&cap) {
-                        // PR_CAPBSET_READ = 23
-                        let is_set = unsafe { libc::prctl(23, c as libc::c_ulong, 0, 0, 0) };
-                        if is_set == 1 {
-                            // PR_CAPBSET_DROP = 24
-                            let drop_res = unsafe { libc::prctl(24, c as libc::c_ulong, 0, 0, 0) };
-                            if drop_res != 0 {
-                                return Err(SecurityError::SyscallFailed {
-                                    syscall: format!("prctl(PR_CAPBSET_DROP, {})", cap.name()),
-                                    os_error: std::io::Error::last_os_error().to_string(),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 4. Query current capability sets if any set is omitted
+        // 2. Query current capability sets if any set is omitted
         let header = UserCapHeader {
             version: LINUX_CAPABILITY_VERSION_3,
             pid: 0,
@@ -257,7 +251,7 @@ pub fn apply_capabilities(sets: &CapabilitySets) -> Result<(), SecurityError> {
             });
         }
 
-        // 5. Raise requested Ambient capabilities
+        // 3. Raise requested Ambient capabilities
         if let Some(ambient) = &sets.ambient {
             for cap in ambient {
                 // PR_CAP_AMBIENT_RAISE = 2
@@ -273,7 +267,7 @@ pub fn apply_capabilities(sets: &CapabilitySets) -> Result<(), SecurityError> {
             }
         }
 
-        // 6. Verification: Check /proc/self/status
+        // 4. Verification: Check /proc/self/status
         verify_applied_capabilities(sets)?;
 
         Ok(())

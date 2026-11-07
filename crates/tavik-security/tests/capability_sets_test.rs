@@ -1,4 +1,6 @@
 use tavik_security::{apply_capabilities, Capability, CapabilitySets, SecurityError};
+#[cfg(target_os = "linux")]
+use tavik_security::{apply_thread_capabilities, drop_bounding_set};
 
 #[test]
 fn test_default_oci_and_empty_sets() {
@@ -119,6 +121,76 @@ fn test_linux_capabilities_application_in_child_process() {
         assert_eq!(
             exit_code, 0,
             "Child process failed capability verification with exit code {}",
+            exit_code
+        );
+    }
+}
+
+#[test]
+fn test_drop_bounding_set_and_apply_thread_capabilities_in_child() {
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping rootful capability test (requires root)");
+            return;
+        }
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "Failed to fork test child");
+
+        if pid == 0 {
+            let target_caps = vec![Capability::CAP_KILL];
+            let sets = CapabilitySets {
+                bounding: Some(target_caps.clone()),
+                effective: Some(target_caps.clone()),
+                permitted: Some(target_caps),
+                inheritable: Some(Vec::new()),
+                ambient: Some(Vec::new()),
+            };
+
+            // Step 1: drop bounding set while root
+            if let Err(e) = drop_bounding_set(sets.bounding.as_ref().unwrap()) {
+                eprintln!("Child drop_bounding_set failed: {}", e);
+                unsafe { libc::_exit(1) };
+            }
+
+            // Step 2: apply thread capabilities without touching bounding set
+            if let Err(e) = apply_thread_capabilities(&sets) {
+                eprintln!("Child apply_thread_capabilities failed: {}", e);
+                unsafe { libc::_exit(2) };
+            }
+
+            // Verify bounding set dropped CAP_CHOWN
+            let has_chown =
+                unsafe { libc::prctl(23, Capability::CAP_CHOWN.value() as libc::c_ulong, 0, 0, 0) };
+            if has_chown != 0 {
+                eprintln!("CAP_CHOWN was not dropped from bounding set!");
+                unsafe { libc::_exit(3) };
+            }
+
+            // Verify bounding set retained CAP_KILL
+            let has_kill =
+                unsafe { libc::prctl(23, Capability::CAP_KILL.value() as libc::c_ulong, 0, 0, 0) };
+            if has_kill != 1 {
+                eprintln!("CAP_KILL was dropped from bounding set!");
+                unsafe { libc::_exit(4) };
+            }
+
+            unsafe { libc::_exit(0) };
+        }
+
+        let mut status: i32 = 0;
+        let wait_res = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(wait_res, pid);
+
+        assert!(
+            libc::WIFEXITED(status),
+            "Child process crashed or was killed by signal"
+        );
+        let exit_code = libc::WEXITSTATUS(status);
+        assert_eq!(
+            exit_code, 0,
+            "Child process failed verification with exit code {}",
             exit_code
         );
     }

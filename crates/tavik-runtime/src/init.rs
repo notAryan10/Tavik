@@ -375,16 +375,20 @@ fn run_container_init_child(
         None
     };
 
-    // 12. If transitioning to non-root UID, drop the bounding set first while still root (UID 0),
-    // and enable PR_SET_KEEPCAPS so permitted capabilities are preserved across setuid().
-    if proc.user.uid > 0 {
-        if let Some(sets) = &cap_sets {
-            if let Some(bounding) = &sets.bounding {
-                tavik_security::drop_bounding_set(bounding).map_err(|e| {
-                    TavikError::Execution(format!("Failed to drop bounding capabilities: {}", e))
-                })?;
-            }
+    // 12. If capability bounding set is configured, drop unrequested capabilities
+    // while still root (UID 0) prior to any privilege transition.
+    // In Linux, PR_CAPBSET_DROP strictly requires CAP_SETPCAP.
+    if let Some(sets) = &cap_sets {
+        if let Some(bounding) = &sets.bounding {
+            tavik_security::drop_bounding_set(bounding).map_err(|e| {
+                TavikError::Execution(format!("Failed to drop bounding capabilities: {}", e))
+            })?;
         }
+    }
+
+    // 13. Privilege transition: supplementary groups, GID, UID (FAIL-CLOSED)
+    if proc.user.uid > 0 {
+        // Enable PR_SET_KEEPCAPS so permitted capabilities are preserved across setuid().
         let keepcaps_res = unsafe { libc::prctl(libc::PR_SET_KEEPCAPS, 1, 0, 0, 0) };
         if keepcaps_res != 0 {
             return Err(TavikError::Execution(format!(
@@ -394,7 +398,6 @@ fn run_container_init_child(
         }
     }
 
-    // 13. Privilege transition: supplementary groups, GID, UID (FAIL-CLOSED)
     if !proc.user.additional_gids.is_empty() {
         let gids: Vec<libc::gid_t> = proc
             .user
@@ -433,10 +436,11 @@ fn run_container_init_child(
         }
     }
 
-    // 14. Apply capabilities (bounding, permitted, effective, inheritable, ambient)
+    // 14. Apply thread capabilities (permitted, effective, inheritable, ambient)
+    // Using apply_thread_capabilities ensures PR_CAPBSET_DROP is not attempted post-setuid.
     if let Some(sets) = &cap_sets {
-        tavik_security::apply_capabilities(sets).map_err(|e| {
-            TavikError::Execution(format!("Failed to apply Linux capabilities: {}", e))
+        tavik_security::apply_thread_capabilities(sets).map_err(|e| {
+            TavikError::Execution(format!("Failed to apply thread capabilities: {}", e))
         })?;
     }
 

@@ -550,7 +550,7 @@ fn test_privilege_transition_uid_gid_and_groups() {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&dev_dir.join("null"), fs::Permissions::from_mode(0o666));
+            let _ = fs::set_permissions(dev_dir.join("null"), fs::Permissions::from_mode(0o666));
             let _ = fs::set_permissions(&tmp_dir, fs::Permissions::from_mode(0o777));
         }
 
@@ -608,6 +608,11 @@ fn test_privilege_transition_uid_gid_and_groups() {
             "Expected gid=1000, got: {:?}",
             id_output
         );
+        assert!(
+            id_output.contains("groups=") && id_output.contains("1001"),
+            "Expected supplementary group 1001 in id output, got: {:?}",
+            id_output
+        );
 
         let _ = executor.kill(container_id, 9);
         let _ = executor.delete(container_id, true);
@@ -637,7 +642,7 @@ fn test_combined_security_hardening() {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&dev_dir.join("null"), fs::Permissions::from_mode(0o666));
+            let _ = fs::set_permissions(dev_dir.join("null"), fs::Permissions::from_mode(0o666));
             let _ = fs::set_permissions(&tmp_dir, fs::Permissions::from_mode(0o777));
         }
 

@@ -5,8 +5,8 @@ pub mod no_new_privs;
 pub mod seccomp;
 
 pub use capabilities::{
-    apply_capabilities, drop_bounding_set, restore_effective_capabilities,
-    validate_capability_sets, CapabilitySets,
+    apply_capabilities, apply_thread_capabilities, drop_bounding_set,
+    restore_effective_capabilities, validate_capability_sets, CapabilitySets,
 };
 pub use capability_map::{Capability, CapabilityMap};
 pub use error::SecurityError;

@@ -6,6 +6,7 @@ members = [
     "crates/tavik-daemon",
     "crates/tavik-cli",
     "crates/tavik-runtime",
+    "crates/tavik-cgroups",
     "tests/integration",
 ]
 
@@ -23,6 +24,7 @@ tavik-common = { path = "crates/tavik-common" }
 tavik-core = { path = "crates/tavik-core" }
 tavik-daemon = { path = "crates/tavik-daemon" }
 tavik-runtime = { path = "crates/tavik-runtime" }
+tavik-cgroups = { path = "crates/tavik-cgroups" }
 
 tokio = { version = "1.41", features = ["full"] }
 clap = { version = "4.5", features = ["derive", "env"] }

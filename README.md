@@ -285,11 +285,11 @@ macOS and Windows can be used as development hosts, but running Linux containers
 ### Clone the repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/Tavik.git
+git clone https://github.com/notAryan10/Tavik.git
 cd Tavik
 ```
 
-Replace `YOUR_USERNAME` with the repository owner's GitHub username.
+Replace `notAryan10` with the repository owner's GitHub username.
 
 ### Build the project
 

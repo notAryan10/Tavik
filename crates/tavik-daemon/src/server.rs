@@ -7,6 +7,7 @@ use tavik_common::error::{Result, TavikError};
 use tavik_common::protocol::{Action, Request, Response, TavikClientCodec, TavikServerCodec};
 use tavik_common::system::SystemInfo;
 use tavik_core::{ProcessSupervisor, StateStore};
+use tavik_runtime::ContainerExecutor;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
 use tokio_util::codec::Framed;
@@ -16,6 +17,7 @@ pub struct DaemonServer {
     socket_path: PathBuf,
     state_dir: PathBuf,
     supervisor: Arc<ProcessSupervisor>,
+    runtime: Arc<ContainerExecutor>,
     shutdown_tx: broadcast::Sender<()>,
 }
 
@@ -23,12 +25,14 @@ impl DaemonServer {
     pub fn new(socket_path: PathBuf, state_dir: PathBuf) -> Result<Self> {
         let store = StateStore::new(state_dir.clone())?;
         let supervisor = Arc::new(ProcessSupervisor::new(store));
+        let runtime = Arc::new(ContainerExecutor::new(state_dir.join("runtime"))?);
         let (shutdown_tx, _) = broadcast::channel(1);
 
         Ok(Self {
             socket_path,
             state_dir,
             supervisor,
+            runtime,
             shutdown_tx,
         })
     }
@@ -94,6 +98,7 @@ impl DaemonServer {
                     match accept_res {
                         Ok((stream, _)) => {
                             let supervisor = self.supervisor.clone();
+                            let runtime = self.runtime.clone();
                             let shutdown_tx = self.shutdown_tx.clone();
                             let state_dir = self.state_dir.clone();
                             let socket_path = self.socket_path.clone();
@@ -102,6 +107,7 @@ impl DaemonServer {
                                 if let Err(e) = handle_connection(
                                     stream,
                                     supervisor,
+                                    runtime,
                                     shutdown_tx,
                                     &state_dir,
                                     &socket_path
@@ -135,6 +141,7 @@ impl DaemonServer {
 async fn handle_connection(
     stream: UnixStream,
     supervisor: Arc<ProcessSupervisor>,
+    runtime: Arc<ContainerExecutor>,
     shutdown_tx: broadcast::Sender<()>,
     state_dir: &Path,
     socket_path: &Path,
@@ -174,6 +181,31 @@ async fn handle_connection(
                 Ok(proc_info) => Response::ok(req_id, &proc_info)?,
                 Err(err) => Response::err(req_id, err),
             },
+            Action::ContainerCreate { id, bundle } => {
+                match runtime.create(&id, Path::new(&bundle)) {
+                    Ok(state) => Response::ok(req_id, &state)?,
+                    Err(err) => Response::err(req_id, err),
+                }
+            }
+            Action::ContainerStart { id } => match runtime.start(&id) {
+                Ok(state) => Response::ok(req_id, &state)?,
+                Err(err) => Response::err(req_id, err),
+            },
+            Action::ContainerState { id } => match runtime.load_state(&id) {
+                Ok(state) => Response::ok(req_id, &state)?,
+                Err(err) => Response::err(req_id, err),
+            },
+            Action::ContainerKill { id, signal } => {
+                let sig_num = parse_signal(&signal);
+                match runtime.kill(&id, sig_num) {
+                    Ok(()) => Response::ok(req_id, &format!("Signal {} sent", signal))?,
+                    Err(err) => Response::err(req_id, err),
+                }
+            }
+            Action::ContainerDelete { id, force } => match runtime.delete(&id, force) {
+                Ok(()) => Response::ok(req_id, &format!("Container {} deleted", id))?,
+                Err(err) => Response::err(req_id, err),
+            },
             Action::Shutdown => {
                 info!("Shutdown request received via RPC");
                 let _ = shutdown_tx.send(());
@@ -185,4 +217,17 @@ async fn handle_connection(
     }
 
     Ok(())
+}
+
+fn parse_signal(sig: &str) -> i32 {
+    match sig.to_uppercase().as_str() {
+        "SIGTERM" | "15" => 15,
+        "SIGKILL" | "9" => 9,
+        "SIGINT" | "2" => 2,
+        "SIGHUP" | "1" => 1,
+        "SIGQUIT" | "3" => 3,
+        "SIGSTOP" | "19" => 19,
+        "SIGCONT" | "18" => 18,
+        other => other.parse::<i32>().unwrap_or(15),
+    }
 }

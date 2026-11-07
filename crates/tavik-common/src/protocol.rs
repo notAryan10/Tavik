@@ -30,6 +30,11 @@ pub enum Action {
     ProcessStop { id: String, signal: Option<i32> },
     ProcessList,
     ProcessInspect { id: String },
+    ContainerCreate { id: String, bundle: String },
+    ContainerStart { id: String },
+    ContainerState { id: String },
+    ContainerKill { id: String, signal: String },
+    ContainerDelete { id: String, force: bool },
     Shutdown,
 }
 

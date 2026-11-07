@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 tavik-common.workspace = true
 tavik-daemon.workspace = true
+tavik-runtime.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 futures-util.workspace = true

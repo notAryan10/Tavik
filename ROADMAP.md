@@ -6,7 +6,7 @@
 - [x] Protocol and IPC framing specifications.
 - [x] Security and isolation roadmap.
 
-## Phase 1: Foundation Engine (Current)
+## Phase 1: Foundation Engine (Completed)
 - [x] Modular Rust workspace configuration.
 - [x] `tavik-common`: Protocol, IPC framing, typed errors, host feature detection.
 - [x] `tavik-core`: Atomic persistent state store, asynchronous process supervisor.
@@ -14,11 +14,14 @@
 - [x] `tavik-cli`: `tavik` CLI client (`version`, `info`, `daemon`, `ps`, `inspect`, `stop`, `run-task`).
 - [x] Comprehensive unit and integration test suite.
 
-## Phase 2: OCI Container Runtime (`tavikr`)
-- [ ] OCI Runtime Specification v1.2 compliance.
-- [ ] Rootfs preparation and `pivot_root` setup.
-- [ ] Linux namespaces (PID, Mount, Network, UTS, IPC, User).
-- [ ] Container init process and lifecycle state transitions (`creating`, `created`, `running`, `stopped`).
+## Phase 2: OCI Container Runtime (`tavikr`) (Active)
+- [x] OCI Runtime Specification v1.2 compliance models (`config.json`, `ContainerState`).
+- [x] Standalone `tavikr` OCI runtime binary with `create`, `start`, `state`, `kill`, `delete`, and `spec` commands.
+- [x] Bundle loader and integrity validation.
+- [x] Linux namespace configuration (PID, Mount, Network, UTS, IPC).
+- [x] Mount isolation engine (`MS_REC | MS_PRIVATE`, rootfs bind mount, `/proc`, `/sys`, `/dev`).
+- [x] Container init synchronization protocol (socketpair).
+- [x] Daemon RPC integration for OCI container lifecycle management (`tavik container ...`).
 - [ ] Terminal allocation (PTY) and standard I/O forwarding.
 
 ## Phase 3: Resource Governance & Security Controls

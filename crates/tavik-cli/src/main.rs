@@ -87,6 +87,43 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+
+    /// Manage OCI containers
+    #[command(subcommand)]
+    Container(ContainerCommands),
+}
+
+#[derive(Subcommand, Debug)]
+enum ContainerCommands {
+    /// Create an OCI container from a bundle directory
+    Create {
+        container_id: String,
+        #[arg(short, long)]
+        bundle: PathBuf,
+    },
+
+    /// Start an existing OCI container
+    Start { container_id: String },
+
+    /// Query the status/state of an OCI container
+    State { container_id: String },
+
+    /// Send a signal to an OCI container
+    Kill {
+        container_id: String,
+        #[arg(short, long, default_value = "SIGTERM")]
+        signal: String,
+    },
+
+    /// Remove an OCI container
+    Rm {
+        container_id: String,
+        #[arg(short, long)]
+        force: bool,
+    },
+
+    /// Output a standard default OCI spec (config.json)
+    Spec,
 }
 
 fn parse_key_val(s: &str) -> Result<(String, String), String> {
@@ -258,6 +295,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 info.name, info.id, info.pid
             );
         }
+        Commands::Container(sub) => match sub {
+            ContainerCommands::Create {
+                container_id,
+                bundle,
+            } => {
+                let client = Client::new(socket_path);
+                let bundle_str = bundle.to_string_lossy().to_string();
+                let state = client.container_create(container_id, bundle_str).await?;
+                println!("{}", serde_json::to_string_pretty(&state)?);
+            }
+            ContainerCommands::Start { container_id } => {
+                let client = Client::new(socket_path);
+                let state = client.container_start(container_id).await?;
+                println!("{}", serde_json::to_string_pretty(&state)?);
+            }
+            ContainerCommands::State { container_id } => {
+                let client = Client::new(socket_path);
+                let state = client.container_state(container_id).await?;
+                println!("{}", serde_json::to_string_pretty(&state)?);
+            }
+            ContainerCommands::Kill {
+                container_id,
+                signal,
+            } => {
+                let client = Client::new(socket_path);
+                let msg = client.container_kill(container_id, signal).await?;
+                println!("{}", msg);
+            }
+            ContainerCommands::Rm {
+                container_id,
+                force,
+            } => {
+                let client = Client::new(socket_path);
+                let msg = client.container_delete(container_id, force).await?;
+                println!("{}", msg);
+            }
+            ContainerCommands::Spec => {
+                let spec = tavik_runtime::Spec::default_linux();
+                println!("{}", serde_json::to_string_pretty(&spec)?);
+            }
+        },
     }
 
     Ok(())

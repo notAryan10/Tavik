@@ -89,6 +89,33 @@ impl Client {
         serde_json::from_value(val).map_err(Into::into)
     }
 
+    pub async fn container_create(&self, id: String, bundle: String) -> Result<serde_json::Value> {
+        self.send_action(Action::ContainerCreate { id, bundle })
+            .await
+    }
+
+    pub async fn container_start(&self, id: String) -> Result<serde_json::Value> {
+        self.send_action(Action::ContainerStart { id }).await
+    }
+
+    pub async fn container_state(&self, id: String) -> Result<serde_json::Value> {
+        self.send_action(Action::ContainerState { id }).await
+    }
+
+    pub async fn container_kill(&self, id: String, signal: String) -> Result<String> {
+        let val = self
+            .send_action(Action::ContainerKill { id, signal })
+            .await?;
+        serde_json::from_value(val).map_err(Into::into)
+    }
+
+    pub async fn container_delete(&self, id: String, force: bool) -> Result<String> {
+        let val = self
+            .send_action(Action::ContainerDelete { id, force })
+            .await?;
+        serde_json::from_value(val).map_err(Into::into)
+    }
+
     pub async fn shutdown(&self) -> Result<String> {
         let val = self.send_action(Action::Shutdown).await?;
         serde_json::from_value(val).map_err(Into::into)

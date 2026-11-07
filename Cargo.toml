@@ -9,6 +9,7 @@ members = [
     "crates/tavik-cgroups",
     "crates/tavik-security",
     "crates/tavik-registry",
+    "crates/tavik-store",
     "tests/integration",
 ]
 
@@ -29,6 +30,7 @@ tavik-runtime = { path = "crates/tavik-runtime" }
 tavik-cgroups = { path = "crates/tavik-cgroups" }
 tavik-security = { path = "crates/tavik-security" }
 tavik-registry = { path = "crates/tavik-registry" }
+tavik-store = { path = "crates/tavik-store" }
 
 tokio = { version = "1.41", features = ["full"] }
 clap = { version = "4.5", features = ["derive", "env"] }

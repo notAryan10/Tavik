@@ -1,0 +1,22 @@
+[package]
+name = "tavik-store"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Content-addressed image and layer storage for TAVIK"
+
+[dependencies]
+tokio = { workspace = true, features = ["fs", "io-util", "sync"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+hex.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

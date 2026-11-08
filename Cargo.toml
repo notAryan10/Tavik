@@ -10,6 +10,7 @@ members = [
     "crates/tavik-security",
     "crates/tavik-registry",
     "crates/tavik-store",
+    "crates/tavik-image",
     "tests/integration",
 ]
 
@@ -31,6 +32,7 @@ tavik-cgroups = { path = "crates/tavik-cgroups" }
 tavik-security = { path = "crates/tavik-security" }
 tavik-registry = { path = "crates/tavik-registry" }
 tavik-store = { path = "crates/tavik-store" }
+tavik-image = { path = "crates/tavik-image" }
 
 tokio = { version = "1.41", features = ["full"] }
 clap = { version = "4.5", features = ["derive", "env"] }
@@ -52,3 +54,6 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 sha2 = "0.10"
 hex = "0.4"
 url = "2.5"
+tar = "0.4"
+flate2 = "1.0"
+zstd = "0.13"

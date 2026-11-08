@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tavik_image::config::{ContainerConfig, ImageConfiguration, ImageVolume};
 use tavik_image::user::{resolve_user, ResolvedUser};
 use tavik_image::ImageError;
@@ -296,7 +296,15 @@ fn test_user_resolution_missing_group_file() {
 #[test]
 fn test_user_resolution_malformed_passwd_records() {
     let cases = [
-        ("alice:x:1000\n", "expected at least 4 fields"),
+        ("alice:x:1000\n", "expected exactly 7 fields"),
+        (
+            "alice:x:1000:1000::/home/alice\n",
+            "expected exactly 7 fields",
+        ), // 6 fields (truncated)
+        (
+            "alice:x:1000:1000::/home/alice:/bin/sh:extra\n",
+            "expected exactly 7 fields",
+        ), // 8 fields (overlong)
         (":x:1000:1000::/home/alice:/bin/sh\n", "username is empty"),
         (
             "alice:x:notanumber:1000::/home/alice:/bin/sh\n",
@@ -322,7 +330,12 @@ fn test_user_resolution_malformed_passwd_records() {
 fn test_user_resolution_malformed_group_records() {
     let passwd = "alice:x:1001:1001::/home/alice:/bin/sh\n";
     let cases = [
-        ("developers:x\n", "expected at least 3 fields"),
+        ("developers:x\n", "expected exactly 4 fields"), // 2 fields (truncated)
+        ("developers:x:7000\n", "expected exactly 4 fields"), // 3 fields (truncated)
+        (
+            "developers:x:7000:alice:extra\n",
+            "expected exactly 4 fields",
+        ), // 5 fields (overlong)
         (":x:1001:\n", "groupname is empty"),
         ("developers:x:notanumber:\n", "invalid numeric GID"),
     ];
@@ -335,6 +348,155 @@ fn test_user_resolution_malformed_group_records() {
             "Expected error containing '{expected_msg}', got: {err:?}"
         );
     }
+}
+
+#[test]
+fn test_user_resolution_valid_empty_fields_comments_and_blank_lines() {
+    // Valid /etc/passwd with blank lines, comments, empty password, empty gecos, empty home, empty shell
+    let passwd = "\
+# This is a comment at the top
+root:*:0:0:::
+
+# Blank line above and comment here
+alice::1001:1001::/home/alice:/bin/sh
+bob:x:1002:1002:Bob Gecos::
+";
+    // Valid /etc/group with blank lines, comments, empty password, empty members
+    let group = "\
+# Group comment
+root:x:0:
+alice::1001:
+developers:x:2000:
+# Another comment
+staff:*:3000:bob
+";
+    let rootfs = setup_test_rootfs(Some(passwd), Some(group));
+
+    let res_root =
+        resolve_user(rootfs.path(), Some("root")).expect("Root resolution should succeed");
+    assert_eq!(res_root.uid, 0);
+    assert_eq!(res_root.gid, 0);
+    assert_eq!(res_root.username, Some("root".to_string()));
+
+    let res_alice =
+        resolve_user(rootfs.path(), Some("alice")).expect("Alice resolution should succeed");
+    assert_eq!(res_alice.uid, 1001);
+    assert_eq!(res_alice.gid, 1001);
+
+    let res_bob = resolve_user(rootfs.path(), Some("bob")).expect("Bob resolution should succeed");
+    assert_eq!(res_bob.uid, 1002);
+    assert_eq!(res_bob.gid, 1002);
+    assert_eq!(res_bob.additional_gids, vec![3000]);
+}
+
+#[test]
+fn test_user_resolution_fifo_passwd_and_group_fails_promptly() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    // Test FIFO for /etc/passwd
+    {
+        let dir = tempdir().expect("Failed to create tempdir");
+        let etc_dir = dir.path().join("etc");
+        fs::create_dir_all(&etc_dir).expect("Failed to create etc directory");
+        let passwd_path = etc_dir.join("passwd");
+
+        let c_path = CString::new(passwd_path.as_os_str().as_bytes()).unwrap();
+        let res = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(res, 0, "mkfifo failed for passwd");
+
+        let start = std::time::Instant::now();
+        let err = resolve_user(dir.path(), Some("1000")).unwrap_err();
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "Resolution on FIFO passwd took too long: {elapsed:?}"
+        );
+        assert!(
+            matches!(err, ImageError::InvalidConfiguration(ref msg) if msg.contains("not a regular file")),
+            "Expected non-regular file error, got: {err:?}"
+        );
+    }
+
+    // Test FIFO for /etc/group
+    {
+        let dir = tempdir().expect("Failed to create tempdir");
+        let etc_dir = dir.path().join("etc");
+        fs::create_dir_all(&etc_dir).expect("Failed to create etc directory");
+        let passwd_path = etc_dir.join("passwd");
+        fs::write(passwd_path, "alice:x:1001:1001:Alice:/home/alice:/bin/sh\n")
+            .expect("Failed to write passwd");
+        let group_path = etc_dir.join("group");
+
+        let c_path = CString::new(group_path.as_os_str().as_bytes()).unwrap();
+        let res = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(res, 0, "mkfifo failed for group");
+
+        let start = std::time::Instant::now();
+        let err = resolve_user(dir.path(), Some("alice")).unwrap_err();
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "Resolution on FIFO group took too long: {elapsed:?}"
+        );
+        assert!(
+            matches!(err, ImageError::InvalidConfiguration(ref msg) if msg.contains("not a regular file")),
+            "Expected non-regular file error for group, got: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn test_user_resolution_etc_as_regular_file_fails_loudly() {
+    let dir = tempdir().expect("Failed to create tempdir");
+    let etc_file = dir.path().join("etc");
+    // Create /etc as a regular file rather than a directory
+    fs::write(&etc_file, "this is a regular file, not a directory")
+        .expect("Failed to write file at /etc");
+
+    let err = resolve_user(dir.path(), Some("1000")).unwrap_err();
+    assert!(
+        matches!(err, ImageError::Io(ref e) if e.raw_os_error() == Some(libc::ENOTDIR)),
+        "Expected ENOTDIR error for non-directory /etc, got: {err:?}"
+    );
+}
+
+#[test]
+fn test_safe_dir_read_file_to_string_limited_overflow_and_limits() {
+    use tavik_image::SafeDir;
+
+    let dir = tempdir().expect("Failed to create tempdir");
+    let file_path = dir.path().join("test.txt");
+    fs::write(&file_path, "hello world 12345").expect("Failed to write test file");
+
+    let safe_dir = SafeDir::open_rootfs(dir.path()).expect("SafeDir open failed");
+
+    // Arithmetic overflow on limit + 1: u64::MAX
+    let err_overflow = safe_dir
+        .read_file_to_string_limited(Path::new("test.txt"), u64::MAX)
+        .unwrap_err();
+    assert!(
+        matches!(err_overflow, ImageError::InvalidConfiguration(ref msg) if msg.contains("overflows u64")),
+        "Expected limit overflow error, got: {err_overflow:?}"
+    );
+
+    // Limit exceeded: file has 17 bytes, limit is 5 bytes
+    let err_limit = safe_dir
+        .read_file_to_string_limited(Path::new("test.txt"), 5)
+        .unwrap_err();
+    assert!(
+        matches!(err_limit, ImageError::InvalidConfiguration(ref msg) if msg.contains("exceeds maximum allowed size")),
+        "Expected size limit error, got: {err_limit:?}"
+    );
+
+    // Exact limit success: file has 17 bytes, limit is 17 bytes
+    let content = safe_dir
+        .read_file_to_string_limited(Path::new("test.txt"), 17)
+        .expect("Exact limit should succeed")
+        .expect("File should exist");
+    assert_eq!(content, "hello world 12345");
 }
 
 #[test]

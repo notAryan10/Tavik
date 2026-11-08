@@ -510,6 +510,8 @@ impl SafeDir {
 
     /// Opens an existing file for reading relative to this directory descriptor with `O_NOFOLLOW`.
     /// Does not create parent directories or follow intermediate/final symlinks.
+    /// Uses `O_NONBLOCK` to prevent blocking on FIFOs or special files, and verifies `S_IFREG`
+    /// both before (via `fstatat`) and after (via `fstat`) opening.
     pub fn open_read_file_at(&self, rel_path: &Path) -> Result<std::fs::File, ImageError> {
         let components = self.validate_path(rel_path)?;
         let (parent_dir, final_comp) = self.resolve_parent_dir(&components, false)?;
@@ -517,7 +519,31 @@ impl SafeDir {
             ImageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
         })?;
 
-        let safe_flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // Inspect entry with fstatat(AT_SYMLINK_NOFOLLOW) before opening and reject known non-regular files
+        let mut pre_st: libc::stat = unsafe { std::mem::zeroed() };
+        let fstatat_res = unsafe {
+            libc::fstatat(
+                parent_dir.as_raw_fd(),
+                c_final.as_ptr(),
+                &mut pre_st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if fstatat_res == 0 {
+            if (pre_st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+                return Err(ImageError::InvalidConfiguration(format!(
+                    "Path '{}' is not a regular file",
+                    rel_path.display()
+                )));
+            }
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ENOENT) {
+                return Err(ImageError::Io(err));
+            }
+        }
+
+        let safe_flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC;
         let raw_fd = unsafe { libc::openat(parent_dir.as_raw_fd(), c_final.as_ptr(), safe_flags) };
         if raw_fd < 0 {
             return Err(ImageError::Io(std::io::Error::last_os_error()));
@@ -545,19 +571,36 @@ impl SafeDir {
 
     /// Reads up to `max_bytes` from a file relative to this rootfs without following symlinks.
     /// Returns `Ok(None)` if the file or an intermediate parent directory does not exist (ENOENT).
-    /// Returns `Err(...)` if the file exists but is unreadable, exceeds `max_bytes`, or is a symlink.
+    /// Returns `Err(...)` if the file exists but is unreadable, exceeds `max_bytes`, is a symlink,
+    /// or if an intermediate component is not a directory (ENOTDIR).
     pub fn read_file_to_string_limited(
         &self,
         rel_path: &Path,
         max_bytes: u64,
     ) -> Result<Option<String>, ImageError> {
+        let take_limit = max_bytes.checked_add(1).ok_or_else(|| {
+            ImageError::InvalidConfiguration(format!(
+                "Invalid read limit for '{}': limit {} overflows u64",
+                rel_path.display(),
+                max_bytes
+            ))
+        })?;
+
+        let max_usize = usize::try_from(max_bytes).map_err(|_| {
+            ImageError::InvalidConfiguration(format!(
+                "Invalid read limit for '{}': limit {} exceeds system address space",
+                rel_path.display(),
+                max_bytes
+            ))
+        })?;
+
         match self.open_read_file_at(rel_path) {
             Ok(mut file) => {
                 use std::io::Read;
                 let mut buffer = Vec::new();
-                let mut take = (&mut file).take(max_bytes + 1);
+                let mut take = (&mut file).take(take_limit);
                 take.read_to_end(&mut buffer).map_err(ImageError::Io)?;
-                if buffer.len() > max_bytes as usize {
+                if buffer.len() > max_usize {
                     return Err(ImageError::InvalidConfiguration(format!(
                         "File '{}' exceeds maximum allowed size of {} bytes",
                         rel_path.display(),
@@ -574,8 +617,7 @@ impl SafeDir {
             }
             Err(ImageError::Io(ref e))
                 if e.kind() == std::io::ErrorKind::NotFound
-                    || e.raw_os_error() == Some(libc::ENOENT)
-                    || e.raw_os_error() == Some(libc::ENOTDIR) =>
+                    || e.raw_os_error() == Some(libc::ENOENT) =>
             {
                 Ok(None)
             }

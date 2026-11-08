@@ -228,9 +228,9 @@ fn parse_passwd(content: &str) -> Result<Vec<PasswdRecord>, ImageError> {
             continue;
         }
         let fields: Vec<&str> = line.split(':').collect();
-        if fields.len() < 4 {
+        if fields.len() != 7 {
             return Err(ImageError::InvalidConfiguration(format!(
-                "Malformed /etc/passwd record at line {}: expected at least 4 fields, found {}",
+                "Malformed /etc/passwd record at line {}: expected exactly 7 fields, found {}",
                 line_num + 1,
                 fields.len()
             )));
@@ -273,9 +273,9 @@ fn parse_group(content: &str) -> Result<Vec<GroupRecord>, ImageError> {
             continue;
         }
         let fields: Vec<&str> = line.split(':').collect();
-        if fields.len() < 3 {
+        if fields.len() != 4 {
             return Err(ImageError::InvalidConfiguration(format!(
-                "Malformed /etc/group record at line {}: expected at least 3 fields, found {}",
+                "Malformed /etc/group record at line {}: expected exactly 4 fields, found {}",
                 line_num + 1,
                 fields.len()
             )));
@@ -294,7 +294,7 @@ fn parse_group(content: &str) -> Result<Vec<GroupRecord>, ImageError> {
                 fields[2]
             ))
         })?;
-        let members: Vec<String> = if fields.len() >= 4 && !fields[3].trim().is_empty() {
+        let members: Vec<String> = if !fields[3].trim().is_empty() {
             fields[3]
                 .split(',')
                 .map(|m| m.trim().to_string())

@@ -7,6 +7,9 @@ license.workspace = true
 
 [dependencies]
 tavik-common.workspace = true
+tavik-store.workspace = true
+tavik-image.workspace = true
+tavik-runtime.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -14,9 +17,14 @@ tracing.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+sha2.workspace = true
+hex.workspace = true
+flate2.workspace = true
+zstd.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true
+tar.workspace = true

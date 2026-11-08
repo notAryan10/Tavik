@@ -485,8 +485,40 @@ fn run_container_init_child(
     let mut c_envs_ptrs: Vec<*const libc::c_char> = c_envs.iter().map(|s| s.as_ptr()).collect();
     c_envs_ptrs.push(std::ptr::null());
 
+    // Resolve binary path along the container's PATH if args[0] does not contain '/'
+    // We are already inside the container rootfs post-pivot_root, so access checks
+    // exclusively inspect the container filesystem and never touch host executables.
+    let executable_c = if !proc.args[0].contains('/') {
+        let container_path = proc
+            .env
+            .iter()
+            .find_map(|e| e.strip_prefix("PATH="))
+            .unwrap_or("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+
+        let mut found_path = None;
+        for dir in container_path.split(':') {
+            if dir.is_empty() {
+                continue;
+            }
+            let candidate = std::path::Path::new(dir).join(&proc.args[0]);
+            if let Ok(c_cand) = CString::new(candidate.to_str().unwrap_or("")) {
+                if unsafe { libc::access(c_cand.as_ptr(), libc::X_OK) } == 0 {
+                    found_path = Some(c_cand);
+                    break;
+                }
+            }
+        }
+        found_path.unwrap_or_else(|| c_args[0].clone())
+    } else {
+        c_args[0].clone()
+    };
+
     unsafe {
-        libc::execve(c_args_ptrs[0], c_args_ptrs.as_ptr(), c_envs_ptrs.as_ptr());
+        libc::execve(
+            executable_c.as_ptr(),
+            c_args_ptrs.as_ptr(),
+            c_envs_ptrs.as_ptr(),
+        );
     }
 
     Err(TavikError::Execution(format!(

@@ -873,6 +873,50 @@ fn test_blob_modification_replacement_between_passes() {
 }
 
 #[test]
+fn test_blob_atomic_replacement_between_passes() {
+    let temp = tempdir().unwrap();
+    let rootfs = temp.path().join("rootfs");
+    std::fs::create_dir_all(&rootfs).unwrap();
+
+    let mut tar_builder = Builder::new(Vec::new());
+    let data = b"initial_content";
+    let mut header = Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_mode(0o644);
+    header.set_size(data.len() as u64);
+    header.set_cksum();
+    tar_builder
+        .append_data(&mut header, "test.txt", Cursor::new(data))
+        .unwrap();
+
+    let tar_bytes = tar_builder.into_inner().unwrap();
+    let blob_path = temp.path().join("layer.tar");
+    let layer = write_tar_layer(&tar_bytes, &blob_path, false);
+
+    // Prepare a separate replacement file with a different inode and content
+    let replacement_path = temp.path().join("replacement.tar");
+    std::fs::write(&replacement_path, b"replaced_blob_content").unwrap();
+
+    let mut unpacker = ImageUnpacker::new();
+    let blob_path_clone = blob_path.clone();
+    let replacement_path_clone = replacement_path.clone();
+    unpacker.set_mid_pass_hook(move || {
+        // Atomically replace the blob file with the new file between pass 1 and pass 2
+        std::fs::rename(&replacement_path_clone, &blob_path_clone).unwrap();
+    });
+
+    let res = unpacker.unpack_layer(&layer, &rootfs);
+
+    // Must fail because the blob path was replaced with a different file
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert!(matches!(
+        err,
+        ImageError::CorruptArchive(_) | ImageError::BlobDigestMismatch { .. }
+    ));
+}
+
+#[test]
 fn test_empty_or_unsupported_layer_digest_rejected() {
     let temp = tempdir().unwrap();
     let rootfs = temp.path().join("rootfs");

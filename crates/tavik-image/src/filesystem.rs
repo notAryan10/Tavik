@@ -327,10 +327,17 @@ impl SafeDir {
                             return Err(ImageError::Io(std::io::Error::last_os_error()));
                         }
                         let ret = unsafe { libc::fchmod(tmp_raw, 0o755) };
-                        let chmod_err = std::io::Error::last_os_error();
-                        unsafe { libc::close(tmp_raw) };
-                        if ret != 0 {
-                            return Err(ImageError::Io(chmod_err));
+                        let chmod_err = if ret != 0 {
+                            Some(std::io::Error::last_os_error())
+                        } else {
+                            None
+                        };
+                        let close_ret = unsafe { libc::close(tmp_raw) };
+                        if let Some(err) = chmod_err {
+                            return Err(ImageError::Io(err));
+                        }
+                        if close_ret != 0 {
+                            return Err(ImageError::Io(std::io::Error::last_os_error()));
                         }
                     }
                     next_raw = unsafe {
@@ -730,8 +737,16 @@ impl SafeDir {
                 }
 
                 let ret = unsafe { libc::fchmod(raw_open, (m & 0o7777) as libc::mode_t) };
-                unsafe { libc::close(raw_open) };
-                if ret != 0 {
+                let chmod_err = if ret != 0 {
+                    Some(std::io::Error::last_os_error())
+                } else {
+                    None
+                };
+                let close_ret = unsafe { libc::close(raw_open) };
+                if let Some(err) = chmod_err {
+                    return Err(ImageError::Io(err));
+                }
+                if close_ret != 0 {
                     return Err(ImageError::Io(std::io::Error::last_os_error()));
                 }
             }

@@ -676,25 +676,7 @@ impl RootfsBuilder {
             return Err(ImageError::Io(std::io::Error::last_os_error()));
         }
 
-        // Explicitly enforce 0700 permissions on staging directory via fchmod (propagate errors)
-        let staging_open = unsafe {
-            libc::openat(
-                parent_fd.as_raw_fd(),
-                c_staging_name.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if staging_open < 0 {
-            return Err(ImageError::Io(std::io::Error::last_os_error()));
-        }
-        let ret = unsafe { libc::fchmod(staging_open, 0o700) };
-        let chmod_err = std::io::Error::last_os_error();
-        unsafe { libc::close(staging_open) };
-        if ret != 0 {
-            return Err(ImageError::Io(chmod_err));
-        }
-
-        // Reliable RAII Cleanup Guard for staging directory
+        // Reliable RAII Cleanup Guard for staging directory: constructed immediately after mkdirat succeeds
         struct StagingGuard {
             parent_fd: RawFd,
             staging_name: CString,
@@ -730,6 +712,31 @@ impl RootfsBuilder {
             active: true,
         };
 
+        // Explicitly enforce 0700 permissions on staging directory via fchmod (propagate errors)
+        let staging_open = unsafe {
+            libc::openat(
+                parent_fd.as_raw_fd(),
+                c_staging_name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if staging_open < 0 {
+            return Err(ImageError::Io(std::io::Error::last_os_error()));
+        }
+        let ret = unsafe { libc::fchmod(staging_open, 0o700) };
+        let chmod_err = if ret != 0 {
+            Some(std::io::Error::last_os_error())
+        } else {
+            None
+        };
+        let close_ret = unsafe { libc::close(staging_open) };
+        if let Some(err) = chmod_err {
+            return Err(ImageError::Io(err));
+        }
+        if close_ret != 0 {
+            return Err(ImageError::Io(std::io::Error::last_os_error()));
+        }
+
         let staging_path = parent_path.join(&staging_name);
 
         // Apply layers sequentially in OCI layer order
@@ -757,13 +764,23 @@ impl RootfsBuilder {
         }
         if (root_stat.st_mode & 0o777) == 0o700 {
             let ret = unsafe { libc::fchmod(staging_open, 0o755) };
-            let chmod_err = std::io::Error::last_os_error();
-            unsafe { libc::close(staging_open) };
-            if ret != 0 {
-                return Err(ImageError::Io(chmod_err));
+            let chmod_err = if ret != 0 {
+                Some(std::io::Error::last_os_error())
+            } else {
+                None
+            };
+            let close_ret = unsafe { libc::close(staging_open) };
+            if let Some(err) = chmod_err {
+                return Err(ImageError::Io(err));
+            }
+            if close_ret != 0 {
+                return Err(ImageError::Io(std::io::Error::last_os_error()));
             }
         } else {
-            unsafe { libc::close(staging_open) };
+            let close_ret = unsafe { libc::close(staging_open) };
+            if close_ret != 0 {
+                return Err(ImageError::Io(std::io::Error::last_os_error()));
+            }
         }
 
         // Publish completed rootfs with atomic no-replace semantics

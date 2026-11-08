@@ -51,6 +51,12 @@ pub enum ImageError {
     #[error("Corrupt archive data: {0}")]
     CorruptArchive(String),
 
+    #[error("Invalid image configuration: {0}")]
+    InvalidConfiguration(String),
+
+    #[error("Configuration JSON parsing error: {0}")]
+    Json(#[from] serde_json::Error),
+
     #[error("Storage error: {0}")]
     Store(#[from] tavik_store::StoreError),
 

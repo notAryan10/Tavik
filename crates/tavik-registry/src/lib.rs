@@ -4,6 +4,7 @@ pub mod descriptor;
 pub mod error;
 pub mod manifest;
 pub mod reference;
+pub mod store_integration;
 
 pub use auth::{AuthChallenge, AuthManager, RegistryCredentials};
 pub use client::{DownloadedBlob, RegistryClient};
@@ -15,3 +16,4 @@ pub use descriptor::{
 pub use error::RegistryError;
 pub use manifest::{Manifest, OciImageIndex, OciManifest};
 pub use reference::ImageReference;
+pub use store_integration::{pull_image, PullResult};

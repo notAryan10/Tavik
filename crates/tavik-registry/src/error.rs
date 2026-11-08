@@ -52,6 +52,9 @@ pub enum RegistryError {
     #[error("Registry protocol error: {0}")]
     Protocol(String),
 
+    #[error("Storage error: {0}")]
+    Store(#[from] tavik_store::StoreError),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }

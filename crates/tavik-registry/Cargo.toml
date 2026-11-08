@@ -19,6 +19,8 @@ hex = { workspace = true }
 url = { workspace = true }
 futures-util = { workspace = true }
 uuid = { workspace = true }
+chrono = { workspace = true }
+tavik-store = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

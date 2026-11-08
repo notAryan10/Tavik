@@ -43,9 +43,27 @@ impl Drop for CgroupGuard {
 }
 
 #[cfg(target_os = "linux")]
+pub const START_FIFO_FD: i32 = 3;
+#[cfg(target_os = "linux")]
+pub const EXEC_STATUS_FD: i32 = 4;
+
+#[cfg(target_os = "linux")]
+fn write_ready_error_and_exit(ready_fd: i32, msg: &str) -> ! {
+    unsafe {
+        let _ = libc::write(ready_fd, msg.as_ptr() as *const libc::c_void, msg.len());
+        libc::close(ready_fd);
+        libc::_exit(1);
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn write_exec_error_and_exit(msg: &str) -> ! {
     unsafe {
-        let _ = libc::write(3, msg.as_ptr() as *const libc::c_void, msg.len());
+        let _ = libc::write(
+            EXEC_STATUS_FD,
+            msg.as_ptr() as *const libc::c_void,
+            msg.len(),
+        );
         libc::_exit(1);
     }
 }
@@ -266,7 +284,7 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
     }
 
     // 10. Wait for child init process to signal readiness over pipe
-    let mut buf = [0u8; 16];
+    let mut buf = [0u8; 512];
     let n = unsafe {
         libc::read(
             ready_pipe[0],
@@ -284,20 +302,48 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
             let mut status = 0;
             libc::waitpid(child_pid, &mut status, 0);
         }
-        let msg = format!("Container init child failed to signal readiness");
+        let err_msg = if n > 0 {
+            format!(
+                "Container init child setup failed: {}",
+                String::from_utf8_lossy(&buf[..n as usize])
+            )
+        } else {
+            "Container init child exited prematurely without signaling readiness".to_string()
+        };
+        let _ = unsafe { libc::write(trampoline_pipe[1], err_msg.as_ptr() as _, err_msg.len()) };
+        drop(cgroup_guard);
+        unsafe { libc::_exit(1) };
+    }
+
+    // 11. Record host PID and persist state as Created (FAIL-CLOSED)
+    let pid_write_res = fs::write(&pid_file, child_pid.to_string());
+    let state_write_res = (|| -> Result<()> {
+        pid_write_res.map_err(|e| TavikError::Io(format!("Failed to write pid file: {}", e)))?;
+        let lock_path = container_dir.join("state.lock");
+        let _lock = crate::executor::StateLock::acquire(&lock_path)?;
+        let mut updated_state = state;
+        updated_state.status = ContainerStatus::Created;
+        updated_state.pid = Some(child_pid as u32);
+        let tmp_file = container_dir.join("state.json.tmp");
+        let json = serde_json::to_string_pretty(&updated_state)?;
+        fs::write(&tmp_file, json)?;
+        fs::rename(&tmp_file, &state_file)?;
+        Ok(())
+    })();
+
+    if let Err(e) = state_write_res {
+        unsafe {
+            libc::kill(child_pid, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(child_pid, &mut status, 0);
+        }
+        let msg = format!("Failed to persist Created container state: {}", e);
         let _ = unsafe { libc::write(trampoline_pipe[1], msg.as_ptr() as _, msg.len()) };
         drop(cgroup_guard);
         unsafe { libc::_exit(1) };
     }
 
-    // 11. Record host PID and persist state as Created
-    let _ = fs::write(&pid_file, child_pid.to_string());
-    let mut updated_state = state;
-    updated_state.status = ContainerStatus::Created;
-    updated_state.pid = Some(child_pid as u32);
-    if let Ok(json) = serde_json::to_string_pretty(&updated_state) {
-        let _ = fs::write(&state_file, json);
-    }
+    let owns_cgroup = cgroup_guard.is_some();
 
     // Ownership of cgroup transferred to running container lifecycle; disarm guard
     if let Some(mut guard) = cgroup_guard {
@@ -311,26 +357,76 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
     // --- SUPERVISORY LOOP ---
     // The supervisor remains active to reap the child and update state upon exit
     let mut status = 0;
-    unsafe {
-        libc::waitpid(child_pid, &mut status, 0);
+    loop {
+        let res = unsafe { libc::waitpid(child_pid, &mut status, 0) };
+        if res < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            eprintln!(
+                "Supervisor waitpid on child PID {} failed: {}",
+                child_pid, err
+            );
+            break;
+        }
+        if res == child_pid {
+            break;
+        }
     }
 
-    // Child exited: update container state to Stopped
-    if let Ok(content) = fs::read_to_string(&state_file) {
-        if let Ok(mut st) = serde_json::from_str::<ContainerState>(&content) {
-            st.status = ContainerStatus::Stopped;
-            if let Ok(json) = serde_json::to_string_pretty(&st) {
-                let _ = fs::write(&state_file, json);
+    // Child exited: transition container state to Stopped with StateLock
+    let lock_path = container_dir.join("state.lock");
+    if let Ok(_lock) = crate::executor::StateLock::acquire(&lock_path) {
+        if let Ok(content) = fs::read_to_string(&state_file) {
+            if let Ok(mut st) = serde_json::from_str::<ContainerState>(&content) {
+                st.status = ContainerStatus::Stopped;
+                let tmp_file = container_dir.join("state.json.tmp");
+                if let Ok(json) = serde_json::to_string_pretty(&st) {
+                    if fs::write(&tmp_file, json).is_ok() {
+                        let _ = fs::rename(&tmp_file, &state_file);
+                    }
+                }
             }
         }
     }
 
-    // Destroy container cgroup on exit
-    if let Ok(mgr) = tavik_cgroups::CgroupManager::new() {
-        let _ = mgr.destroy_container_cgroup(id);
+    // Destroy container cgroup on exit ONLY if owned by this supervisor
+    if owns_cgroup {
+        match tavik_cgroups::CgroupManager::new() {
+            Ok(mgr) => {
+                if let Err(e) = mgr.destroy_container_cgroup(id) {
+                    eprintln!(
+                        "Warning: failed to destroy cgroup for container '{}': {}",
+                        id, e
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: failed to initialize cgroup manager for cleanup of '{}': {}",
+                    id, e
+                );
+            }
+        }
     }
-    let _ = fs::remove_file(&start_fifo_path);
-    let _ = fs::remove_file(&exec_fifo_path);
+
+    if let Err(e) = fs::remove_file(&start_fifo_path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!(
+                "Warning: failed to remove start FIFO {:?}: {}",
+                start_fifo_path, e
+            );
+        }
+    }
+    if let Err(e) = fs::remove_file(&exec_fifo_path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!(
+                "Warning: failed to remove exec FIFO {:?}: {}",
+                exec_fifo_path, e
+            );
+        }
+    }
 
     unsafe { libc::_exit(0) };
 }
@@ -345,30 +441,104 @@ fn run_container_init_child(
 ) {
     use std::ffi::CString;
 
-    // 1. Open start FIFO with O_RDWR before pivot_root so open does not block
-    let c_fifo = CString::new(start_fifo_path.to_str().unwrap()).unwrap();
-    let fifo_fd = unsafe { libc::open(c_fifo.as_ptr(), libc::O_RDWR) };
-    if fifo_fd < 0 {
-        eprintln!("Failed to open start FIFO in child");
+    // Relocate ready_pipe_write_fd to descriptor >= 10 with FD_CLOEXEC
+    let safe_ready_fd = unsafe { libc::fcntl(ready_pipe_write_fd, libc::F_DUPFD_CLOEXEC, 10) };
+    if safe_ready_fd < 0 {
+        eprintln!("Failed to relocate ready pipe fd");
         unsafe { libc::_exit(1) };
+    }
+    if safe_ready_fd != ready_pipe_write_fd {
+        unsafe {
+            libc::close(ready_pipe_write_fd);
+        }
     }
 
-    // 2. Open exec FIFO with O_RDWR and dup2 to fixed descriptor 3 (FD_CLOEXEC)
-    let c_exec_fifo = CString::new(exec_fifo_path.to_str().unwrap()).unwrap();
-    let exec_fd = unsafe { libc::open(c_exec_fifo.as_ptr(), libc::O_RDWR) };
-    if exec_fd < 0 {
-        eprintln!("Failed to open exec FIFO in child");
-        unsafe { libc::_exit(1) };
+    // 1. Open start FIFO with O_RDWR before pivot_root so open does not block
+    let c_start_fifo = match CString::new(start_fifo_path.to_str().unwrap_or("")) {
+        Ok(c) => c,
+        Err(_) => write_ready_error_and_exit(safe_ready_fd, "Invalid start FIFO path"),
+    };
+    let raw_start_fd = unsafe { libc::open(c_start_fifo.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    if raw_start_fd < 0 {
+        let err = std::io::Error::last_os_error();
+        write_ready_error_and_exit(
+            safe_ready_fd,
+            &format!("Failed to open start FIFO: {}", err),
+        );
+    }
+    let safe_start_fd = unsafe { libc::fcntl(raw_start_fd, libc::F_DUPFD_CLOEXEC, 10) };
+    if safe_start_fd < 0 {
+        let err = std::io::Error::last_os_error();
+        write_ready_error_and_exit(
+            safe_ready_fd,
+            &format!("Failed to relocate start FIFO fd: {}", err),
+        );
+    }
+    if safe_start_fd != raw_start_fd {
+        unsafe {
+            libc::close(raw_start_fd);
+        }
+    }
+
+    // 2. Open exec FIFO with O_RDWR
+    let c_exec_fifo = match CString::new(exec_fifo_path.to_str().unwrap_or("")) {
+        Ok(c) => c,
+        Err(_) => write_ready_error_and_exit(safe_ready_fd, "Invalid exec FIFO path"),
+    };
+    let raw_exec_fd = unsafe { libc::open(c_exec_fifo.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    if raw_exec_fd < 0 {
+        let err = std::io::Error::last_os_error();
+        write_ready_error_and_exit(safe_ready_fd, &format!("Failed to open exec FIFO: {}", err));
+    }
+    let safe_exec_fd = unsafe { libc::fcntl(raw_exec_fd, libc::F_DUPFD_CLOEXEC, 10) };
+    if safe_exec_fd < 0 {
+        let err = std::io::Error::last_os_error();
+        write_ready_error_and_exit(
+            safe_ready_fd,
+            &format!("Failed to relocate exec FIFO fd: {}", err),
+        );
+    }
+    if safe_exec_fd != raw_exec_fd {
+        unsafe {
+            libc::close(raw_exec_fd);
+        }
+    }
+
+    // Assign dedicated descriptors START_FIFO_FD (3) and EXEC_STATUS_FD (4)
+    if unsafe { libc::dup2(safe_start_fd, START_FIFO_FD) } < 0 {
+        let err = std::io::Error::last_os_error();
+        write_ready_error_and_exit(
+            safe_ready_fd,
+            &format!("Failed to dup2 start FIFO to fd {}: {}", START_FIFO_FD, err),
+        );
     }
     unsafe {
-        if libc::dup2(exec_fd, 3) < 0 {
-            libc::close(exec_fd);
-            libc::_exit(1);
-        }
-        if exec_fd != 3 {
-            libc::close(exec_fd);
-        }
-        libc::fcntl(3, libc::F_SETFD, libc::FD_CLOEXEC);
+        libc::close(safe_start_fd);
+    }
+    if unsafe { libc::fcntl(START_FIFO_FD, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        let err = std::io::Error::last_os_error();
+        write_ready_error_and_exit(
+            safe_ready_fd,
+            &format!("Failed to set FD_CLOEXEC on start FIFO: {}", err),
+        );
+    }
+
+    if unsafe { libc::dup2(safe_exec_fd, EXEC_STATUS_FD) } < 0 {
+        let err = std::io::Error::last_os_error();
+        write_ready_error_and_exit(
+            safe_ready_fd,
+            &format!("Failed to dup2 exec FIFO to fd {}: {}", EXEC_STATUS_FD, err),
+        );
+    }
+    unsafe {
+        libc::close(safe_exec_fd);
+    }
+    if unsafe { libc::fcntl(EXEC_STATUS_FD, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        let err = std::io::Error::last_os_error();
+        write_ready_error_and_exit(
+            safe_ready_fd,
+            &format!("Failed to set FD_CLOEXEC on exec FIFO: {}", err),
+        );
     }
 
     // 3. Unshare Mount, UTS, IPC, Network namespaces for the container
@@ -384,17 +554,28 @@ fn run_container_init_child(
         }
     }
     if unsafe { libc::unshare(child_flags) } != 0 {
-        write_exec_error_and_exit(&format!(
-            "Failed to unshare container namespaces: {}",
-            std::io::Error::last_os_error()
-        ));
+        write_ready_error_and_exit(
+            safe_ready_fd,
+            &format!(
+                "Failed to unshare container namespaces: {}",
+                std::io::Error::last_os_error()
+            ),
+        );
     }
 
     // 4. Set Hostname
     if let Some(hostname) = &spec.hostname {
-        let c_host = CString::new(hostname.as_str()).unwrap();
+        let c_host = match CString::new(hostname.as_str()) {
+            Ok(c) => c,
+            Err(_) => write_ready_error_and_exit(safe_ready_fd, "Invalid hostname"),
+        };
         unsafe {
-            libc::sethostname(c_host.as_ptr(), hostname.len());
+            if libc::sethostname(c_host.as_ptr(), hostname.len()) != 0 {
+                write_ready_error_and_exit(
+                    safe_ready_fd,
+                    &format!("Failed to sethostname: {}", std::io::Error::last_os_error()),
+                );
+            }
         }
     }
 
@@ -409,17 +590,20 @@ fn run_container_init_child(
             std::ptr::null(),
         ) != 0
         {
-            write_exec_error_and_exit(&format!(
-                "Failed to make mount namespace private: {}",
-                std::io::Error::last_os_error()
-            ));
+            write_ready_error_and_exit(
+                safe_ready_fd,
+                &format!(
+                    "Failed to make mount namespace private: {}",
+                    std::io::Error::last_os_error()
+                ),
+            );
         }
     }
 
     // 6. Resolve rootfs and bind mount it to itself
     let root = match &spec.root {
         Some(r) => r,
-        None => write_exec_error_and_exit("Spec missing rootfs definition"),
+        None => write_ready_error_and_exit(safe_ready_fd, "Spec missing rootfs definition"),
     };
     let rootfs_path = if Path::new(&root.path).is_absolute() {
         PathBuf::from(&root.path)
@@ -429,7 +613,7 @@ fn run_container_init_child(
 
     let c_rootfs = match CString::new(rootfs_path.to_str().unwrap_or("")) {
         Ok(c) => c,
-        Err(_) => write_exec_error_and_exit("Invalid rootfs path"),
+        Err(_) => write_ready_error_and_exit(safe_ready_fd, "Invalid rootfs path"),
     };
     unsafe {
         if libc::mount(
@@ -440,17 +624,23 @@ fn run_container_init_child(
             std::ptr::null(),
         ) != 0
         {
-            write_exec_error_and_exit(&format!(
-                "Failed to bind mount rootfs to itself: {}",
-                std::io::Error::last_os_error()
-            ));
+            write_ready_error_and_exit(
+                safe_ready_fd,
+                &format!(
+                    "Failed to bind mount rootfs to itself: {}",
+                    std::io::Error::last_os_error()
+                ),
+            );
         }
     }
 
     // Mount proc inside container rootfs
     let proc_target = rootfs_path.join("proc");
     let _ = fs::create_dir_all(&proc_target);
-    let c_proc_target = CString::new(proc_target.to_str().unwrap()).unwrap();
+    let c_proc_target = match CString::new(proc_target.to_str().unwrap_or("")) {
+        Ok(c) => c,
+        Err(_) => write_ready_error_and_exit(safe_ready_fd, "Invalid proc target path"),
+    };
     let proc_type = CString::new("proc").unwrap();
     unsafe {
         let mount_res = libc::mount(
@@ -461,10 +651,13 @@ fn run_container_init_child(
             std::ptr::null(),
         );
         if mount_res != 0 {
-            write_exec_error_and_exit(&format!(
-                "Failed to mount /proc inside container rootfs: {}",
-                std::io::Error::last_os_error()
-            ));
+            write_ready_error_and_exit(
+                safe_ready_fd,
+                &format!(
+                    "Failed to mount /proc inside container rootfs: {}",
+                    std::io::Error::last_os_error()
+                ),
+            );
         }
     }
 
@@ -472,56 +665,67 @@ fn run_container_init_child(
     let old_root_rel = ".pivot_root";
     let old_root_path = rootfs_path.join(old_root_rel);
     let _ = fs::create_dir_all(&old_root_path);
-    let c_old_root = CString::new(old_root_path.to_str().unwrap()).unwrap();
+    let c_old_root = match CString::new(old_root_path.to_str().unwrap_or("")) {
+        Ok(c) => c,
+        Err(_) => write_ready_error_and_exit(safe_ready_fd, "Invalid old root path"),
+    };
 
     unsafe {
         let ret = libc::syscall(libc::SYS_pivot_root, c_rootfs.as_ptr(), c_old_root.as_ptr());
         if ret != 0 {
-            write_exec_error_and_exit(&format!(
-                "pivot_root failed: {}",
-                std::io::Error::last_os_error()
-            ));
+            write_ready_error_and_exit(
+                safe_ready_fd,
+                &format!("pivot_root failed: {}", std::io::Error::last_os_error()),
+            );
         }
 
         // Chdir to new root
         if libc::chdir(slash.as_ptr()) != 0 {
-            write_exec_error_and_exit(&format!(
-                "chdir to new root failed: {}",
-                std::io::Error::last_os_error()
-            ));
+            write_ready_error_and_exit(
+                safe_ready_fd,
+                &format!(
+                    "chdir to new root failed: {}",
+                    std::io::Error::last_os_error()
+                ),
+            );
         }
 
         // Unmount old root
         let old_root_unmount = CString::new(format!("/{}", old_root_rel)).unwrap();
         if libc::umount2(old_root_unmount.as_ptr(), libc::MNT_DETACH) != 0 {
-            write_exec_error_and_exit(&format!(
-                "umount2 old root failed: {}",
-                std::io::Error::last_os_error()
-            ));
+            write_ready_error_and_exit(
+                safe_ready_fd,
+                &format!(
+                    "umount2 old root failed: {}",
+                    std::io::Error::last_os_error()
+                ),
+            );
         }
         let _ = libc::rmdir(old_root_unmount.as_ptr());
     }
 
     let proc = match &spec.process {
         Some(p) => p,
-        None => write_exec_error_and_exit("Spec missing process definition"),
+        None => write_ready_error_and_exit(safe_ready_fd, "Spec missing process definition"),
     };
 
     // 7. Signal readiness to supervisor
     unsafe {
-        libc::write(
-            ready_pipe_write_fd,
-            b"ready\n".as_ptr() as *const libc::c_void,
-            6,
-        );
-        libc::close(ready_pipe_write_fd);
+        libc::write(safe_ready_fd, b"ready\n".as_ptr() as *const libc::c_void, 6);
+        libc::close(safe_ready_fd);
     }
 
-    // 8. Block waiting for start signal on start FIFO
+    // 8. Block waiting for start signal on START_FIFO_FD (fd 3)
     let mut start_buf = [0u8; 1];
-    let n = unsafe { libc::read(fifo_fd, start_buf.as_mut_ptr() as *mut libc::c_void, 1) };
+    let n = unsafe {
+        libc::read(
+            START_FIFO_FD,
+            start_buf.as_mut_ptr() as *mut libc::c_void,
+            1,
+        )
+    };
     unsafe {
-        libc::close(fifo_fd);
+        libc::close(START_FIFO_FD);
     }
 
     if n <= 0 {
@@ -529,9 +733,13 @@ fn run_container_init_child(
     }
 
     // --- CONTAINER START LIFECYCLE: Strict Security Enforcement ---
-    // 9. File descriptor sanitization: close all fds >= 4 (preserving stdin 0, stdout 1, stderr 2, exec_fd 3)
+    // 9. File descriptor sanitization: close all fds >= 5 (preserving stdin 0, stdout 1, stderr 2, fd 3 closed, EXEC_STATUS_FD 4)
     unsafe {
-        libc::close_range(4, !0u32, 0);
+        if libc::close_range(5, !0u32, 0) != 0 {
+            for fd in 5..256 {
+                libc::close(fd);
+            }
+        }
     }
 
     // 10. Parse capability sets if configured

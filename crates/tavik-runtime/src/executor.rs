@@ -5,6 +5,107 @@ use tavik_common::error::{Result, TavikError};
 #[allow(unused_imports)]
 use tracing::{info, warn};
 
+#[cfg(unix)]
+pub(crate) struct StateLock {
+    file: std::fs::File,
+}
+
+#[cfg(unix)]
+impl StateLock {
+    pub(crate) fn acquire(path: &Path) -> Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|e| TavikError::Io(format!("Failed to open state lock file: {}", e)))?;
+
+        let res =
+            unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) };
+        if res != 0 {
+            return Err(TavikError::Io(format!(
+                "Failed to acquire flock: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        Ok(Self { file })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(
+                std::os::unix::io::AsRawFd::as_raw_fd(&self.file),
+                libc::LOCK_UN,
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct PidFd {
+    fd: i32,
+}
+
+#[cfg(target_os = "linux")]
+impl PidFd {
+    fn open(pid: u32) -> Option<Self> {
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) as i32 };
+        if fd >= 0 {
+            Some(Self { fd })
+        } else {
+            None
+        }
+    }
+
+    fn send_signal(&self, sig: i32) -> Result<()> {
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.fd,
+                sig,
+                std::ptr::null::<libc::c_void>(),
+                0,
+            )
+        };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
+            }
+            return Err(TavikError::Execution(format!(
+                "Failed to send signal {} via pidfd: {}",
+                sig, err
+            )));
+        }
+        Ok(())
+    }
+
+    fn wait_for_exit(&self, timeout: std::time::Duration) -> bool {
+        let mut pfd = libc::pollfd {
+            fd: self.fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+        let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        ret > 0 && (pfd.revents & libc::POLLIN != 0)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PidFd {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
 pub struct ContainerExecutor {
     state_dir: PathBuf,
 }
@@ -19,7 +120,7 @@ impl ContainerExecutor {
         &self.state_dir
     }
 
-    fn container_dir(&self, id: &str) -> PathBuf {
+    pub fn container_dir(&self, id: &str) -> PathBuf {
         self.state_dir.join(id)
     }
 
@@ -68,6 +169,75 @@ impl ContainerExecutor {
         Ok(())
     }
 
+    /// Atomically mutates and persists container state while holding a filesystem lock,
+    /// enforcing strict lifecycle state transition rules.
+    pub fn transition_state<F>(&self, id: &str, mutate: F) -> Result<ContainerState>
+    where
+        F: FnOnce(&mut ContainerState) -> Result<()>,
+    {
+        let container_dir = self.container_dir(id);
+        fs::create_dir_all(&container_dir)?;
+
+        #[cfg(unix)]
+        let lock_path = container_dir.join("state.lock");
+        #[cfg(unix)]
+        let _lock = StateLock::acquire(&lock_path)?;
+
+        let state_path = self.state_file_path(id);
+        if !state_path.exists() {
+            return Err(TavikError::NotFound(format!(
+                "Container '{}' state not found at {:?}",
+                id, state_path
+            )));
+        }
+
+        let content = fs::read_to_string(&state_path)?;
+        let mut state: ContainerState = serde_json::from_str(&content)?;
+        let old_status = state.status;
+
+        mutate(&mut state)?;
+
+        // Enforce valid lifecycle state transitions
+        match (old_status, state.status) {
+            // Identity transitions are valid
+            (s1, s2) if s1 == s2 => {}
+            // Creating -> Created
+            (ContainerStatus::Creating, ContainerStatus::Created) => {}
+            // Created -> Starting
+            (ContainerStatus::Created, ContainerStatus::Starting) => {}
+            // Starting -> Running
+            (ContainerStatus::Starting, ContainerStatus::Running) => {}
+            // Starting -> Stopped (startup failed or short-lived process finished immediately)
+            (ContainerStatus::Starting, ContainerStatus::Stopped) => {}
+            // Running -> Stopped
+            (ContainerStatus::Running, ContainerStatus::Stopped) => {}
+            // Stopped is a terminal state! Can never transition back to Running or Starting
+            (ContainerStatus::Stopped, ContainerStatus::Running) => {
+                // Ignore late Running transition if supervisor already reaped child and marked Stopped
+                state.status = ContainerStatus::Stopped;
+            }
+            (ContainerStatus::Stopped, ContainerStatus::Starting) => {
+                return Err(TavikError::InvalidState(format!(
+                    "Container '{}' has already stopped and cannot be started again",
+                    id
+                )));
+            }
+            (from, to) => {
+                return Err(TavikError::InvalidState(format!(
+                    "Invalid container state transition from '{}' to '{}'",
+                    from, to
+                )));
+            }
+        }
+
+        let tmp_path = container_dir.join("state.json.tmp");
+        let json = serde_json::to_string_pretty(&state)?;
+        fs::write(&tmp_path, json)?;
+        fs::rename(&tmp_path, &state_path)?;
+
+        Ok(state)
+    }
+
     /// Creates an OCI container bundle instance (`create` command).
     pub fn create(&self, id: &str, bundle_dir: &Path) -> Result<ContainerState> {
         let container_dir = self.container_dir(id);
@@ -102,7 +272,7 @@ impl ContainerExecutor {
         self.save_state(&initial_state)?;
 
         // Platform-specific container init creation
-        let final_state = match self.platform_create(id, &spec, &canonical_bundle, initial_state) {
+        let _final_state = match self.platform_create(id, &spec, &canonical_bundle, initial_state) {
             Ok(s) => s,
             Err(e) => {
                 // Clean up failed container state directory so no stale Creating state is left behind
@@ -110,14 +280,14 @@ impl ContainerExecutor {
                 return Err(e);
             }
         };
-        self.save_state(&final_state)?;
 
-        Ok(final_state)
+        // Reload persisted state to guarantee synchronization
+        self.load_state(id)
     }
 
     /// Starts a created OCI container (`start` command).
     pub fn start(&self, id: &str) -> Result<ContainerState> {
-        let mut state = self.load_state(id)?;
+        let state = self.load_state(id)?;
 
         if state.status != ContainerStatus::Created {
             return Err(TavikError::InvalidState(format!(
@@ -127,17 +297,31 @@ impl ContainerExecutor {
         }
 
         info!("Starting OCI container '{}'", id);
+
+        // 1. Mark transition from Created to Starting
+        self.transition_state(id, |st| {
+            st.status = ContainerStatus::Starting;
+            Ok(())
+        })?;
+
+        // 2. Perform platform start (wakes child, verifies execve EOF with timeout)
         match self.platform_start(id, &state) {
             Ok(()) => {
-                state.status = ContainerStatus::Running;
-                self.save_state(&state)?;
-                Ok(state)
+                // Transition to Running (or preserve Stopped if short-lived child already exited and reaped)
+                let final_state = self.transition_state(id, |st| {
+                    if st.status != ContainerStatus::Stopped {
+                        st.status = ContainerStatus::Running;
+                    }
+                    Ok(())
+                })?;
+                Ok(final_state)
             }
             Err(e) => {
-                // If startup failed (execve failed or child exited before exec),
-                // mark state as Stopped, do NOT mark as Running!
-                state.status = ContainerStatus::Stopped;
-                let _ = self.save_state(&state);
+                // If startup failed, mark state as Stopped, do NOT mark as Running!
+                let _ = self.transition_state(id, |st| {
+                    st.status = ContainerStatus::Stopped;
+                    Ok(())
+                });
                 Err(e)
             }
         }
@@ -150,13 +334,13 @@ impl ContainerExecutor {
         signal: Option<i32>,
         grace_period: Option<std::time::Duration>,
     ) -> Result<ContainerState> {
-        let mut state = self.load_state(id)?;
+        let state = self.load_state(id)?;
 
         if state.status == ContainerStatus::Stopped {
             return Ok(state);
         }
 
-        if state.status != ContainerStatus::Running {
+        if state.status != ContainerStatus::Running && state.status != ContainerStatus::Starting {
             return Err(TavikError::InvalidState(format!(
                 "Cannot stop container '{}': status is '{}' (expected 'running')",
                 id, state.status
@@ -188,7 +372,83 @@ impl ContainerExecutor {
             id, pid, sig
         );
 
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
+        {
+            let timeout = grace_period.unwrap_or(std::time::Duration::from_secs(10));
+            let pidfd = PidFd::open(pid);
+
+            let mut terminated = false;
+            if let Some(ref pfd) = pidfd {
+                // Send stop signal via pidfd to prevent PID recycling
+                pfd.send_signal(sig)?;
+                // Wait for process termination
+                if pfd.wait_for_exit(timeout) {
+                    terminated = true;
+                } else {
+                    warn!(
+                        "Container '{}' (PID {}) did not stop after {:?}; escalating to SIGKILL",
+                        id, pid, timeout
+                    );
+                    pfd.send_signal(libc::SIGKILL)?;
+                    if pfd.wait_for_exit(std::time::Duration::from_secs(2)) {
+                        terminated = true;
+                    }
+                }
+            } else {
+                // Fallback for environments where pidfd_open is unavailable
+                let res = unsafe { libc::kill(pid as libc::pid_t, sig) };
+                if res != 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() != Some(libc::ESRCH) {
+                        return Err(TavikError::Execution(format!(
+                            "Failed to send stop signal {} to container PID {}: {}",
+                            sig, pid, err
+                        )));
+                    }
+                }
+
+                let start_time = std::time::Instant::now();
+                while start_time.elapsed() < timeout {
+                    if !is_pid_alive(pid) {
+                        terminated = true;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+
+                if !terminated {
+                    warn!(
+                        "Container '{}' (PID {}) did not stop after {:?}; escalating to SIGKILL",
+                        id, pid, timeout
+                    );
+                    let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                    let kill_start = std::time::Instant::now();
+                    while kill_start.elapsed() < std::time::Duration::from_secs(2) {
+                        if !is_pid_alive(pid) {
+                            terminated = true;
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                }
+            }
+
+            if !terminated {
+                return Err(TavikError::Execution(format!(
+                    "Container '{}' (PID {}) failed to terminate even after SIGKILL escalation",
+                    id, pid
+                )));
+            }
+
+            // Confirmed termination: transition state to Stopped
+            let final_state = self.transition_state(id, |st| {
+                st.status = ContainerStatus::Stopped;
+                Ok(())
+            })?;
+            Ok(final_state)
+        }
+
+        #[cfg(all(unix, not(target_os = "linux")))]
         {
             let res = unsafe { libc::kill(pid as libc::pid_t, sig) };
             if res != 0 {
@@ -214,10 +474,6 @@ impl ContainerExecutor {
             }
 
             if !terminated {
-                warn!(
-                    "Container '{}' (PID {}) did not stop after {:?}; escalating to SIGKILL",
-                    id, pid, timeout
-                );
                 let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
                 let kill_start = std::time::Instant::now();
                 while kill_start.elapsed() < std::time::Duration::from_secs(2) {
@@ -236,9 +492,11 @@ impl ContainerExecutor {
                 )));
             }
 
-            state.status = ContainerStatus::Stopped;
-            self.save_state(&state)?;
-            Ok(state)
+            let final_state = self.transition_state(id, |st| {
+                st.status = ContainerStatus::Stopped;
+                Ok(())
+            })?;
+            Ok(final_state)
         }
 
         #[cfg(not(unix))]
@@ -361,17 +619,19 @@ impl ContainerExecutor {
     #[cfg(not(target_os = "linux"))]
     fn platform_create(
         &self,
-        _id: &str,
+        id: &str,
         _spec: &Spec,
         _bundle: &Path,
-        mut state: ContainerState,
+        _state: ContainerState,
     ) -> Result<ContainerState> {
         // Honest non-Linux reporting: bundle is validated and created, but isolated execution is marked as requiring Linux.
         warn!(
             "Platform is not Linux. OCI bundle validated, container created in non-isolated mode."
         );
-        state.status = ContainerStatus::Created;
-        Ok(state)
+        self.transition_state(id, |st| {
+            st.status = ContainerStatus::Created;
+            Ok(())
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -422,8 +682,28 @@ impl ContainerExecutor {
         }
 
         // 3. Read execution status from exec.fifo
-        // If execve() succeeds, fd 3 in child is closed by kernel via FD_CLOEXEC, yielding EOF (0 bytes).
+        // If execve() succeeds, fd 4 in child is closed by kernel via FD_CLOEXEC, yielding EOF (0 bytes).
         // If execve() or child pre-exec fails, child writes the error string and exits.
+        let mut pfd = libc::pollfd {
+            fd: exec_read_fd,
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        // Wait up to 15 seconds for startup handshake
+        let poll_res = unsafe { libc::poll(&mut pfd, 1, 15000) };
+        if poll_res < 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::close(exec_read_fd) };
+            return Err(TavikError::Io(format!("poll failed on exec.fifo: {}", err)));
+        }
+        if poll_res == 0 {
+            unsafe { libc::close(exec_read_fd) };
+            return Err(TavikError::Execution(format!(
+                "Container '{}' startup timed out waiting for exec status",
+                id
+            )));
+        }
+
         let mut err_buf = Vec::new();
         let mut chunk = [0u8; 512];
         loop {

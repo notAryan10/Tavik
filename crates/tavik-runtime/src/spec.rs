@@ -27,6 +27,7 @@ pub struct ContainerState {
 pub enum ContainerStatus {
     Creating,
     Created,
+    Starting,
     Running,
     Stopped,
 }
@@ -36,6 +37,7 @@ impl std::fmt::Display for ContainerStatus {
         match self {
             Self::Creating => write!(f, "creating"),
             Self::Created => write!(f, "created"),
+            Self::Starting => write!(f, "starting"),
             Self::Running => write!(f, "running"),
             Self::Stopped => write!(f, "stopped"),
         }

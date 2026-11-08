@@ -1577,3 +1577,189 @@ fn test_cgroup_failure_cleanup_raii() {
         );
     }
 }
+
+#[test]
+fn test_state_transitions_serialize_and_prevent_stopped_overwrite() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let bundle_dir = temp.path().join("bundle");
+    let rootfs = bundle_dir.join("rootfs");
+    fs::create_dir_all(&rootfs).unwrap();
+
+    let spec = Spec::default_linux();
+    fs::write(
+        bundle_dir.join("config.json"),
+        serde_json::to_string_pretty(&spec).unwrap(),
+    )
+    .unwrap();
+
+    let executor = ContainerExecutor::new(state_dir).unwrap();
+    let id = "test-serialize-state";
+    let state = executor.create(id, &bundle_dir).unwrap();
+    assert_eq!(state.status, ContainerStatus::Created);
+
+    // 1. Transition Created -> Starting
+    let starting_state = executor
+        .transition_state(id, |st| {
+            st.status = ContainerStatus::Starting;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(starting_state.status, ContainerStatus::Starting);
+
+    // 2. Transition Starting -> Stopped (simulating supervisor reaping child before platform_start returns)
+    let stopped_state = executor
+        .transition_state(id, |st| {
+            st.status = ContainerStatus::Stopped;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(stopped_state.status, ContainerStatus::Stopped);
+
+    // 3. Late transition to Running: MUST NOT overwrite Stopped!
+    let late_running_state = executor
+        .transition_state(id, |st| {
+            st.status = ContainerStatus::Running;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        late_running_state.status,
+        ContainerStatus::Stopped,
+        "Late transition to Running must be ignored when supervisor marked container as Stopped"
+    );
+
+    // 4. Attempting to start an already stopped container must fail
+    let restart_res = executor.transition_state(id, |st| {
+        st.status = ContainerStatus::Starting;
+        Ok(())
+    });
+    assert!(
+        matches!(
+            restart_res,
+            Err(tavik_common::error::TavikError::InvalidState(_))
+        ),
+        "Stopped container must not transition back to Starting"
+    );
+}
+
+#[test]
+fn test_stop_rejects_suspend_and_resume_signals() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let bundle_dir = temp.path().join("bundle");
+    let rootfs = bundle_dir.join("rootfs");
+    fs::create_dir_all(&rootfs).unwrap();
+
+    let spec = Spec::default_linux();
+    fs::write(
+        bundle_dir.join("config.json"),
+        serde_json::to_string_pretty(&spec).unwrap(),
+    )
+    .unwrap();
+
+    let executor = ContainerExecutor::new(state_dir).unwrap();
+    let id = "test-stop-reject-signals";
+    let _ = executor.create(id, &bundle_dir).unwrap();
+
+    // Mark as running manually for unit test validation of signal rejection
+    let _ = executor.transition_state(id, |st| {
+        st.status = ContainerStatus::Running;
+        st.pid = Some(999999);
+        Ok(())
+    });
+
+    #[cfg(unix)]
+    {
+        for sig in [
+            libc::SIGSTOP,
+            libc::SIGTSTP,
+            libc::SIGCONT,
+            libc::SIGTTIN,
+            libc::SIGTTOU,
+        ] {
+            let res = executor.stop(id, Some(sig), None);
+            assert!(
+                matches!(res, Err(tavik_common::error::TavikError::InvalidState(_))),
+                "Signal {} must be rejected by stop()",
+                sig
+            );
+        }
+    }
+}
+
+#[test]
+fn test_repeated_short_lived_process_lifecycle() {
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping rootful short-lived process lifecycle test (requires root)");
+            return;
+        }
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let executor = ContainerExecutor::new(state_dir).unwrap();
+
+        let bundle_dir = temp.path().join("bundle");
+        let rootfs = bundle_dir.join("rootfs");
+        let bin_dir = rootfs.join("bin");
+        let dev_dir = rootfs.join("dev");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&dev_dir).unwrap();
+        let _ = fs::File::create(dev_dir.join("null"));
+
+        let busybox_path = if Path::new("/usr/bin/busybox").exists() {
+            "/usr/bin/busybox"
+        } else {
+            "/bin/busybox"
+        };
+        fs::copy(busybox_path, bin_dir.join("busybox")).unwrap();
+
+        let mut spec = Spec::default_linux();
+        if let Some(proc) = &mut spec.process {
+            proc.args = vec!["/bin/busybox".to_string(), "true".to_string()];
+        }
+
+        fs::write(
+            bundle_dir.join("config.json"),
+            serde_json::to_string_pretty(&spec).unwrap(),
+        )
+        .unwrap();
+
+        for i in 0..5 {
+            let container_id = format!("test-short-lived-{}", i);
+            let created = executor.create(&container_id, &bundle_dir).unwrap();
+            assert_eq!(created.status, ContainerStatus::Created);
+
+            // Startup should succeed and rapidly transition to Stopped without race
+            let res = executor.start(&container_id);
+            assert!(
+                res.is_ok(),
+                "Short-lived process startup must succeed: {:?}",
+                res
+            );
+
+            // Give supervisor up to 500ms to finish reaping
+            let start_wait = std::time::Instant::now();
+            let mut final_status = ContainerStatus::Running;
+            while start_wait.elapsed() < Duration::from_millis(500) {
+                if let Ok(st) = executor.load_state(&container_id) {
+                    final_status = st.status;
+                    if final_status == ContainerStatus::Stopped {
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(
+                final_status,
+                ContainerStatus::Stopped,
+                "Iteration {} must end in Stopped status",
+                i
+            );
+
+            let _ = executor.delete(&container_id, true);
+        }
+    }
+}

@@ -508,6 +508,81 @@ impl SafeDir {
         Ok(file)
     }
 
+    /// Opens an existing file for reading relative to this directory descriptor with `O_NOFOLLOW`.
+    /// Does not create parent directories or follow intermediate/final symlinks.
+    pub fn open_read_file_at(&self, rel_path: &Path) -> Result<std::fs::File, ImageError> {
+        let components = self.validate_path(rel_path)?;
+        let (parent_dir, final_comp) = self.resolve_parent_dir(&components, false)?;
+        let c_final = CString::new(final_comp.as_bytes()).map_err(|e| {
+            ImageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        })?;
+
+        let safe_flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let raw_fd = unsafe { libc::openat(parent_dir.as_raw_fd(), c_final.as_ptr(), safe_flags) };
+        if raw_fd < 0 {
+            return Err(ImageError::Io(std::io::Error::last_os_error()));
+        }
+
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let fstat_res = unsafe { libc::fstat(raw_fd, &mut st) };
+        if fstat_res != 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::close(raw_fd) };
+            return Err(ImageError::Io(err));
+        }
+
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            unsafe { libc::close(raw_fd) };
+            return Err(ImageError::InvalidConfiguration(format!(
+                "Path '{}' is not a regular file",
+                rel_path.display()
+            )));
+        }
+
+        let file = unsafe { std::fs::File::from_raw_fd(raw_fd) };
+        Ok(file)
+    }
+
+    /// Reads up to `max_bytes` from a file relative to this rootfs without following symlinks.
+    /// Returns `Ok(None)` if the file or an intermediate parent directory does not exist (ENOENT).
+    /// Returns `Err(...)` if the file exists but is unreadable, exceeds `max_bytes`, or is a symlink.
+    pub fn read_file_to_string_limited(
+        &self,
+        rel_path: &Path,
+        max_bytes: u64,
+    ) -> Result<Option<String>, ImageError> {
+        match self.open_read_file_at(rel_path) {
+            Ok(mut file) => {
+                use std::io::Read;
+                let mut buffer = Vec::new();
+                let mut take = (&mut file).take(max_bytes + 1);
+                take.read_to_end(&mut buffer).map_err(ImageError::Io)?;
+                if buffer.len() > max_bytes as usize {
+                    return Err(ImageError::InvalidConfiguration(format!(
+                        "File '{}' exceeds maximum allowed size of {} bytes",
+                        rel_path.display(),
+                        max_bytes
+                    )));
+                }
+                let s = String::from_utf8(buffer).map_err(|e| {
+                    ImageError::InvalidConfiguration(format!(
+                        "File '{}' contains invalid UTF-8: {e}",
+                        rel_path.display()
+                    ))
+                })?;
+                Ok(Some(s))
+            }
+            Err(ImageError::Io(ref e))
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.raw_os_error() == Some(libc::ENOENT)
+                    || e.raw_os_error() == Some(libc::ENOTDIR) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Checks if an entry exists at `rel_path` without following symlinks.
     pub fn exists_at(&self, rel_path: &Path) -> Result<bool, ImageError> {
         let components = self.validate_path(rel_path)?;

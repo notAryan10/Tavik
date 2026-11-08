@@ -185,6 +185,13 @@ pub struct HistoryRecord {
     pub empty_layer: Option<bool>,
 }
 
+/// Typed container volume declaration from image configuration.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ImageVolume {
+    /// Container destination path where the volume should be mounted.
+    pub destination: std::path::PathBuf,
+}
+
 /// Fully resolved, validated container execution configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EffectiveImageConfig {
@@ -293,6 +300,14 @@ impl ImageConfiguration {
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, ImageError> {
         let bytes = std::fs::read(path.as_ref())?;
         Self::from_bytes(&bytes)
+    }
+
+    /// Extracts, validates, and returns all declared volume destinations from this image configuration.
+    pub fn declared_volumes(&self) -> Result<Vec<ImageVolume>, ImageError> {
+        match self.config {
+            Some(ref c) => c.declared_volumes(),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Validates the structural, semantic, and security rules of the configuration.
@@ -599,6 +614,51 @@ impl ContainerConfig {
         }
 
         Ok(())
+    }
+
+    /// Extracts, validates, and returns all declared volume destinations from this container configuration.
+    pub fn declared_volumes(&self) -> Result<Vec<ImageVolume>, ImageError> {
+        let Some(ref volumes_map) = self.volumes else {
+            return Ok(Vec::new());
+        };
+
+        let mut dests = Vec::with_capacity(volumes_map.len());
+        for key in volumes_map.keys() {
+            if key.is_empty() {
+                return Err(ImageError::InvalidConfiguration(
+                    "Volume declaration destination cannot be empty".to_string(),
+                ));
+            }
+            if !key.starts_with('/') {
+                return Err(ImageError::InvalidConfiguration(format!(
+                    "Volume declaration destination '{key}' must be an absolute path starting with '/'"
+                )));
+            }
+            if key.contains('\0') {
+                return Err(ImageError::InvalidConfiguration(format!(
+                    "Volume declaration destination '{key}' contains forbidden null byte"
+                )));
+            }
+            for comp in key.split('/') {
+                if comp == ".." {
+                    return Err(ImageError::InvalidConfiguration(format!(
+                        "Volume declaration destination '{key}' contains forbidden parent traversal '..'"
+                    )));
+                }
+            }
+
+            // Normalize path (removes redundant/trailing slashes while preserving root)
+            let path = std::path::Path::new(key);
+            let normalized: std::path::PathBuf = path.components().collect();
+
+            dests.push(ImageVolume {
+                destination: normalized,
+            });
+        }
+
+        dests.sort();
+        dests.dedup();
+        Ok(dests)
     }
 }
 

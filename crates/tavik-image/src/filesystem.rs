@@ -289,11 +289,27 @@ impl SafeDir {
                         unsafe { libc::unlinkat(current_raw, c_comp.as_ptr(), 0) };
                     }
 
-                    let ret = unsafe { libc::mkdirat(current_raw, c_comp.as_ptr(), 0o700) };
+                    let ret = unsafe { libc::mkdirat(current_raw, c_comp.as_ptr(), 0o755) };
                     if ret != 0 {
                         let mk_err = std::io::Error::last_os_error();
                         if mk_err.raw_os_error() != Some(libc::EEXIST) {
                             return Err(ImageError::Io(mk_err));
+                        }
+                    } else {
+                        // Explicitly enforce 0o755 permissions in case umask restricted it
+                        let tmp_raw = unsafe {
+                            libc::openat(
+                                current_raw,
+                                c_comp.as_ptr(),
+                                libc::O_RDONLY
+                                    | libc::O_DIRECTORY
+                                    | libc::O_NOFOLLOW
+                                    | libc::O_CLOEXEC,
+                            )
+                        };
+                        if tmp_raw >= 0 {
+                            unsafe { libc::fchmod(tmp_raw, 0o755) };
+                            unsafe { libc::close(tmp_raw) };
                         }
                     }
                     next_raw = unsafe {
@@ -505,6 +521,9 @@ impl SafeDir {
 
     /// Creates a hard link at `link_rel` pointing to `source_rel` relative to this rootfs.
     /// Both source and destination paths are validated descriptor-by-descriptor without symlink following.
+    ///
+    /// Requires the hardlink source to be an existing regular file; strictly rejects symlinks and directories.
+    /// Destination unlinking preserves replacement semantics and propagates any unexpected unlink errors.
     pub fn hardlink_at(&self, source_rel: &Path, link_rel: &Path) -> Result<(), ImageError> {
         let src_comps = self.validate_path(source_rel)?;
         let dst_comps = self.validate_path(link_rel)?;
@@ -519,8 +538,38 @@ impl SafeDir {
             ImageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
         })?;
 
-        // Unlink destination first if it already exists (replacement semantics)
-        let _ = unsafe { libc::unlinkat(dst_parent_dir.as_raw_fd(), c_dst.as_ptr(), 0) };
+        // 1. Inspect source with fstatat: require regular file, reject symlinks and directories
+        let mut src_stat: libc::stat = unsafe { std::mem::zeroed() };
+        let s_ret = unsafe {
+            libc::fstatat(
+                src_parent_dir.as_raw_fd(),
+                c_src.as_ptr(),
+                &mut src_stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if s_ret != 0 {
+            return Err(ImageError::Io(std::io::Error::last_os_error()));
+        }
+
+        let is_reg = (src_stat.st_mode & libc::S_IFMT) == libc::S_IFREG;
+        if !is_reg {
+            return Err(ImageError::CorruptArchive(format!(
+                "Hardlink source '{}' is not a regular file (mode: {:#o})",
+                source_rel.display(),
+                src_stat.st_mode
+            )));
+        }
+
+        // 2. Unlink destination first if it already exists (replacement semantics).
+        // Only ignore ENOENT; propagate all other errors.
+        let u_ret = unsafe { libc::unlinkat(dst_parent_dir.as_raw_fd(), c_dst.as_ptr(), 0) };
+        if u_ret != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ENOENT) {
+                return Err(ImageError::Io(err));
+            }
+        }
 
         let ret = unsafe {
             libc::linkat(
@@ -540,14 +589,32 @@ impl SafeDir {
     }
 
     /// Sets metadata (ownership, modification time, and permissions) at `rel_path` without following symlinks.
+    ///
+    /// Rootless Ownership Behavior:
+    /// - When running as privileged root (`geteuid() == 0`), ownership errors are strictly propagated.
+    /// - When running as an unprivileged user (rootless mode, `geteuid() != 0`), changing ownership to
+    ///   arbitrary foreign UIDs/GIDs returns `EPERM`. In this case, TAVIK explicitly logs the condition at
+    ///   `debug!` level and preserves the running user's ownership, while rejecting invalid/unsafe UIDs/GIDs
+    ///   (such as `u32::MAX`). Any error other than `EPERM` is propagated immediately.
+    ///
+    /// Permissions (mode):
+    /// - Applied exclusively through securely acquired descriptors with `O_NOFOLLOW | O_CLOEXEC`.
+    /// - Never applied to symbolic links (which possess no independent permissions in POSIX).
+    /// - Never falls back to `fchmodat(..., 0)` which follows symlinks.
     pub fn set_metadata_at(
         &self,
         rel_path: &Path,
         mode: Option<u32>,
-        uid: u32,
-        gid: u32,
+        uid: u64,
+        gid: u64,
         mtime_sec: i64,
+        mtime_nsec: i64,
     ) -> Result<(), ImageError> {
+        // Reject UID/GID values that cannot be represented safely in POSIX (e.g. u32::MAX or overflow)
+        if uid > (u32::MAX - 1) as u64 || gid > (u32::MAX - 1) as u64 {
+            return Err(ImageError::InvalidOwnership { uid, gid });
+        }
+
         let components = self.validate_path(rel_path)?;
         let (parent_dir, final_comp) = self.resolve_parent_dir(&components, false)?;
         let c_final = CString::new(final_comp.as_bytes()).map_err(|e| {
@@ -569,7 +636,14 @@ impl SafeDir {
         if ret != 0 {
             let err = std::io::Error::last_os_error();
             let is_unprivileged = unsafe { libc::geteuid() != 0 };
-            if !(err.raw_os_error() == Some(libc::EPERM) && is_unprivileged) {
+            if err.raw_os_error() == Some(libc::EPERM) && is_unprivileged {
+                tracing::debug!(
+                    "Rootless mode: cannot set ownership to {}:{} on '{}': EPERM (retaining current user)",
+                    uid,
+                    gid,
+                    rel_path.display()
+                );
+            } else {
                 return Err(ImageError::Io(err));
             }
         }
@@ -578,11 +652,11 @@ impl SafeDir {
         let times = [
             libc::timespec {
                 tv_sec: mtime_sec as libc::time_t,
-                tv_nsec: 0,
+                tv_nsec: mtime_nsec as libc::c_long,
             },
             libc::timespec {
                 tv_sec: mtime_sec as libc::time_t,
-                tv_nsec: 0,
+                tv_nsec: mtime_nsec as libc::c_long,
             },
         ];
         let ret = unsafe {
@@ -597,7 +671,7 @@ impl SafeDir {
             return Err(ImageError::Io(std::io::Error::last_os_error()));
         }
 
-        // 3. Permissions (mode): applied if not a symlink
+        // 3. Permissions (mode): applied if not a symlink through securely acquired descriptors
         if let Some(m) = mode {
             let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
             let ret = unsafe {
@@ -608,27 +682,36 @@ impl SafeDir {
                     libc::AT_SYMLINK_NOFOLLOW,
                 )
             };
-            if ret == 0 && (stat_buf.st_mode & libc::S_IFMT) != libc::S_IFLNK {
-                let raw_open = unsafe {
-                    libc::openat(
-                        parent_fd,
-                        c_final.as_ptr(),
-                        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                    )
-                };
-                if raw_open >= 0 {
-                    let ret = unsafe { libc::fchmod(raw_open, (m & 0o7777) as libc::mode_t) };
-                    unsafe { libc::close(raw_open) };
-                    if ret != 0 {
-                        return Err(ImageError::Io(std::io::Error::last_os_error()));
-                    }
+            if ret != 0 {
+                return Err(ImageError::Io(std::io::Error::last_os_error()));
+            }
+
+            let is_symlink = (stat_buf.st_mode & libc::S_IFMT) == libc::S_IFLNK;
+            let is_dir = (stat_buf.st_mode & libc::S_IFMT) == libc::S_IFDIR;
+
+            // Never apply permissions to symlinks
+            if !is_symlink {
+                let open_flags = if is_dir {
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
                 } else {
-                    let ret = unsafe {
-                        libc::fchmodat(parent_fd, c_final.as_ptr(), (m & 0o7777) as libc::mode_t, 0)
-                    };
-                    if ret != 0 {
-                        return Err(ImageError::Io(std::io::Error::last_os_error()));
-                    }
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+                };
+
+                let mut raw_open = unsafe { libc::openat(parent_fd, c_final.as_ptr(), open_flags) };
+                if raw_open < 0 && !is_dir {
+                    // If regular file with restrictive mode (e.g. 0000) failed O_RDONLY, try O_WRONLY
+                    let alt_flags = libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+                    raw_open = unsafe { libc::openat(parent_fd, c_final.as_ptr(), alt_flags) };
+                }
+
+                if raw_open < 0 {
+                    return Err(ImageError::Io(std::io::Error::last_os_error()));
+                }
+
+                let ret = unsafe { libc::fchmod(raw_open, (m & 0o7777) as libc::mode_t) };
+                unsafe { libc::close(raw_open) };
+                if ret != 0 {
+                    return Err(ImageError::Io(std::io::Error::last_os_error()));
                 }
             }
         }
@@ -737,7 +820,7 @@ impl SafeDir {
         };
         if ret != 0 {
             let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::NotFound {
+            if err.raw_os_error() == Some(libc::ENOENT) {
                 return Ok(());
             }
             return Err(ImageError::Io(err));
@@ -751,14 +834,19 @@ impl SafeDir {
                     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 )
             };
-            if raw_dir >= 0 {
+            if raw_dir < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::ENOENT) {
+                    return Err(ImageError::Io(err));
+                }
+            } else {
                 let owned_dir = unsafe { OwnedFd::from_raw_fd(raw_dir) };
                 Self::remove_dir_contents_fd(owned_dir.as_raw_fd())?;
             }
             let ret = unsafe { libc::unlinkat(parent_fd, c_final.as_ptr(), libc::AT_REMOVEDIR) };
             if ret != 0 {
                 let err = std::io::Error::last_os_error();
-                if err.kind() != std::io::ErrorKind::NotFound {
+                if err.raw_os_error() != Some(libc::ENOENT) {
                     return Err(ImageError::Io(err));
                 }
             }
@@ -766,7 +854,7 @@ impl SafeDir {
             let ret = unsafe { libc::unlinkat(parent_fd, c_final.as_ptr(), 0) };
             if ret != 0 {
                 let err = std::io::Error::last_os_error();
-                if err.kind() != std::io::ErrorKind::NotFound {
+                if err.raw_os_error() != Some(libc::ENOENT) {
                     return Err(ImageError::Io(err));
                 }
             }
@@ -785,7 +873,7 @@ impl SafeDir {
         let components = self.validate_path(rel_path)?;
         let (parent_dir, final_comp) = match self.resolve_parent_dir(&components, false) {
             Ok(res) => res,
-            Err(ImageError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(ImageError::Io(e)) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(()),
             Err(e) => return Err(e),
         };
         let c_final = CString::new(final_comp.as_bytes()).map_err(|e| {
@@ -801,7 +889,7 @@ impl SafeDir {
         };
         if raw_dir < 0 {
             let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::NotFound {
+            if err.raw_os_error() == Some(libc::ENOENT) {
                 return Ok(());
             }
             return Err(ImageError::Io(err));
@@ -811,7 +899,14 @@ impl SafeDir {
         Self::remove_dir_contents_fd(owned_dir.as_raw_fd())
     }
 
-    fn remove_dir_contents_fd(dir_fd: RawFd) -> Result<(), ImageError> {
+    /// Recursively removes all contents inside the directory specified by `dir_fd` descriptor-relatively.
+    ///
+    /// Hardened error handling:
+    /// - Detects readdir errors via errno checking.
+    /// - Propagates unexpected fstatat, openat, and unlinkat errors immediately.
+    /// - Only ignores explicitly expected ENOENT conditions (e.g. concurrent unlinks).
+    /// - Guarantees partial deletions fail loudly so opaque whiteouts cannot falsely succeed.
+    pub fn remove_dir_contents_fd(dir_fd: RawFd) -> Result<(), ImageError> {
         let dup_fd = unsafe { libc::dup(dir_fd) };
         if dup_fd < 0 {
             return Err(ImageError::Io(std::io::Error::last_os_error()));
@@ -823,10 +918,47 @@ impl SafeDir {
             return Err(ImageError::Io(std::io::Error::last_os_error()));
         }
 
+        struct DirCloser(*mut libc::DIR);
+        impl Drop for DirCloser {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe { libc::closedir(self.0) };
+                }
+            }
+        }
+        let _closer = DirCloser(dir_ptr);
+
+        fn reset_errno() {
+            #[cfg(target_os = "macos")]
+            unsafe {
+                *libc::__error() = 0;
+            }
+            #[cfg(not(target_os = "macos"))]
+            unsafe {
+                *libc::__errno_location() = 0;
+            }
+        }
+
+        fn get_errno() -> i32 {
+            #[cfg(target_os = "macos")]
+            unsafe {
+                *libc::__error()
+            }
+            #[cfg(not(target_os = "macos"))]
+            unsafe {
+                *libc::__errno_location()
+            }
+        }
+
         let mut entries = Vec::new();
         loop {
+            reset_errno();
             let entry_ptr = unsafe { libc::readdir(dir_ptr) };
             if entry_ptr.is_null() {
+                let err = get_errno();
+                if err != 0 {
+                    return Err(ImageError::Io(std::io::Error::from_raw_os_error(err)));
+                }
                 break;
             }
             let entry = unsafe { &*entry_ptr };
@@ -837,7 +969,6 @@ impl SafeDir {
             }
             entries.push(c_str.to_owned());
         }
-        unsafe { libc::closedir(dir_ptr) };
 
         for c_name in entries {
             let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
@@ -850,7 +981,11 @@ impl SafeDir {
                 )
             };
             if ret != 0 {
-                continue;
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::ENOENT) {
+                    continue;
+                }
+                return Err(ImageError::Io(err));
             }
 
             if (stat_buf.st_mode & libc::S_IFMT) == libc::S_IFDIR {
@@ -861,13 +996,31 @@ impl SafeDir {
                         libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                     )
                 };
-                if child_raw >= 0 {
-                    let child_owned = unsafe { OwnedFd::from_raw_fd(child_raw) };
-                    Self::remove_dir_contents_fd(child_owned.as_raw_fd())?;
+                if child_raw < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::ENOENT) {
+                        continue;
+                    }
+                    return Err(ImageError::Io(err));
                 }
-                unsafe { libc::unlinkat(dir_fd, c_name.as_ptr(), libc::AT_REMOVEDIR) };
+                let child_owned = unsafe { OwnedFd::from_raw_fd(child_raw) };
+                Self::remove_dir_contents_fd(child_owned.as_raw_fd())?;
+
+                let ret = unsafe { libc::unlinkat(dir_fd, c_name.as_ptr(), libc::AT_REMOVEDIR) };
+                if ret != 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() != Some(libc::ENOENT) {
+                        return Err(ImageError::Io(err));
+                    }
+                }
             } else {
-                unsafe { libc::unlinkat(dir_fd, c_name.as_ptr(), 0) };
+                let ret = unsafe { libc::unlinkat(dir_fd, c_name.as_ptr(), 0) };
+                if ret != 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() != Some(libc::ENOENT) {
+                        return Err(ImageError::Io(err));
+                    }
+                }
             }
         }
 

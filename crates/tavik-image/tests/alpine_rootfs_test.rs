@@ -1,5 +1,6 @@
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use sha2::Digest;
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use tar::{Builder, EntryType, Header};
@@ -277,7 +278,8 @@ fn test_alpine_rootfs_end_to_end_assembly() {
     let l0_bytes = gz0.finish().unwrap();
     let l0_path = temp.path().join("layer0.tar.gz");
     std::fs::write(&l0_path, &l0_bytes).unwrap();
-    let layer0 = Layer::new("sha256:layer0", &l0_path, l0_bytes.len() as u64);
+    let l0_digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&l0_bytes)));
+    let layer0 = Layer::new(l0_digest, &l0_path, l0_bytes.len() as u64);
 
     // 2. Layer 1: Alpine Modification Layer
     let mut tar1 = Builder::new(Vec::new());
@@ -336,7 +338,8 @@ fn test_alpine_rootfs_end_to_end_assembly() {
     let l1_bytes = gz1.finish().unwrap();
     let l1_path = temp.path().join("layer1.tar.gz");
     std::fs::write(&l1_path, &l1_bytes).unwrap();
-    let layer1 = Layer::new("sha256:layer1", &l1_path, l1_bytes.len() as u64);
+    let l1_digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&l1_bytes)));
+    let layer1 = Layer::new(l1_digest, &l1_path, l1_bytes.len() as u64);
 
     // 3. Build rootfs with RootfsBuilder
     let builder = RootfsBuilder::new();

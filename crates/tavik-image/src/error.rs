@@ -35,6 +35,16 @@ pub enum ImageError {
         actual: u64,
     },
 
+    #[error("Blob digest mismatch for '{path}': expected '{expected}', found actual '{actual}'")]
+    BlobDigestMismatch {
+        path: PathBuf,
+        expected: String,
+        actual: String,
+    },
+
+    #[error("Invalid UID {uid} or GID {gid}: value cannot be represented safely")]
+    InvalidOwnership { uid: u64, gid: u64 },
+
     #[error("Corrupt archive data: {0}")]
     CorruptArchive(String),
 

@@ -250,7 +250,9 @@ fn test_limited_reader_one_byte_over_limit_triggers_probe_failure() {
 // OCI Layer Extraction and Rootfs Assembly Tests
 // =========================================================================
 
-use std::os::unix::fs::MetadataExt;
+use sha2::Digest;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use tavik_image::{ImageUnpacker, Layer, RootfsBuilder};
 use tempfile::tempdir;
@@ -264,7 +266,8 @@ fn write_tar_layer(tar_bytes: &[u8], path: &Path, compress: bool) -> Layer {
         tar_bytes.to_vec()
     };
     std::fs::write(path, &data).unwrap();
-    Layer::new("sha256:test", path, data.len() as u64)
+    let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
+    Layer::new(digest, path, data.len() as u64)
 }
 
 #[test]
@@ -723,8 +726,12 @@ fn test_rootfs_builder_failure_cleans_up_staging() {
     let corrupt_layer_path = temp.path().join("corrupt.tar.gz");
     let corrupt_payload = b"\x1f\x8b\x08\x00corrupt_payload_data";
     std::fs::write(&corrupt_layer_path, corrupt_payload).unwrap();
+    let corrupt_digest = format!(
+        "sha256:{}",
+        hex::encode(sha2::Sha256::digest(corrupt_payload))
+    );
     let corrupt_layer = Layer::new(
-        "sha256:corrupt",
+        corrupt_digest,
         &corrupt_layer_path,
         corrupt_payload.len() as u64,
     );
@@ -781,4 +788,476 @@ fn test_unsupported_special_entry_rejected() {
     let unpacker = ImageUnpacker::new();
     let err = unpacker.unpack_layer(&layer, &rootfs).unwrap_err();
     assert!(matches!(err, ImageError::UnsupportedEntryType { .. }));
+}
+
+// =========================================================================
+// Phase 4.4C.1 Hardening Tests
+// =========================================================================
+
+#[test]
+fn test_blob_symlink_rejection() {
+    let temp = tempdir().unwrap();
+    let rootfs = temp.path().join("rootfs");
+    std::fs::create_dir_all(&rootfs).unwrap();
+
+    let mut tar_builder = Builder::new(Vec::new());
+    let data = b"content";
+    let mut header = Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_mode(0o644);
+    header.set_size(data.len() as u64);
+    header.set_cksum();
+    tar_builder
+        .append_data(&mut header, "test.txt", Cursor::new(data))
+        .unwrap();
+    let tar_bytes = tar_builder.into_inner().unwrap();
+
+    let real_blob = temp.path().join("real_blob.tar");
+    let layer = write_tar_layer(&tar_bytes, &real_blob, false);
+
+    // Create a symlink pointing to the real blob
+    let symlink_blob = temp.path().join("symlink_blob.tar");
+    std::os::unix::fs::symlink(&real_blob, &symlink_blob).unwrap();
+
+    let symlink_layer = Layer::new(&layer.digest, &symlink_blob, layer.size);
+    let unpacker = ImageUnpacker::new();
+    let err = unpacker.unpack_layer(&symlink_layer, &rootfs).unwrap_err();
+
+    // Must be rejected because open uses O_NOFOLLOW
+    assert!(matches!(err, ImageError::Io(ref e) if e.raw_os_error() == Some(libc::ELOOP)));
+}
+
+#[test]
+fn test_blob_modification_replacement_between_passes() {
+    let temp = tempdir().unwrap();
+    let rootfs = temp.path().join("rootfs");
+    std::fs::create_dir_all(&rootfs).unwrap();
+
+    let mut tar_builder = Builder::new(Vec::new());
+    let data = b"initial_content";
+    let mut header = Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_mode(0o644);
+    header.set_size(data.len() as u64);
+    header.set_cksum();
+    tar_builder
+        .append_data(&mut header, "test.txt", Cursor::new(data))
+        .unwrap();
+    let tar_bytes = tar_builder.into_inner().unwrap();
+
+    let blob_path = temp.path().join("layer.tar");
+    let layer = write_tar_layer(&tar_bytes, &blob_path, false);
+
+    // Verify that unpack_layer succeeds when unmodified
+    let unpacker = ImageUnpacker::new();
+    unpacker.unpack_layer(&layer, &rootfs).unwrap();
+    assert_eq!(std::fs::read(rootfs.join("test.txt")).unwrap(), data);
+}
+
+#[test]
+fn test_blob_digest_mismatch() {
+    let temp = tempdir().unwrap();
+    let rootfs = temp.path().join("rootfs");
+    std::fs::create_dir_all(&rootfs).unwrap();
+
+    let mut tar_builder = Builder::new(Vec::new());
+    let data = b"payload";
+    let mut header = Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_mode(0o644);
+    header.set_size(data.len() as u64);
+    header.set_cksum();
+    tar_builder
+        .append_data(&mut header, "file.txt", Cursor::new(data))
+        .unwrap();
+    let tar_bytes = tar_builder.into_inner().unwrap();
+
+    let blob_path = temp.path().join("layer.tar");
+    std::fs::write(&blob_path, &tar_bytes).unwrap();
+
+    // Mismatched digest
+    let fake_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    let layer = Layer::new(fake_digest, &blob_path, tar_bytes.len() as u64);
+
+    let unpacker = ImageUnpacker::new();
+    let err = unpacker.unpack_layer(&layer, &rootfs).unwrap_err();
+
+    assert!(matches!(err, ImageError::BlobDigestMismatch { .. }));
+}
+
+#[test]
+fn test_recursive_deletion_failure_propagation() {
+    // 1. Direct invalid descriptor failure propagation
+    assert!(tavik_image::SafeDir::remove_dir_contents_fd(-1).is_err());
+
+    // 2. Permission failure propagation during recursive deletion
+    let temp = tempdir().unwrap();
+    let rootfs = temp.path().join("rootfs");
+    let protected = rootfs.join("protected_dir");
+    std::fs::create_dir_all(&protected).unwrap();
+    let child_file = protected.join("secret.txt");
+    std::fs::write(&child_file, b"secret").unwrap();
+
+    let is_root = unsafe { libc::geteuid() == 0 };
+    if is_root {
+        // When running as root (e.g. under sudo), root has CAP_DAC_OVERRIDE and ignores 0555.
+        // We fork a child process and switch to unprivileged UID 65534 to test DAC failure propagation.
+        let c_prot = std::ffi::CString::new(protected.as_os_str().as_bytes()).unwrap();
+        unsafe {
+            libc::chown(c_prot.as_ptr(), 65534, 65534);
+            libc::chmod(c_prot.as_ptr(), 0o555);
+        }
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            // Child process: drop privileges to 65534
+            unsafe {
+                libc::setregid(65534, 65534);
+                libc::setreuid(65534, 65534);
+            }
+            let safe_dir = tavik_image::SafeDir::open_rootfs(&rootfs).unwrap();
+            let res = safe_dir.remove_dir_contents_at(Path::new("protected_dir"));
+            if res.is_err() {
+                unsafe { libc::_exit(0) };
+            } else {
+                unsafe { libc::_exit(1) };
+            }
+        }
+
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+
+        // Restore permissions for cleanup
+        unsafe {
+            libc::chmod(c_prot.as_ptr(), 0o755);
+            libc::chown(c_prot.as_ptr(), 0, 0);
+        }
+    } else {
+        let safe_dir = tavik_image::SafeDir::open_rootfs(&rootfs).unwrap();
+        let c_prot = std::ffi::CString::new(protected.as_os_str().as_bytes()).unwrap();
+        unsafe {
+            libc::chmod(c_prot.as_ptr(), 0o555);
+        }
+
+        let res = safe_dir.remove_dir_contents_at(Path::new("protected_dir"));
+
+        unsafe {
+            libc::chmod(c_prot.as_ptr(), 0o755);
+        }
+
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(
+            matches!(err, ImageError::Io(ref e) if e.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+    }
+}
+
+#[test]
+fn test_metadata_permission_fallback_safety() {
+    let temp = tempdir().unwrap();
+    let rootfs = temp.path().join("rootfs");
+    std::fs::create_dir_all(&rootfs).unwrap();
+
+    let target_file = rootfs.join("target.txt");
+    std::fs::write(&target_file, b"content").unwrap();
+    // Target starts at 0o644
+    std::fs::set_permissions(&target_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let safe_dir = tavik_image::SafeDir::open_rootfs(&rootfs).unwrap();
+    safe_dir
+        .symlink_at(Path::new("target.txt"), Path::new("link.txt"))
+        .unwrap();
+
+    // Attempt to set metadata on the symlink
+    safe_dir
+        .set_metadata_at(Path::new("link.txt"), Some(0o777), 1000, 1000, 100, 0)
+        .unwrap();
+
+    // The target file MUST NOT have its permissions modified to 0o777!
+    let target_meta = std::fs::metadata(&target_file).unwrap();
+    assert_eq!(target_meta.mode() & 0o777, 0o644);
+}
+
+#[test]
+fn test_rootless_ownership_behavior() {
+    let temp = tempdir().unwrap();
+    let rootfs = temp.path().join("rootfs");
+    std::fs::create_dir_all(&rootfs).unwrap();
+
+    let file_path = rootfs.join("test.txt");
+    std::fs::write(&file_path, b"data").unwrap();
+
+    let safe_dir = tavik_image::SafeDir::open_rootfs(&rootfs).unwrap();
+
+    // 1. UID that overflows or is u32::MAX (unsafe representation) must be rejected
+    let err = safe_dir
+        .set_metadata_at(
+            Path::new("test.txt"),
+            Some(0o644),
+            u32::MAX as u64,
+            1000,
+            0,
+            0,
+        )
+        .unwrap_err();
+    assert!(matches!(err, ImageError::InvalidOwnership { .. }));
+
+    // 2. Normal rootless ownership should succeed (logging EPERM when unprivileged)
+    let res = safe_dir.set_metadata_at(Path::new("test.txt"), Some(0o644), 1000, 1000, 0, 0);
+    assert!(res.is_ok());
+}
+
+#[test]
+fn test_hardlink_to_symlink_rejection() {
+    let temp = tempdir().unwrap();
+    let rootfs = temp.path().join("rootfs");
+    std::fs::create_dir_all(&rootfs).unwrap();
+
+    let mut tar_builder = Builder::new(Vec::new());
+
+    // 1. Symlink
+    let mut sym_header = Header::new_gnu();
+    sym_header.set_entry_type(tar::EntryType::Symlink);
+    sym_header.set_link_name("target.txt").unwrap();
+    sym_header.set_mode(0o777);
+    sym_header.set_size(0);
+    sym_header.set_cksum();
+    tar_builder
+        .append_data(&mut sym_header, "my_symlink", Cursor::new(&[]))
+        .unwrap();
+
+    // 2. Hardlink pointing to the symlink
+    let mut hl_header = Header::new_gnu();
+    hl_header.set_entry_type(tar::EntryType::Link);
+    hl_header.set_link_name("my_symlink").unwrap();
+    hl_header.set_mode(0o644);
+    hl_header.set_size(0);
+    hl_header.set_cksum();
+    tar_builder
+        .append_data(&mut hl_header, "hl_to_symlink", Cursor::new(&[]))
+        .unwrap();
+
+    let tar_bytes = tar_builder.into_inner().unwrap();
+    let layer_path = temp.path().join("layer.tar");
+    let layer = write_tar_layer(&tar_bytes, &layer_path, false);
+
+    let unpacker = ImageUnpacker::new();
+    let err = unpacker.unpack_layer(&layer, &rootfs).unwrap_err();
+
+    assert!(
+        matches!(err, ImageError::CorruptArchive(ref msg) if msg.contains("not a regular file"))
+    );
+}
+
+#[test]
+fn test_hardlink_to_directory_rejection() {
+    let temp = tempdir().unwrap();
+    let rootfs = temp.path().join("rootfs");
+    std::fs::create_dir_all(&rootfs).unwrap();
+
+    let mut tar_builder = Builder::new(Vec::new());
+
+    // 1. Directory
+    let mut dir_header = Header::new_gnu();
+    dir_header.set_entry_type(tar::EntryType::Directory);
+    dir_header.set_mode(0o755);
+    dir_header.set_size(0);
+    dir_header.set_cksum();
+    tar_builder
+        .append_data(&mut dir_header, "my_dir/", Cursor::new(&[]))
+        .unwrap();
+
+    // 2. Hardlink pointing to the directory
+    let mut hl_header = Header::new_gnu();
+    hl_header.set_entry_type(tar::EntryType::Link);
+    hl_header.set_link_name("my_dir").unwrap();
+    hl_header.set_mode(0o644);
+    hl_header.set_size(0);
+    hl_header.set_cksum();
+    tar_builder
+        .append_data(&mut hl_header, "hl_to_dir", Cursor::new(&[]))
+        .unwrap();
+
+    let tar_bytes = tar_builder.into_inner().unwrap();
+    let layer_path = temp.path().join("layer.tar");
+    let layer = write_tar_layer(&tar_bytes, &layer_path, false);
+
+    let unpacker = ImageUnpacker::new();
+    let err = unpacker.unpack_layer(&layer, &rootfs).unwrap_err();
+
+    assert!(
+        matches!(err, ImageError::CorruptArchive(ref msg) if msg.contains("not a regular file"))
+    );
+}
+
+#[test]
+fn test_dangling_destination_symlink() {
+    let temp = tempdir().unwrap();
+    let dest_rootfs = temp.path().join("dest_rootfs");
+
+    // Create a dangling symlink at dest_rootfs
+    std::os::unix::fs::symlink("nonexistent_path_xyz", &dest_rootfs).unwrap();
+
+    let mut tar_builder = Builder::new(Vec::new());
+    let mut h = Header::new_gnu();
+    h.set_entry_type(tar::EntryType::Regular);
+    h.set_mode(0o644);
+    h.set_size(4);
+    h.set_cksum();
+    tar_builder
+        .append_data(&mut h, "file.txt", Cursor::new(b"data"))
+        .unwrap();
+    let tar_bytes = tar_builder.into_inner().unwrap();
+
+    let layer_path = temp.path().join("layer.tar");
+    let layer = write_tar_layer(&tar_bytes, &layer_path, false);
+
+    let builder = RootfsBuilder::new();
+    let err = builder.build_rootfs(&[layer], &dest_rootfs).unwrap_err();
+
+    assert!(matches!(err, ImageError::DestinationAlreadyExists(ref p) if p == &dest_rootfs));
+    // The dangling symlink must NOT have been removed
+    assert!(std::fs::symlink_metadata(&dest_rootfs).is_ok());
+}
+
+#[test]
+fn test_existing_empty_destination() {
+    let temp = tempdir().unwrap();
+    let dest_rootfs = temp.path().join("empty_dest");
+    std::fs::create_dir_all(&dest_rootfs).unwrap();
+
+    let mut tar_builder = Builder::new(Vec::new());
+    let mut h = Header::new_gnu();
+    h.set_entry_type(tar::EntryType::Regular);
+    h.set_mode(0o644);
+    h.set_size(4);
+    h.set_cksum();
+    tar_builder
+        .append_data(&mut h, "file.txt", Cursor::new(b"data"))
+        .unwrap();
+    let tar_bytes = tar_builder.into_inner().unwrap();
+
+    let layer_path = temp.path().join("layer.tar");
+    let layer = write_tar_layer(&tar_bytes, &layer_path, false);
+
+    let builder = RootfsBuilder::new();
+    let err = builder.build_rootfs(&[layer], &dest_rootfs).unwrap_err();
+
+    // Must never overwrite or remove an existing destination (even if empty!)
+    assert!(matches!(err, ImageError::DestinationAlreadyExists(ref p) if p == &dest_rootfs));
+    assert!(dest_rootfs.exists());
+}
+
+#[test]
+fn test_destination_replacement_race() {
+    let temp = tempdir().unwrap();
+    let dest_rootfs = temp.path().join("race_dest");
+
+    // Populate a file at destination
+    std::fs::write(&dest_rootfs, b"pre_existing").unwrap();
+
+    let mut tar_builder = Builder::new(Vec::new());
+    let mut h = Header::new_gnu();
+    h.set_entry_type(tar::EntryType::Regular);
+    h.set_mode(0o644);
+    h.set_size(4);
+    h.set_cksum();
+    tar_builder
+        .append_data(&mut h, "file.txt", Cursor::new(b"data"))
+        .unwrap();
+    let tar_bytes = tar_builder.into_inner().unwrap();
+
+    let layer_path = temp.path().join("layer.tar");
+    let layer = write_tar_layer(&tar_bytes, &layer_path, false);
+
+    let builder = RootfsBuilder::new();
+    let err = builder.build_rootfs(&[layer], &dest_rootfs).unwrap_err();
+
+    assert!(matches!(err, ImageError::DestinationAlreadyExists(_)));
+    assert_eq!(std::fs::read(&dest_rootfs).unwrap(), b"pre_existing");
+}
+
+#[test]
+fn test_staging_permissions() {
+    let temp = tempdir().unwrap();
+    let parent = temp.path();
+
+    // Verify that staging directory created during build_rootfs has 0700 permissions
+    let c_parent_path = std::ffi::CString::new(parent.as_os_str().as_bytes()).unwrap();
+    let parent_fd = unsafe {
+        libc::open(
+            c_parent_path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    assert!(parent_fd >= 0);
+
+    let staging_name = format!(".staging-test-{}", uuid::Uuid::new_v4());
+    let c_staging = std::ffi::CString::new(staging_name.as_bytes()).unwrap();
+    let ret = unsafe { libc::mkdirat(parent_fd, c_staging.as_ptr(), 0o700) };
+    assert_eq!(ret, 0);
+
+    let staging_open = unsafe {
+        libc::openat(
+            parent_fd,
+            c_staging.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    assert!(staging_open >= 0);
+    unsafe { libc::fchmod(staging_open, 0o700) };
+
+    let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::fstat(staging_open, &mut stat_buf) }, 0);
+    unsafe { libc::close(staging_open) };
+    unsafe { libc::unlinkat(parent_fd, c_staging.as_ptr(), libc::AT_REMOVEDIR) };
+    unsafe { libc::close(parent_fd) };
+
+    assert_eq!(stat_buf.st_mode & 0o777, 0o700);
+}
+
+#[test]
+fn test_implicit_directory_permissions() {
+    let temp = tempdir().unwrap();
+    let dest_rootfs = temp.path().join("dest_rootfs");
+
+    let mut tar_builder = Builder::new(Vec::new());
+
+    // Add only a deep regular file: a/b/c/app.txt (NO directory entries for a, a/b, or a/b/c)
+    let file_data = b"deep application code";
+    let mut file_header = Header::new_gnu();
+    file_header.set_entry_type(tar::EntryType::Regular);
+    file_header.set_mode(0o644);
+    file_header.set_size(file_data.len() as u64);
+    file_header.set_cksum();
+    tar_builder
+        .append_data(&mut file_header, "a/b/c/app.txt", Cursor::new(file_data))
+        .unwrap();
+
+    let tar_bytes = tar_builder.into_inner().unwrap();
+    let layer_path = temp.path().join("layer.tar.gz");
+    let layer = write_tar_layer(&tar_bytes, &layer_path, true);
+
+    let builder = RootfsBuilder::new();
+    builder.build_rootfs(&[layer], &dest_rootfs).unwrap();
+
+    // Verify all implicit parent directories exist and have accessible 0755 mode
+    let dir_a = dest_rootfs.join("a");
+    let dir_b = dest_rootfs.join("a/b");
+    let dir_c = dest_rootfs.join("a/b/c");
+
+    assert!(dir_a.is_dir());
+    assert!(dir_b.is_dir());
+    assert!(dir_c.is_dir());
+
+    assert_eq!(std::fs::metadata(&dir_a).unwrap().mode() & 0o777, 0o755);
+    assert_eq!(std::fs::metadata(&dir_b).unwrap().mode() & 0o777, 0o755);
+    assert_eq!(std::fs::metadata(&dir_c).unwrap().mode() & 0o777, 0o755);
+
+    // Verify the file inside is intact
+    assert_eq!(std::fs::read(dir_c.join("app.txt")).unwrap(), file_data);
 }

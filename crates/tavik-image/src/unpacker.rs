@@ -3,16 +3,75 @@ use crate::error::ImageError;
 use crate::filesystem::{normalize_symlink_target, sanitize_entry_path, SafeDir};
 use crate::layer::Layer;
 use crate::whiteout::Whiteout;
-use std::fs::File;
+use sha2::{Digest, Sha256};
+use std::ffi::CString;
+use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use tar::EntryType;
 use tracing::{debug, info};
 
 struct EntryMetadata {
     mode: u32,
-    uid: u32,
-    gid: u32,
-    mtime: i64,
+    uid: u64,
+    gid: u64,
+    mtime_sec: i64,
+    mtime_nsec: i64,
+}
+
+fn rename_no_replace(
+    parent_fd: RawFd,
+    staging_name: &CString,
+    dest_name: &CString,
+    dest_path: &Path,
+) -> Result<(), ImageError> {
+    #[cfg(target_os = "linux")]
+    let ret = unsafe {
+        libc::renameat2(
+            parent_fd,
+            staging_name.as_ptr(),
+            parent_fd,
+            dest_name.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+
+    #[cfg(target_os = "macos")]
+    let ret = unsafe {
+        extern "C" {
+            fn renameatx_np(
+                olddirfd: libc::c_int,
+                oldpath: *const libc::c_char,
+                newdirfd: libc::c_int,
+                newpath: *const libc::c_char,
+                flags: libc::c_uint,
+            ) -> libc::c_int;
+        }
+        const RENAME_EXCL: libc::c_uint = 0x00000004;
+        renameatx_np(
+            parent_fd,
+            staging_name.as_ptr(),
+            parent_fd,
+            dest_name.as_ptr(),
+            RENAME_EXCL,
+        )
+    };
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    compile_error!("Unsupported OS for atomic rename");
+
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EEXIST) {
+            return Err(ImageError::DestinationAlreadyExists(
+                dest_path.to_path_buf(),
+            ));
+        }
+        return Err(ImageError::Io(err));
+    }
+
+    Ok(())
 }
 
 /// Layer unpacker that safely extracts layers and processes OCI whiteout markers.
@@ -41,27 +100,95 @@ impl ImageUnpacker {
             rootfs.display()
         );
 
-        // 1. Validate blob file existence, type, and size
-        let metadata = std::fs::metadata(&layer.blob_path).map_err(ImageError::Io)?;
-        if !metadata.is_file() {
+        // 1. Open layer blob exactly once using O_RDONLY | O_CLOEXEC | O_NOFOLLOW
+        let c_blob_path = CString::new(layer.blob_path.as_os_str().as_bytes()).map_err(|e| {
+            ImageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        })?;
+
+        let raw_blob_fd = unsafe {
+            libc::open(
+                c_blob_path.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if raw_blob_fd < 0 {
+            return Err(ImageError::Io(std::io::Error::last_os_error()));
+        }
+        let blob_file = unsafe { std::fs::File::from_raw_fd(raw_blob_fd) };
+
+        // 2. Verify with fstat that it is a regular file
+        let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
+        let s_ret = unsafe { libc::fstat(blob_file.as_raw_fd(), &mut stat_buf) };
+        if s_ret != 0 {
+            return Err(ImageError::Io(std::io::Error::last_os_error()));
+        }
+
+        if (stat_buf.st_mode & libc::S_IFMT) != libc::S_IFREG {
             return Err(ImageError::CorruptArchive(format!(
                 "Layer blob '{}' is not a regular file",
                 layer.blob_path.display()
             )));
         }
-        if layer.size > 0 && metadata.len() != layer.size {
+
+        // 3. Validate the expected compressed blob size
+        let actual_size = stat_buf.st_size as u64;
+        if layer.size > 0 && actual_size != layer.size {
             return Err(ImageError::BlobSizeMismatch {
                 path: layer.blob_path.clone(),
                 expected: layer.size,
-                actual: metadata.len(),
+                actual: actual_size,
             });
         }
+
+        // 4. Verify Layer.digest against the actual compressed blob bytes (streaming in 64KB chunks)
+        if !layer.digest.is_empty() {
+            let mut hasher = Sha256::new();
+            let mut buf = [0u8; 64 * 1024];
+            let mut reader = &blob_file;
+            let mut total_read = 0u64;
+            loop {
+                let n = reader.read(&mut buf).map_err(ImageError::Io)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                total_read += n as u64;
+            }
+
+            if layer.size > 0 && total_read != layer.size {
+                return Err(ImageError::BlobSizeMismatch {
+                    path: layer.blob_path.clone(),
+                    expected: layer.size,
+                    actual: total_read,
+                });
+            }
+
+            let actual_hex = hex::encode(hasher.finalize());
+            let actual_digest = format!("sha256:{}", actual_hex);
+
+            let expected_hex = layer
+                .digest
+                .strip_prefix("sha256:")
+                .unwrap_or(&layer.digest);
+            if !actual_hex.eq_ignore_ascii_case(expected_hex) {
+                return Err(ImageError::BlobDigestMismatch {
+                    path: layer.blob_path.clone(),
+                    expected: layer.digest.clone(),
+                    actual: actual_digest,
+                });
+            }
+        }
+
+        // Rewind to beginning of the blob
+        (&blob_file)
+            .seek(SeekFrom::Start(0))
+            .map_err(ImageError::Io)?;
 
         // =========================================================================
         // Pass 1: Validate entries, paths, symlink targets, and collect whiteouts
         // =========================================================================
-        let blob_file_pass1 = File::open(&layer.blob_path).map_err(ImageError::Io)?;
-        let (_format1, stream1) = ArchiveReader::open(blob_file_pass1, self.decompression_limit)?;
+        let pass1_file = blob_file.try_clone().map_err(ImageError::Io)?;
+        let (_format1, stream1) = ArchiveReader::open(pass1_file, self.decompression_limit)?;
         let mut archive1 = tar::Archive::new(stream1);
         archive1.set_ignore_zeros(false);
 
@@ -133,11 +260,31 @@ impl ImageUnpacker {
             }
         }
 
+        // Rewind blob file descriptor to start for Pass 2
+        (&blob_file)
+            .seek(SeekFrom::Start(0))
+            .map_err(ImageError::Io)?;
+
+        // Ensure blob wasn't modified between passes
+        let mut stat_buf2: libc::stat = unsafe { std::mem::zeroed() };
+        let s_ret2 = unsafe { libc::fstat(blob_file.as_raw_fd(), &mut stat_buf2) };
+        if s_ret2 != 0 {
+            return Err(ImageError::Io(std::io::Error::last_os_error()));
+        }
+        if stat_buf2.st_ino != stat_buf.st_ino
+            || stat_buf2.st_size != stat_buf.st_size
+            || stat_buf2.st_mtime != stat_buf.st_mtime
+        {
+            return Err(ImageError::CorruptArchive(format!(
+                "Layer blob '{}' was modified between archive passes",
+                layer.blob_path.display()
+            )));
+        }
+
         // =========================================================================
         // Pass 2: Extract ordinary entries, skipping whiteouts
         // =========================================================================
-        let blob_file_pass2 = File::open(&layer.blob_path).map_err(ImageError::Io)?;
-        let (_format2, stream2) = ArchiveReader::open(blob_file_pass2, self.decompression_limit)?;
+        let (_format2, stream2) = ArchiveReader::open(blob_file, self.decompression_limit)?;
         let mut archive2 = tar::Archive::new(stream2);
         archive2.set_ignore_zeros(false);
 
@@ -156,19 +303,52 @@ impl ImageUnpacker {
                 continue;
             }
 
-            let header = entry.header();
-            let mode = header.mode().unwrap_or(0o644);
-            let uid = header.uid().unwrap_or(0) as u32;
-            let gid = header.gid().unwrap_or(0) as u32;
-            let mtime = header.mtime().unwrap_or(0) as i64;
+            let (mode, uid, gid, mtime_sec, entry_type) = {
+                let header = entry.header();
+                (
+                    header.mode().unwrap_or(0o644),
+                    header.uid().unwrap_or(0),
+                    header.gid().unwrap_or(0),
+                    header.mtime().unwrap_or(0) as i64,
+                    header.entry_type(),
+                )
+            };
+            let mut mtime_nsec = 0i64;
+
+            // Preserve supported PAX subsecond timestamp precision if available
+            if let Ok(Some(pax)) = entry.pax_extensions() {
+                for ext in pax.flatten() {
+                    if ext.key() == Ok("mtime") {
+                        if let Ok(val) = ext.value() {
+                            if let Some((_, frac)) = val.split_once('.') {
+                                let mut frac_str = frac.to_string();
+                                if frac_str.len() > 9 {
+                                    frac_str.truncate(9);
+                                }
+                                while frac_str.len() < 9 {
+                                    frac_str.push('0');
+                                }
+                                if let Ok(ns) = frac_str.parse::<i64>() {
+                                    mtime_nsec = ns;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Reject invalid UID/GID values that cannot be represented safely in POSIX
+            if uid > (u32::MAX - 1) as u64 || gid > (u32::MAX - 1) as u64 {
+                return Err(ImageError::InvalidOwnership { uid, gid });
+            }
+
             let meta = EntryMetadata {
                 mode,
                 uid,
                 gid,
-                mtime,
+                mtime_sec,
+                mtime_nsec,
             };
-
-            let entry_type = header.entry_type();
             match entry_type {
                 EntryType::Directory => {
                     safe_dir.prepare_for_entry(&path, true)?;
@@ -185,7 +365,7 @@ impl ImageUnpacker {
                     )?;
                     std::io::copy(&mut entry, &mut file).map_err(ImageError::Io)?;
                     drop(file);
-                    safe_dir.set_metadata_at(&path, Some(mode), uid, gid, mtime)?;
+                    safe_dir.set_metadata_at(&path, Some(mode), uid, gid, mtime_sec, mtime_nsec)?;
                 }
                 EntryType::Symlink => {
                     let target = entry
@@ -199,7 +379,7 @@ impl ImageUnpacker {
                         })?;
                     safe_dir.prepare_for_entry(&path, false)?;
                     safe_dir.symlink_at(&target, &path)?;
-                    safe_dir.set_metadata_at(&path, None, uid, gid, mtime)?;
+                    safe_dir.set_metadata_at(&path, None, uid, gid, mtime_sec, mtime_nsec)?;
                 }
                 EntryType::Link => {
                     let target = entry
@@ -214,7 +394,14 @@ impl ImageUnpacker {
                     if safe_dir.exists_at(&target)? {
                         safe_dir.prepare_for_entry(&path, false)?;
                         safe_dir.hardlink_at(&target, &path)?;
-                        safe_dir.set_metadata_at(&path, Some(mode), uid, gid, mtime)?;
+                        safe_dir.set_metadata_at(
+                            &path,
+                            Some(mode),
+                            uid,
+                            gid,
+                            mtime_sec,
+                            mtime_nsec,
+                        )?;
                     } else {
                         // Forward reference: queue for post-pass-2 extraction
                         deferred_hardlinks.push((target.into_owned(), path, meta));
@@ -237,7 +424,14 @@ impl ImageUnpacker {
             }
             safe_dir.prepare_for_entry(&dest, false)?;
             safe_dir.hardlink_at(&source, &dest)?;
-            safe_dir.set_metadata_at(&dest, Some(meta.mode), meta.uid, meta.gid, meta.mtime)?;
+            safe_dir.set_metadata_at(
+                &dest,
+                Some(meta.mode),
+                meta.uid,
+                meta.gid,
+                meta.mtime_sec,
+                meta.mtime_nsec,
+            )?;
         }
 
         // =========================================================================
@@ -250,7 +444,14 @@ impl ImageUnpacker {
         });
 
         for (dir_path, meta) in deferred_dir_metadata {
-            safe_dir.set_metadata_at(&dir_path, Some(meta.mode), meta.uid, meta.gid, meta.mtime)?;
+            safe_dir.set_metadata_at(
+                &dir_path,
+                Some(meta.mode),
+                meta.uid,
+                meta.gid,
+                meta.mtime_sec,
+                meta.mtime_nsec,
+            )?;
         }
 
         Ok(())
@@ -275,7 +476,7 @@ impl RootfsBuilder {
         self
     }
 
-    /// Sequentially applies layers into the destination rootfs.
+    /// Sequentially applies layers into the destination rootfs using descriptor-relative staging and atomic publication.
     pub fn build_rootfs(
         &self,
         layers: &[Layer],
@@ -287,61 +488,155 @@ impl RootfsBuilder {
             dest_rootfs.display()
         );
 
-        // 1. Avoid overwriting an existing destination unexpectedly
-        if dest_rootfs.exists() {
-            if let Ok(mut read_dir) = std::fs::read_dir(dest_rootfs) {
-                if read_dir.next().is_some() {
-                    return Err(ImageError::DestinationAlreadyExists(
-                        dest_rootfs.to_path_buf(),
-                    ));
-                }
-            } else {
-                return Err(ImageError::DestinationAlreadyExists(
-                    dest_rootfs.to_path_buf(),
-                ));
+        let parent_path = dest_rootfs.parent().unwrap_or_else(|| Path::new("."));
+        let dest_name = dest_rootfs.file_name().ok_or_else(|| {
+            ImageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Invalid dest_rootfs path",
+            ))
+        })?;
+
+        // Ensure parent directory exists
+        if !parent_path.exists() {
+            std::fs::create_dir_all(parent_path).map_err(ImageError::Io)?;
+        }
+
+        // Open parent directory descriptor with O_RDONLY | O_DIRECTORY | O_CLOEXEC
+        let c_parent_path = CString::new(parent_path.as_os_str().as_bytes()).map_err(|e| {
+            ImageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        })?;
+        let parent_raw_fd = unsafe {
+            libc::open(
+                c_parent_path.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if parent_raw_fd < 0 {
+            return Err(ImageError::Io(std::io::Error::last_os_error()));
+        }
+        let parent_fd = unsafe { OwnedFd::from_raw_fd(parent_raw_fd) };
+
+        // Detect existing destinations without following symlinks (detects files, dirs, and dangling symlinks)
+        let c_dest_name = CString::new(dest_name.as_bytes()).map_err(|e| {
+            ImageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        })?;
+        let mut dest_stat: libc::stat = unsafe { std::mem::zeroed() };
+        let s_ret = unsafe {
+            libc::fstatat(
+                parent_fd.as_raw_fd(),
+                c_dest_name.as_ptr(),
+                &mut dest_stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if s_ret == 0 {
+            // Destination already exists; never remove an existing destination
+            return Err(ImageError::DestinationAlreadyExists(
+                dest_rootfs.to_path_buf(),
+            ));
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ENOENT) {
+                return Err(ImageError::Io(err));
             }
         }
 
-        // 2. Ensure parent directory exists and is trusted
-        let parent_dir = dest_rootfs.parent().unwrap_or_else(|| Path::new("."));
-        if !parent_dir.exists() {
-            std::fs::create_dir_all(parent_dir).map_err(ImageError::Io)?;
+        // Create staging directory descriptor-relatively with explicit 0700 permissions
+        let staging_name = format!(".staging-rootfs-{}", uuid::Uuid::new_v4());
+        let c_staging_name = CString::new(staging_name.as_bytes()).map_err(|e| {
+            ImageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        })?;
+
+        let mk_ret =
+            unsafe { libc::mkdirat(parent_fd.as_raw_fd(), c_staging_name.as_ptr(), 0o700) };
+        if mk_ret != 0 {
+            return Err(ImageError::Io(std::io::Error::last_os_error()));
         }
 
-        // 3. Create private staging rootfs in parent directory (guarantees same mount/device for atomic rename)
-        let staging_name = format!(".staging-rootfs-{}", uuid::Uuid::new_v4());
-        let staging_rootfs = parent_dir.join(staging_name);
-        std::fs::create_dir_all(&staging_rootfs).map_err(ImageError::Io)?;
+        // Explicitly enforce 0700 permissions on staging directory via fchmod
+        let staging_open = unsafe {
+            libc::openat(
+                parent_fd.as_raw_fd(),
+                c_staging_name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if staging_open >= 0 {
+            unsafe { libc::fchmod(staging_open, 0o700) };
+            unsafe { libc::close(staging_open) };
+        }
 
-        // RAII Cleanup Guard for staging directory
-        struct StagingGuard<'a> {
-            path: &'a Path,
+        // Reliable RAII Cleanup Guard for staging directory
+        struct StagingGuard {
+            parent_fd: RawFd,
+            staging_name: CString,
             active: bool,
         }
-        impl<'a> Drop for StagingGuard<'a> {
+        impl Drop for StagingGuard {
             fn drop(&mut self) {
-                if self.active && self.path.exists() {
-                    let _ = std::fs::remove_dir_all(self.path);
+                if self.active {
+                    let raw_staging = unsafe {
+                        libc::openat(
+                            self.parent_fd,
+                            self.staging_name.as_ptr(),
+                            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                        )
+                    };
+                    if raw_staging >= 0 {
+                        let _ = SafeDir::remove_dir_contents_fd(raw_staging);
+                        unsafe { libc::close(raw_staging) };
+                    }
+                    unsafe {
+                        libc::unlinkat(
+                            self.parent_fd,
+                            self.staging_name.as_ptr(),
+                            libc::AT_REMOVEDIR,
+                        );
+                    }
                 }
             }
         }
         let mut guard = StagingGuard {
-            path: &staging_rootfs,
+            parent_fd: parent_fd.as_raw_fd(),
+            staging_name: c_staging_name.clone(),
             active: true,
         };
 
-        // 4. Apply layers sequentially in OCI layer order
+        let staging_path = parent_path.join(&staging_name);
+
+        // Apply layers sequentially in OCI layer order
         for layer in layers {
-            self.unpacker.unpack_layer(layer, &staging_rootfs)?;
+            self.unpacker.unpack_layer(layer, &staging_path)?;
         }
 
-        // 5. Publish completed rootfs atomically
-        if dest_rootfs.exists() {
-            std::fs::remove_dir(dest_rootfs).map_err(ImageError::Io)?;
+        // Ensure root staging directory permissions are accessible (0755) before publication
+        let staging_open = unsafe {
+            libc::openat(
+                parent_fd.as_raw_fd(),
+                c_staging_name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if staging_open >= 0 {
+            let mut root_stat: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(staging_open, &mut root_stat) } == 0 {
+                // If staging root is still 0700, change to 0755 so container root is accessible
+                if (root_stat.st_mode & 0o777) == 0o700 {
+                    unsafe { libc::fchmod(staging_open, 0o755) };
+                }
+            }
+            unsafe { libc::close(staging_open) };
         }
-        std::fs::rename(&staging_rootfs, dest_rootfs).map_err(ImageError::Io)?;
 
-        // Disarm guard since staging succeeded and was moved to dest_rootfs
+        // Publish completed rootfs with atomic no-replace semantics
+        rename_no_replace(
+            parent_fd.as_raw_fd(),
+            &c_staging_name,
+            &c_dest_name,
+            dest_rootfs,
+        )?;
+
+        // Disarm guard since staging succeeded and was published to dest_rootfs
         guard.active = false;
 
         Ok(dest_rootfs.to_path_buf())

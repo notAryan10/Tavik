@@ -127,35 +127,127 @@ impl ContainerExecutor {
         }
 
         info!("Starting OCI container '{}'", id);
-        self.platform_start(id, &state)?;
+        match self.platform_start(id, &state) {
+            Ok(()) => {
+                state.status = ContainerStatus::Running;
+                self.save_state(&state)?;
+                Ok(state)
+            }
+            Err(e) => {
+                // If startup failed (execve failed or child exited before exec),
+                // mark state as Stopped, do NOT mark as Running!
+                state.status = ContainerStatus::Stopped;
+                let _ = self.save_state(&state);
+                Err(e)
+            }
+        }
+    }
 
-        // Verify container init child did not immediately exit with failure
-        #[cfg(target_os = "linux")]
+    /// Stops a running container with graceful signal escalation (`stop` command).
+    pub fn stop(
+        &self,
+        id: &str,
+        signal: Option<i32>,
+        grace_period: Option<std::time::Duration>,
+    ) -> Result<ContainerState> {
+        let mut state = self.load_state(id)?;
+
+        if state.status == ContainerStatus::Stopped {
+            return Ok(state);
+        }
+
+        if state.status != ContainerStatus::Running {
+            return Err(TavikError::InvalidState(format!(
+                "Cannot stop container '{}': status is '{}' (expected 'running')",
+                id, state.status
+            )));
+        }
+
+        let pid = state.pid.ok_or_else(|| {
+            TavikError::InvalidState(format!("Container '{}' has no active PID", id))
+        })?;
+
+        let sig = signal.unwrap_or(libc::SIGTERM);
+
+        // Reject signals that only suspend or resume the process
+        #[cfg(unix)]
         {
-            if let Some(pid) = state.pid {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                let mut status = 0;
-                let wait_res = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
-                if wait_res == pid as i32 {
-                    state.status = ContainerStatus::Stopped;
-                    let _ = self.save_state(&state);
-                    let exit_code = if libc::WIFEXITED(status) {
-                        libc::WEXITSTATUS(status)
-                    } else {
-                        -1
-                    };
-                    return Err(TavikError::Execution(format!(
-                        "Container '{}' process (PID {}) terminated immediately on start with exit code {}",
-                        id, pid, exit_code
-                    )));
-                }
+            if matches!(
+                sig,
+                libc::SIGSTOP | libc::SIGTSTP | libc::SIGCONT | libc::SIGTTIN | libc::SIGTTOU
+            ) {
+                return Err(TavikError::InvalidState(format!(
+                    "Signal {} suspends/resumes process and cannot be used to stop container '{}'",
+                    sig, id
+                )));
             }
         }
 
-        state.status = ContainerStatus::Running;
-        self.save_state(&state)?;
+        info!(
+            "Stopping container '{}' (PID {}) with signal {}",
+            id, pid, sig
+        );
 
-        Ok(state)
+        #[cfg(unix)]
+        {
+            let res = unsafe { libc::kill(pid as libc::pid_t, sig) };
+            if res != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(TavikError::Execution(format!(
+                        "Failed to send stop signal {} to container PID {}: {}",
+                        sig, pid, err
+                    )));
+                }
+            }
+
+            let timeout = grace_period.unwrap_or(std::time::Duration::from_secs(10));
+            let start_time = std::time::Instant::now();
+            let mut terminated = false;
+
+            while start_time.elapsed() < timeout {
+                if !is_pid_alive(pid) {
+                    terminated = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+
+            if !terminated {
+                warn!(
+                    "Container '{}' (PID {}) did not stop after {:?}; escalating to SIGKILL",
+                    id, pid, timeout
+                );
+                let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                let kill_start = std::time::Instant::now();
+                while kill_start.elapsed() < std::time::Duration::from_secs(2) {
+                    if !is_pid_alive(pid) {
+                        terminated = true;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+            }
+
+            if !terminated {
+                return Err(TavikError::Execution(format!(
+                    "Container '{}' (PID {}) failed to terminate even after SIGKILL escalation",
+                    id, pid
+                )));
+            }
+
+            state.status = ContainerStatus::Stopped;
+            self.save_state(&state)?;
+            Ok(state)
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = (pid, sig, grace_period);
+            Err(TavikError::Unsupported(
+                "Container stop is unsupported on non-Unix platforms".to_string(),
+            ))
+        }
     }
 
     /// Sends a signal to the container process (`kill` command).
@@ -286,7 +378,10 @@ impl ContainerExecutor {
     fn platform_start(&self, id: &str, _state: &ContainerState) -> Result<()> {
         use std::io::Write;
 
-        let start_fifo = self.container_dir(id).join("start.fifo");
+        let container_dir = self.container_dir(id);
+        let start_fifo = container_dir.join("start.fifo");
+        let exec_fifo = container_dir.join("exec.fifo");
+
         if !start_fifo.exists() {
             return Err(TavikError::InvalidState(format!(
                 "Container '{}' start FIFO not found at {:?}",
@@ -294,17 +389,76 @@ impl ContainerExecutor {
             )));
         }
 
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .open(&start_fifo)
-            .map_err(|e| TavikError::Io(format!("Failed to open container start FIFO: {}", e)))?;
+        // 1. Open exec.fifo for reading BEFORE triggering start signal
+        let exec_fifo_c = std::ffi::CString::new(exec_fifo.to_str().unwrap()).unwrap();
+        let exec_read_fd =
+            unsafe { libc::open(exec_fifo_c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if exec_read_fd < 0 {
+            return Err(TavikError::Io(format!(
+                "Failed to open exec FIFO at {:?}: {}",
+                exec_fifo,
+                std::io::Error::last_os_error()
+            )));
+        }
 
-        file.write_all(b"1").map_err(|e| {
-            TavikError::Io(format!(
+        // 2. Open start FIFO and write start signal
+        let mut file = match fs::OpenOptions::new().write(true).open(&start_fifo) {
+            Ok(f) => f,
+            Err(e) => {
+                unsafe { libc::close(exec_read_fd) };
+                return Err(TavikError::Io(format!(
+                    "Failed to open container start FIFO: {}",
+                    e
+                )));
+            }
+        };
+
+        if let Err(e) = file.write_all(b"1") {
+            unsafe { libc::close(exec_read_fd) };
+            return Err(TavikError::Io(format!(
                 "Failed to write start signal to container FIFO: {}",
                 e
-            ))
-        })?;
+            )));
+        }
+
+        // 3. Read execution status from exec.fifo
+        // If execve() succeeds, fd 3 in child is closed by kernel via FD_CLOEXEC, yielding EOF (0 bytes).
+        // If execve() or child pre-exec fails, child writes the error string and exits.
+        let mut err_buf = Vec::new();
+        let mut chunk = [0u8; 512];
+        loop {
+            let n = unsafe {
+                libc::read(
+                    exec_read_fd,
+                    chunk.as_mut_ptr() as *mut libc::c_void,
+                    chunk.len(),
+                )
+            };
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                unsafe { libc::close(exec_read_fd) };
+                return Err(TavikError::Io(format!(
+                    "Failed to read from exec.fifo: {}",
+                    err
+                )));
+            }
+            if n == 0 {
+                break; // EOF: kernel closed fd on successful execve!
+            }
+            err_buf.extend_from_slice(&chunk[..n as usize]);
+        }
+        unsafe { libc::close(exec_read_fd) };
+
+        if !err_buf.is_empty() {
+            let err_msg = String::from_utf8_lossy(&err_buf);
+            return Err(TavikError::Execution(format!(
+                "Container '{}' failed during startup: {}",
+                id, err_msg
+            )));
+        }
 
         Ok(())
     }

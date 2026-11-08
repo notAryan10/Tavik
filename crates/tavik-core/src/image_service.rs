@@ -459,7 +459,17 @@ impl ImageService {
         &self,
         executor: &ContainerExecutor,
         container_id: &str,
-    ) -> Result<(), ImageServiceError> {
+    ) -> Result<ContainerState, ImageServiceError> {
+        self.stop_container_with_timeout(executor, container_id, None)
+    }
+
+    /// Stops a container using its image-configured stop signal with a configurable grace period.
+    pub fn stop_container_with_timeout(
+        &self,
+        executor: &ContainerExecutor,
+        container_id: &str,
+        grace_period: Option<std::time::Duration>,
+    ) -> Result<ContainerState, ImageServiceError> {
         let state = executor.load_state(container_id)?;
         let signal_str = state
             .annotations
@@ -469,8 +479,8 @@ impl ImageService {
             .unwrap_or("SIGTERM");
 
         let signal_num = parse_signal(signal_str)?;
-        executor.kill(container_id, signal_num)?;
-        Ok(())
+        let stopped_state = executor.stop(container_id, Some(signal_num), grace_period)?;
+        Ok(stopped_state)
     }
 }
 

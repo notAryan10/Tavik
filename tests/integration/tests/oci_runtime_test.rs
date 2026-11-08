@@ -1052,26 +1052,56 @@ fn test_working_directory_inaccessible_to_container_user() {
 fn test_container_creation_retry_with_same_id_after_failure() {
     let temp = tempdir().unwrap();
     let state_dir = temp.path().join("state");
-    let bundle_invalid = temp.path().join("bundle_invalid");
-    fs::create_dir_all(&bundle_invalid).unwrap();
-    // Missing rootfs/config.json - creation will fail
-    fs::write(bundle_invalid.join("config.json"), "invalid json").unwrap();
+    let bundle_fail = temp.path().join("bundle_fail");
+    fs::create_dir_all(&bundle_fail).unwrap();
+
+    // Valid spec so Spec::load_from_bundle succeeds and Creating state is persisted,
+    // but rootfs directory is omitted so platform_create fails!
+    let mut fail_spec = Spec::default_linux();
+    if let Some(root) = &mut fail_spec.root {
+        root.path = "nonexistent_rootfs_dir".to_string();
+    }
+    fs::write(
+        bundle_fail.join("config.json"),
+        serde_json::to_string_pretty(&fail_spec).unwrap(),
+    )
+    .unwrap();
 
     let executor = ContainerExecutor::new(state_dir.clone()).unwrap();
     let container_id = "test-retry-creation-id";
+    let container_dir = state_dir.join(container_id);
 
-    // 1. Initial creation fails due to invalid bundle
-    let first_res = executor.create(container_id, &bundle_invalid);
-    assert!(first_res.is_err());
-
-    // Verify container directory was cleaned up and not left in stale Creating state
-    let container_dir = state_dir.join("containers").join(container_id);
+    // 1. Initial creation fails during platform_create after Creating state was persisted
+    let first_res = executor.create(container_id, &bundle_fail);
     assert!(
-        !container_dir.exists(),
-        "Container state directory should have been cleaned up on creation failure"
+        first_res.is_err(),
+        "Creation should fail due to missing rootfs in platform_create"
     );
 
-    // 2. Setting up a valid bundle
+    // 2. Verify state and filesystem cleanup: no stale state, PID, or FIFO files remain
+    assert!(
+        !container_dir.exists(),
+        "Container directory {:?} must be cleaned up on creation failure",
+        container_dir
+    );
+    assert!(
+        !container_dir.join("state.json").exists(),
+        "stale state.json must not remain"
+    );
+    assert!(
+        !container_dir.join("container.pid").exists(),
+        "stale container.pid must not remain"
+    );
+    assert!(
+        !container_dir.join("start.fifo").exists(),
+        "stale start.fifo must not remain"
+    );
+    assert!(
+        !container_dir.join("exec.fifo").exists(),
+        "stale exec.fifo must not remain"
+    );
+
+    // 3. Setting up a valid bundle
     let bundle_valid = temp.path().join("bundle_valid");
     let rootfs_valid = bundle_valid.join("rootfs");
     fs::create_dir_all(&rootfs_valid).unwrap();
@@ -1085,17 +1115,31 @@ fn test_container_creation_retry_with_same_id_after_failure() {
     )
     .unwrap();
 
-    // 3. Retry with exact same container ID should not be blocked by ContainerAlreadyExists
+    // 4. Retry with exact same container ID succeeds without ContainerAlreadyExists
     #[cfg(target_os = "linux")]
     {
         if unsafe { libc::geteuid() } == 0 {
             let second_res = executor.create(container_id, &bundle_valid);
             assert!(
                 second_res.is_ok(),
-                "Retry with same container_id should succeed after failed creation cleanup"
+                "Retry with same container_id should succeed after failed creation cleanup: {:?}",
+                second_res.err()
             );
+            let state = second_res.unwrap();
+            assert_eq!(state.status, ContainerStatus::Created);
             let _ = executor.delete(container_id, true);
         }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let second_res = executor.create(container_id, &bundle_valid);
+        assert!(
+            second_res.is_ok(),
+            "Retry with same container_id should succeed on non-Linux: {:?}",
+            second_res.err()
+        );
+        let _ = executor.delete(container_id, true);
     }
 }
 
@@ -1183,5 +1227,353 @@ fn test_explicit_uid_gid_zero_credential_transition() {
 
         let _ = executor.kill(container_id, 9);
         let _ = executor.delete(container_id, true);
+    }
+}
+
+#[test]
+fn test_short_lived_process_startup_success() {
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping rootful short-lived process test (requires root)");
+            return;
+        }
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let bundle_dir = temp.path().join("bundle");
+        let rootfs = bundle_dir.join("rootfs");
+        let bin_dir = rootfs.join("bin");
+        let dev_dir = rootfs.join("dev");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&dev_dir).unwrap();
+        let _ = fs::File::create(dev_dir.join("null"));
+
+        let busybox_path = if Path::new("/usr/bin/busybox").exists() {
+            "/usr/bin/busybox"
+        } else {
+            "/bin/busybox"
+        };
+        fs::copy(busybox_path, bin_dir.join("busybox")).unwrap();
+
+        let mut spec = Spec::default_linux();
+        if let Some(proc) = &mut spec.process {
+            // Short-lived process: true (exits immediately with code 0)
+            proc.args = vec!["/bin/busybox".to_string(), "true".to_string()];
+        }
+
+        let config_path = bundle_dir.join("config.json");
+        fs::write(&config_path, serde_json::to_string_pretty(&spec).unwrap()).unwrap();
+
+        let executor = ContainerExecutor::new(state_dir).unwrap();
+        let container_id = "test-short-lived-01";
+
+        let created_state = executor.create(container_id, &bundle_dir).unwrap();
+        assert_eq!(created_state.status, ContainerStatus::Created);
+
+        // start() must succeed and must NOT report startup failure due to short-lived exit!
+        let start_res = executor.start(container_id);
+        assert!(
+            start_res.is_ok(),
+            "Starting short-lived process should succeed: {:?}",
+            start_res.err()
+        );
+
+        // Sleep briefly for supervisor to reap child and persist Stopped
+        std::thread::sleep(Duration::from_millis(100));
+        let state = executor.load_state(container_id).unwrap();
+        assert_eq!(state.status, ContainerStatus::Stopped);
+
+        let _ = executor.delete(container_id, true);
+    }
+}
+
+#[test]
+fn test_runtime_path_resolution_variants() {
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping rootful runtime PATH test (requires root)");
+            return;
+        }
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let bundle_dir = temp.path().join("bundle");
+        let rootfs = bundle_dir.join("rootfs");
+        let bin_dir = rootfs.join("bin");
+        let usr_bin = rootfs.join("usr/bin");
+        let custom_bin = rootfs.join("custom_tools");
+        let dev_dir = rootfs.join("dev");
+        let tmp_dir = rootfs.join("tmp");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&usr_bin).unwrap();
+        fs::create_dir_all(&custom_bin).unwrap();
+        fs::create_dir_all(&dev_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let _ = fs::File::create(dev_dir.join("null"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(dev_dir.join("null"), fs::Permissions::from_mode(0o666));
+            let _ = fs::set_permissions(&tmp_dir, fs::Permissions::from_mode(0o777));
+        }
+
+        let busybox_path = if Path::new("/usr/bin/busybox").exists() {
+            "/usr/bin/busybox"
+        } else {
+            "/bin/busybox"
+        };
+        fs::copy(busybox_path, bin_dir.join("busybox")).unwrap();
+
+        // 1. In-rootfs symlink: /usr/bin/my_sh -> /bin/busybox
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/bin/busybox", usr_bin.join("my_sh")).unwrap();
+
+        // 2. Custom tool in custom_tools: custom_echo -> /bin/busybox
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/bin/busybox", custom_bin.join("custom_echo")).unwrap();
+
+        // 3. Malicious symlink targeting path outside rootfs
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("../../../../../../etc/shadow", rootfs.join("bad_escape"))
+            .unwrap();
+
+        let executor = ContainerExecutor::new(state_dir).unwrap();
+
+        // A. Bare executable resolved along multiple PATH entries
+        let mut spec_bare = Spec::default_linux();
+        if let Some(proc) = &mut spec_bare.process {
+            proc.env = vec!["PATH=/nonexistent:/custom_tools:/bin".to_string()];
+            proc.args = vec![
+                "custom_echo".to_string(),
+                "echo".to_string(),
+                "bare_ok".to_string(),
+            ];
+        }
+        fs::write(
+            bundle_dir.join("config.json"),
+            serde_json::to_string_pretty(&spec_bare).unwrap(),
+        )
+        .unwrap();
+
+        let _ = executor.create("test-path-bare", &bundle_dir).unwrap();
+        let res_bare = executor.start("test-path-bare");
+        assert!(
+            res_bare.is_ok(),
+            "Bare executable in PATH should start successfully"
+        );
+        let _ = executor.delete("test-path-bare", true);
+
+        // B. Symlinked executable inside rootfs
+        let mut spec_sym = Spec::default_linux();
+        if let Some(proc) = &mut spec_sym.process {
+            proc.env = vec!["PATH=/usr/bin".to_string()];
+            proc.args = vec!["my_sh".to_string(), "true".to_string()];
+        }
+        fs::write(
+            bundle_dir.join("config.json"),
+            serde_json::to_string_pretty(&spec_sym).unwrap(),
+        )
+        .unwrap();
+
+        let _ = executor.create("test-path-sym", &bundle_dir).unwrap();
+        let res_sym = executor.start("test-path-sym");
+        assert!(
+            res_sym.is_ok(),
+            "Symlinked executable inside rootfs should start successfully"
+        );
+        let _ = executor.delete("test-path-sym", true);
+
+        // C. Relative executable path ("./bin/busybox")
+        let mut spec_rel = Spec::default_linux();
+        if let Some(proc) = &mut spec_rel.process {
+            proc.cwd = "/".to_string();
+            proc.args = vec!["./bin/busybox".to_string(), "true".to_string()];
+        }
+        fs::write(
+            bundle_dir.join("config.json"),
+            serde_json::to_string_pretty(&spec_rel).unwrap(),
+        )
+        .unwrap();
+
+        let _ = executor.create("test-path-rel", &bundle_dir).unwrap();
+        let res_rel = executor.start("test-path-rel");
+        assert!(
+            res_rel.is_ok(),
+            "Relative executable path should start successfully"
+        );
+        let _ = executor.delete("test-path-rel", true);
+
+        // D. Missing executable fails startup
+        let mut spec_missing = Spec::default_linux();
+        if let Some(proc) = &mut spec_missing.process {
+            proc.env = vec!["PATH=/bin".to_string()];
+            proc.args = vec!["nonexistent_tool_12345".to_string()];
+        }
+        fs::write(
+            bundle_dir.join("config.json"),
+            serde_json::to_string_pretty(&spec_missing).unwrap(),
+        )
+        .unwrap();
+
+        let _ = executor.create("test-path-missing", &bundle_dir).unwrap();
+        let res_missing = executor.start("test-path-missing");
+        assert!(res_missing.is_err(), "Missing executable must fail startup");
+        let _ = executor.delete("test-path-missing", true);
+
+        // E. Malicious symlink escape fails startup safely
+        let mut spec_escape = Spec::default_linux();
+        if let Some(proc) = &mut spec_escape.process {
+            proc.args = vec!["/bad_escape".to_string()];
+        }
+        fs::write(
+            bundle_dir.join("config.json"),
+            serde_json::to_string_pretty(&spec_escape).unwrap(),
+        )
+        .unwrap();
+
+        let _ = executor.create("test-path-escape", &bundle_dir).unwrap();
+        let res_escape = executor.start("test-path-escape");
+        assert!(
+            res_escape.is_err(),
+            "Malicious escaping symlink must fail startup safely"
+        );
+        let _ = executor.delete("test-path-escape", true);
+    }
+}
+
+#[test]
+fn test_stop_semantics_rejects_sigstop_and_escalates_sigkill() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let executor = ContainerExecutor::new(state_dir.clone()).unwrap();
+
+    // 1. Verify stop rejects suspend/resume signals
+    #[cfg(unix)]
+    {
+        // Container that does not exist or invalid state
+        let err_stop = executor
+            .stop("nonexistent", Some(libc::SIGSTOP), None)
+            .unwrap_err();
+        assert!(matches!(
+            err_stop,
+            tavik_common::error::TavikError::NotFound(_)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping rootful stop escalation test (requires root)");
+            return;
+        }
+
+        let bundle_dir = temp.path().join("bundle");
+        let rootfs = bundle_dir.join("rootfs");
+        let bin_dir = rootfs.join("bin");
+        let dev_dir = rootfs.join("dev");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&dev_dir).unwrap();
+        let _ = fs::File::create(dev_dir.join("null"));
+
+        let busybox_path = if Path::new("/usr/bin/busybox").exists() {
+            "/usr/bin/busybox"
+        } else {
+            "/bin/busybox"
+        };
+        fs::copy(busybox_path, bin_dir.join("busybox")).unwrap();
+
+        // Workload that traps and ignores SIGTERM: requires SIGKILL escalation to stop!
+        let mut spec = Spec::default_linux();
+        if let Some(proc) = &mut spec.process {
+            proc.args = vec![
+                "/bin/busybox".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "trap '' TERM; while true; do /bin/busybox sleep 1; done".to_string(),
+            ];
+        }
+
+        fs::write(
+            bundle_dir.join("config.json"),
+            serde_json::to_string_pretty(&spec).unwrap(),
+        )
+        .unwrap();
+
+        let container_id = "test-stop-escalate";
+        let _ = executor.create(container_id, &bundle_dir).unwrap();
+        let running_state = executor.start(container_id).unwrap();
+        assert_eq!(running_state.status, ContainerStatus::Running);
+
+        // Reject SIGSTOP
+        let res_sigstop = executor.stop(container_id, Some(libc::SIGSTOP), None);
+        assert!(matches!(
+            res_sigstop,
+            Err(tavik_common::error::TavikError::InvalidState(_))
+        ));
+
+        // Reject SIGCONT
+        let res_sigcont = executor.stop(container_id, Some(libc::SIGCONT), None);
+        assert!(matches!(
+            res_sigcont,
+            Err(tavik_common::error::TavikError::InvalidState(_))
+        ));
+
+        // Stop with short 100ms grace period: SIGTERM ignored -> escalates to SIGKILL!
+        let stopped_state = executor
+            .stop(
+                container_id,
+                Some(libc::SIGTERM),
+                Some(Duration::from_millis(100)),
+            )
+            .expect("Stop with SIGKILL escalation must succeed");
+        assert_eq!(stopped_state.status, ContainerStatus::Stopped);
+
+        let loaded = executor.load_state(container_id).unwrap();
+        assert_eq!(loaded.status, ContainerStatus::Stopped);
+
+        let _ = executor.delete(container_id, true);
+    }
+}
+
+#[test]
+fn test_cgroup_failure_cleanup_raii() {
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping rootful cgroup cleanup test (requires root)");
+            return;
+        }
+
+        let mgr = match tavik_cgroups::CgroupManager::new() {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+
+        let container_id = "test-cgroup-raii-cleanup";
+        let cgroup_dir = match mgr.create_container_cgroup(container_id) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        assert!(cgroup_dir.exists());
+
+        // Scope with active CgroupGuard: when dropped without disarm(), destroys cgroup!
+        {
+            let guard =
+                tavik_runtime::init::CgroupGuard::new(mgr.clone(), container_id.to_string());
+            assert_eq!(
+                guard.manager().container_cgroup_dir(container_id).unwrap(),
+                cgroup_dir
+            );
+            // Drop guard simulating failure before ownership transfer
+        }
+
+        assert!(
+            !cgroup_dir.exists(),
+            "Cgroup directory {:?} should have been automatically destroyed on guard drop",
+            cgroup_dir
+        );
     }
 }

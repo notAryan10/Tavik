@@ -46,66 +46,6 @@ impl Drop for StateLock {
     }
 }
 
-#[cfg(target_os = "linux")]
-struct PidFd {
-    fd: i32,
-}
-
-#[cfg(target_os = "linux")]
-impl PidFd {
-    fn open(pid: u32) -> Option<Self> {
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) as i32 };
-        if fd >= 0 {
-            Some(Self { fd })
-        } else {
-            None
-        }
-    }
-
-    fn send_signal(&self, sig: i32) -> Result<()> {
-        let ret = unsafe {
-            libc::syscall(
-                libc::SYS_pidfd_send_signal,
-                self.fd,
-                sig,
-                std::ptr::null::<libc::c_void>(),
-                0,
-            )
-        };
-        if ret != 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::ESRCH) {
-                return Ok(());
-            }
-            return Err(TavikError::Execution(format!(
-                "Failed to send signal {} via pidfd: {}",
-                sig, err
-            )));
-        }
-        Ok(())
-    }
-
-    fn wait_for_exit(&self, timeout: std::time::Duration) -> bool {
-        let mut pfd = libc::pollfd {
-            fd: self.fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-        let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-        ret > 0 && (pfd.revents & libc::POLLIN != 0)
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for PidFd {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.fd);
-        }
-    }
-}
-
 pub struct ContainerExecutor {
     state_dir: PathBuf,
 }
@@ -287,19 +227,16 @@ impl ContainerExecutor {
 
     /// Starts a created OCI container (`start` command).
     pub fn start(&self, id: &str) -> Result<ContainerState> {
-        let state = self.load_state(id)?;
-
-        if state.status != ContainerStatus::Created {
-            return Err(TavikError::InvalidState(format!(
-                "Cannot start container '{}': status is '{}' (expected 'created')",
-                id, state.status
-            )));
-        }
-
         info!("Starting OCI container '{}'", id);
 
-        // 1. Mark transition from Created to Starting
-        self.transition_state(id, |st| {
+        // 1. Atomic start: Validate Created -> Starting while holding StateLock
+        let state = self.transition_state(id, |st| {
+            if st.status != ContainerStatus::Created {
+                return Err(TavikError::InvalidState(format!(
+                    "Cannot start container '{}': status is '{}' (expected 'created')",
+                    st.id, st.status
+                )));
+            }
             st.status = ContainerStatus::Starting;
             Ok(())
         })?;
@@ -375,77 +312,36 @@ impl ContainerExecutor {
         #[cfg(target_os = "linux")]
         {
             let timeout = grace_period.unwrap_or(std::time::Duration::from_secs(10));
-            let pidfd = PidFd::open(pid);
+            let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as u64;
+            let control_sock = self.container_dir(id).join("control.sock");
 
-            let mut terminated = false;
-            if let Some(ref pfd) = pidfd {
-                // Send stop signal via pidfd to prevent PID recycling
-                pfd.send_signal(sig)?;
-                // Wait for process termination
-                if pfd.wait_for_exit(timeout) {
-                    terminated = true;
-                } else {
-                    warn!(
-                        "Container '{}' (PID {}) did not stop after {:?}; escalating to SIGKILL",
-                        id, pid, timeout
-                    );
-                    pfd.send_signal(libc::SIGKILL)?;
-                    if pfd.wait_for_exit(std::time::Duration::from_secs(2)) {
-                        terminated = true;
+            if control_sock.exists() {
+                let cmd = format!("STOP {} {}", sig, timeout_ms);
+                match crate::init::send_control_command(&control_sock, &cmd) {
+                    Ok(_) => {
+                        let final_state = self.load_state(id)?;
+                        return Ok(final_state);
                     }
-                }
-            } else {
-                // Fallback for environments where pidfd_open is unavailable
-                let res = unsafe { libc::kill(pid as libc::pid_t, sig) };
-                if res != 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.raw_os_error() != Some(libc::ESRCH) {
-                        return Err(TavikError::Execution(format!(
-                            "Failed to send stop signal {} to container PID {}: {}",
-                            sig, pid, err
-                        )));
-                    }
-                }
-
-                let start_time = std::time::Instant::now();
-                while start_time.elapsed() < timeout {
-                    if !is_pid_alive(pid) {
-                        terminated = true;
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                }
-
-                if !terminated {
-                    warn!(
-                        "Container '{}' (PID {}) did not stop after {:?}; escalating to SIGKILL",
-                        id, pid, timeout
-                    );
-                    let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-                    let kill_start = std::time::Instant::now();
-                    while kill_start.elapsed() < std::time::Duration::from_secs(2) {
-                        if !is_pid_alive(pid) {
-                            terminated = true;
-                            break;
+                    Err(e) => {
+                        if let Ok(st) = self.load_state(id) {
+                            if st.status == ContainerStatus::Stopped {
+                                return Ok(st);
+                            }
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(25));
+                        return Err(e);
                     }
                 }
             }
 
-            if !terminated {
-                return Err(TavikError::Execution(format!(
-                    "Container '{}' (PID {}) failed to terminate even after SIGKILL escalation",
-                    id, pid
-                )));
+            let current = self.load_state(id)?;
+            if current.status == ContainerStatus::Stopped {
+                return Ok(current);
             }
 
-            // Confirmed termination: transition state to Stopped
-            let final_state = self.transition_state(id, |st| {
-                st.status = ContainerStatus::Stopped;
-                Ok(())
-            })?;
-            Ok(final_state)
+            return Err(TavikError::Execution(format!(
+                "Container '{}' supervisor control channel unavailable and container not stopped",
+                id
+            )));
         }
 
         #[cfg(all(unix, not(target_os = "linux")))]
@@ -521,7 +417,27 @@ impl ContainerExecutor {
             signal, id, pid
         );
 
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
+        {
+            let control_sock = self.container_dir(id).join("control.sock");
+            if control_sock.exists() {
+                crate::init::send_control_command(&control_sock, &format!("KILL {}", signal))?;
+                return Ok(());
+            }
+            let state = self.load_state(id)?;
+            if state.status == ContainerStatus::Stopped {
+                return Err(TavikError::InvalidState(format!(
+                    "Cannot signal container '{}': status is stopped",
+                    id
+                )));
+            }
+            return Err(TavikError::Execution(format!(
+                "Container '{}' supervisor control channel unavailable",
+                id
+            )));
+        }
+
+        #[cfg(all(unix, not(target_os = "linux")))]
         {
             let res = unsafe { libc::kill(pid as libc::pid_t, signal) };
             if res != 0 {
@@ -564,8 +480,21 @@ impl ContainerExecutor {
 
         #[cfg(target_os = "linux")]
         {
-            if let Ok(cgroup_mgr) = tavik_cgroups::CgroupManager::new() {
-                let _ = cgroup_mgr.destroy_container_cgroup(id);
+            let owns_cgroup = Spec::load_from_bundle(&state.bundle)
+                .ok()
+                .and_then(|s| s.linux)
+                .and_then(|l| l.resources)
+                .is_some();
+
+            if owns_cgroup {
+                if let Ok(cgroup_mgr) = tavik_cgroups::CgroupManager::new() {
+                    if let Err(e) = cgroup_mgr.destroy_container_cgroup(id) {
+                        warn!(
+                            "Failed to destroy cgroup for container '{}' on delete: {}",
+                            id, e
+                        );
+                    }
+                }
             }
         }
 
@@ -590,27 +519,31 @@ impl ContainerExecutor {
             TavikError::Config("Invalid UTF-8 in state directory path".to_string())
         })?;
 
-        if let Some(tavikr_bin) = find_tavikr_binary() {
-            info!(
-                "Launching container init via dedicated helper: {:?}",
-                tavikr_bin
-            );
-            let status = std::process::Command::new(tavikr_bin)
-                .args(["init", "--state-dir", state_dir_str, id])
-                .status()
-                .map_err(|e| {
-                    TavikError::Execution(format!("Failed to spawn tavikr init helper: {}", e))
-                })?;
+        let tavikr_bin = find_tavikr_binary().ok_or_else(|| {
+            TavikError::Execution(
+                "Dedicated 'tavikr' runtime helper binary not found. A standalone single-threaded \
+                 helper is required on Linux to ensure safe container initialization without \
+                 multithreaded fork deadlocks."
+                    .to_string(),
+            )
+        })?;
 
-            if !status.success() {
-                return Err(TavikError::Execution(format!(
-                    "tavikr init failed with exit status: {:?}",
-                    status
-                )));
-            }
-        } else {
-            info!("Executing in-process container init trampoline");
-            crate::init::run_init_trampoline(&self.state_dir, id)?;
+        info!(
+            "Launching container init via dedicated helper: {:?}",
+            tavikr_bin
+        );
+        let status = std::process::Command::new(tavikr_bin)
+            .args(["init", "--state-dir", state_dir_str, id])
+            .status()
+            .map_err(|e| {
+                TavikError::Execution(format!("Failed to spawn tavikr init helper: {}", e))
+            })?;
+
+        if !status.success() {
+            return Err(TavikError::Execution(format!(
+                "tavikr init failed with exit status: {:?}",
+                status
+            )));
         }
 
         self.load_state(id)
@@ -698,10 +631,21 @@ impl ContainerExecutor {
         }
         if poll_res == 0 {
             unsafe { libc::close(exec_read_fd) };
-            return Err(TavikError::Execution(format!(
+            let orig_err = TavikError::Execution(format!(
                 "Container '{}' startup timed out waiting for exec status",
                 id
-            )));
+            ));
+            let control_sock = container_dir.join("control.sock");
+            if control_sock.exists() {
+                if let Err(cancel_err) = crate::init::send_control_command(&control_sock, "CANCEL")
+                {
+                    warn!(
+                        "Failed to send CANCEL to supervisor for container '{}': {}",
+                        id, cancel_err
+                    );
+                }
+            }
+            return Err(orig_err);
         }
 
         let mut err_buf = Vec::new();
@@ -760,6 +704,12 @@ fn find_tavikr_binary() -> Option<PathBuf> {
             return Some(p);
         }
     }
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_tavikr") {
+        let p = PathBuf::from(path);
+        if p.exists() {
+            return Some(p);
+        }
+    }
     if let Ok(cur) = std::env::current_exe() {
         if let Some(parent) = cur.parent() {
             let p1 = parent.join("tavikr");
@@ -771,6 +721,14 @@ fn find_tavikr_binary() -> Option<PathBuf> {
                 if p2.exists() {
                     return Some(p2);
                 }
+            }
+        }
+    }
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join("tavikr");
+            if candidate.exists() {
+                return Some(candidate);
             }
         }
     }

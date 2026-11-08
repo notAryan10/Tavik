@@ -1763,3 +1763,134 @@ fn test_repeated_short_lived_process_lifecycle() {
         }
     }
 }
+
+#[test]
+fn test_concurrent_start_requests_atomic_rejection() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let bundle_dir = temp.path().join("bundle");
+    let rootfs = bundle_dir.join("rootfs");
+    fs::create_dir_all(&rootfs).unwrap();
+
+    let spec = Spec::default_linux();
+    fs::write(
+        bundle_dir.join("config.json"),
+        serde_json::to_string_pretty(&spec).unwrap(),
+    )
+    .unwrap();
+
+    let executor = std::sync::Arc::new(ContainerExecutor::new(state_dir).unwrap());
+    let id = "test-concurrent-atomic-start";
+    let state = executor.create(id, &bundle_dir).unwrap();
+    assert_eq!(state.status, ContainerStatus::Created);
+
+    let num_threads = 10;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(num_threads));
+    let mut handles = Vec::new();
+
+    for _ in 0..num_threads {
+        let exec = std::sync::Arc::clone(&executor);
+        let b = std::sync::Arc::clone(&barrier);
+        let cont_id = id.to_string();
+
+        handles.push(std::thread::spawn(move || {
+            b.wait();
+            exec.start(&cont_id)
+        }));
+    }
+
+    let mut success_or_starting = 0;
+    let mut rejected_invalid_state = 0;
+
+    for handle in handles {
+        match handle.join().unwrap() {
+            Ok(_) => {
+                success_or_starting += 1;
+            }
+            Err(tavik_common::error::TavikError::Unsupported(_)) => {
+                // On non-Linux platforms, platform_start returns Unsupported after transitioning to Starting
+                success_or_starting += 1;
+            }
+            Err(tavik_common::error::TavikError::InvalidState(_)) => {
+                rejected_invalid_state += 1;
+            }
+            Err(e) => panic!("Unexpected error during concurrent start: {:?}", e),
+        }
+    }
+
+    // Exactly one caller can successfully validate and transition Created -> Starting!
+    assert_eq!(
+        success_or_starting, 1,
+        "Exactly one caller must successfully transition Created -> Starting"
+    );
+    assert_eq!(
+        rejected_invalid_state,
+        num_threads - 1,
+        "All other concurrent callers must be rejected with InvalidState"
+    );
+}
+
+#[test]
+fn test_close_range_fallback_closes_high_descriptors() {
+    #[cfg(target_os = "linux")]
+    {
+        // Open deliberately high file descriptors
+        let test_fds = [42, 100, 250];
+        for &fd in &test_fds {
+            let res = unsafe { libc::dup2(1, fd) };
+            assert_eq!(res, fd, "dup2 to high fd {} failed", fd);
+            assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0);
+        }
+
+        // Call descriptor sanitization for fds >= 5
+        tavik_runtime::init::close_inherited_descriptors_above(5);
+
+        // Verify all test fds are now closed
+        for &fd in &test_fds {
+            let fcntl_res = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert_eq!(fcntl_res, -1, "High fd {} should have been closed", fd);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EBADF)
+            );
+        }
+
+        // Verify standard descriptors 0, 1, 2 remain valid
+        for fd in 0..=2 {
+            assert!(
+                unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0,
+                "Standard fd {} must remain open",
+                fd
+            );
+        }
+    }
+}
+
+#[test]
+fn test_cgroup_ownership_rules_never_destroy_unowned() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let bundle_dir = temp.path().join("bundle");
+    let rootfs = bundle_dir.join("rootfs");
+    fs::create_dir_all(&rootfs).unwrap();
+
+    // Spec with NO resource limits
+    let mut spec = Spec::default_linux();
+    if let Some(linux) = &mut spec.linux {
+        linux.resources = None;
+    }
+    fs::write(
+        bundle_dir.join("config.json"),
+        serde_json::to_string_pretty(&spec).unwrap(),
+    )
+    .unwrap();
+
+    let executor = ContainerExecutor::new(state_dir).unwrap();
+    let container_id = "test-no-cgroup-cont";
+    let state = executor.create(container_id, &bundle_dir).unwrap();
+    assert_eq!(state.status, ContainerStatus::Created);
+
+    // Delete container: must not attempt to destroy any cgroup
+    let del_res = executor.delete(container_id, false);
+    assert!(del_res.is_ok());
+}

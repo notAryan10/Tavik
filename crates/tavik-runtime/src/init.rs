@@ -37,7 +37,12 @@ impl CgroupGuard {
 impl Drop for CgroupGuard {
     fn drop(&mut self) {
         if self.active {
-            let _ = self.mgr.destroy_container_cgroup(&self.container_id);
+            if let Err(e) = self.mgr.destroy_container_cgroup(&self.container_id) {
+                eprintln!(
+                    "CgroupGuard cleanup failed for container '{}': {}",
+                    self.container_id, e
+                );
+            }
         }
     }
 }
@@ -46,6 +51,216 @@ impl Drop for CgroupGuard {
 pub const START_FIFO_FD: i32 = 3;
 #[cfg(target_os = "linux")]
 pub const EXEC_STATUS_FD: i32 = 4;
+
+#[cfg(target_os = "linux")]
+pub fn close_inherited_descriptors_above(min_fd: i32) {
+    // 1. Try kernel close_range syscall
+    if unsafe { libc::close_range(min_fd as libc::c_uint, !0u32, 0) } == 0 {
+        return;
+    }
+
+    // 2. Fallback: inspect /proc/self/fd via getdents64
+    let proc_fd_path = std::ffi::CString::new("/proc/self/fd").unwrap();
+    let dir_fd = unsafe {
+        libc::open(
+            proc_fd_path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if dir_fd >= 0 {
+        let mut buf = [0u8; 2048];
+        loop {
+            let n = unsafe {
+                libc::syscall(
+                    libc::SYS_getdents64,
+                    dir_fd,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                )
+            };
+            if n <= 0 {
+                break;
+            }
+            let mut pos = 0;
+            while pos < n as usize {
+                let d = unsafe { &*(buf.as_ptr().add(pos) as *const libc::dirent64) };
+                let name_bytes = unsafe { std::ffi::CStr::from_ptr(d.d_name.as_ptr()).to_bytes() };
+                if let Ok(name_str) = std::str::from_utf8(name_bytes) {
+                    if let Ok(fd_num) = name_str.parse::<i32>() {
+                        if fd_num >= min_fd && fd_num != dir_fd {
+                            unsafe { libc::close(fd_num) };
+                        }
+                    }
+                }
+                pos += d.d_reclen as usize;
+            }
+        }
+        unsafe { libc::close(dir_fd) };
+        return;
+    }
+
+    // 3. Fallback to RLIMIT_NOFILE
+    let mut rlim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let max_fd = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) } == 0 {
+        rlim.rlim_cur.min(65536) as i32
+    } else {
+        4096
+    };
+    for fd in min_fd..max_fd {
+        unsafe { libc::close(fd) };
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn create_control_listener(sock_path: &Path) -> Result<i32> {
+    use std::os::unix::ffi::OsStrExt;
+
+    if sock_path.exists() {
+        let _ = fs::remove_file(sock_path);
+    }
+
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(TavikError::Io(format!(
+            "Failed to create control socket: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = sock_path.as_os_str().as_bytes();
+    if bytes.len() >= addr.sun_path.len() {
+        unsafe { libc::close(fd) };
+        return Err(TavikError::Config(format!(
+            "Control socket path {:?} exceeds max sockaddr_un length ({})",
+            sock_path,
+            addr.sun_path.len()
+        )));
+    }
+    for (i, &b) in bytes.iter().enumerate() {
+        addr.sun_path[i] = b as libc::c_char;
+    }
+
+    let len = (std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1) as libc::socklen_t;
+    if unsafe { libc::bind(fd, &addr as *const _ as *const libc::sockaddr, len) } != 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(TavikError::Io(format!(
+            "Failed to bind control socket at {:?}: {}",
+            sock_path, err
+        )));
+    }
+
+    if unsafe { libc::listen(fd, 8) } != 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(TavikError::Io(format!(
+            "Failed to listen on control socket: {}",
+            err
+        )));
+    }
+
+    Ok(fd)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn send_control_command(sock_path: &Path, cmd: &str) -> Result<String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(TavikError::Io(format!(
+            "Failed to create socket: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = sock_path.as_os_str().as_bytes();
+    if bytes.len() >= addr.sun_path.len() {
+        unsafe { libc::close(fd) };
+        return Err(TavikError::Config(format!(
+            "Control socket path {:?} exceeds max sockaddr_un length",
+            sock_path
+        )));
+    }
+    for (i, &b) in bytes.iter().enumerate() {
+        addr.sun_path[i] = b as libc::c_char;
+    }
+
+    let len = (std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1) as libc::socklen_t;
+    if unsafe { libc::connect(fd, &addr as *const _ as *const libc::sockaddr, len) } != 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(TavikError::Io(format!(
+            "Failed to connect to control socket at {:?}: {}",
+            sock_path, err
+        )));
+    }
+
+    let msg = format!("{}\n", cmd);
+    let mut written = 0;
+    while written < msg.len() {
+        let n = unsafe {
+            libc::write(
+                fd,
+                msg.as_ptr().add(written) as *const libc::c_void,
+                msg.len() - written,
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            unsafe { libc::close(fd) };
+            return Err(TavikError::Io(format!(
+                "Failed to write to control socket: {}",
+                err
+            )));
+        }
+        written += n as usize;
+    }
+
+    let mut resp = Vec::new();
+    let mut buf = [0u8; 128];
+    loop {
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            unsafe { libc::close(fd) };
+            return Err(TavikError::Io(format!(
+                "Failed to read from control socket: {}",
+                err
+            )));
+        }
+        if n == 0 {
+            break;
+        }
+        resp.extend_from_slice(&buf[..n as usize]);
+        if resp.contains(&b'\n') {
+            break;
+        }
+    }
+    unsafe { libc::close(fd) };
+
+    let s = String::from_utf8_lossy(&resp).trim().to_string();
+    if s.starts_with("ERR") {
+        return Err(TavikError::Execution(format!(
+            "Supervisor control error: {}",
+            s
+        )));
+    }
+    Ok(s)
+}
 
 #[cfg(target_os = "linux")]
 fn write_ready_error_and_exit(ready_fd: i32, msg: &str) -> ! {
@@ -116,22 +331,41 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
         )));
     }
 
-    // 3. Prepare handshake pipe between trampoline caller and supervisor
+    // 3. Prepare control socket for supervisor signaling and lifecycle management
+    let control_sock_path = container_dir.join("control.sock");
+    let control_listener_fd = match create_control_listener(&control_sock_path) {
+        Ok(fd) => fd,
+        Err(e) => {
+            let _ = fs::remove_file(&start_fifo_path);
+            let _ = fs::remove_file(&exec_fifo_path);
+            return Err(e);
+        }
+    };
+
+    // 4. Prepare handshake pipe between trampoline caller and supervisor
     let mut trampoline_pipe = [0i32; 2];
     if unsafe { libc::pipe(trampoline_pipe.as_mut_ptr()) } != 0 {
         let _ = fs::remove_file(&start_fifo_path);
         let _ = fs::remove_file(&exec_fifo_path);
+        let _ = fs::remove_file(&control_sock_path);
+        unsafe { libc::close(control_listener_fd) };
         return Err(TavikError::Io(format!(
             "Failed to create trampoline handshake pipe: {}",
             std::io::Error::last_os_error()
         )));
     }
 
-    // 4. Fork dedicated background supervisor process
+    // 5. Fork dedicated background supervisor process
     let supervisor_pid = unsafe { libc::fork() };
     if supervisor_pid < 0 {
         let _ = fs::remove_file(&start_fifo_path);
         let _ = fs::remove_file(&exec_fifo_path);
+        let _ = fs::remove_file(&control_sock_path);
+        unsafe {
+            libc::close(control_listener_fd);
+            libc::close(trampoline_pipe[0]);
+            libc::close(trampoline_pipe[1]);
+        };
         return Err(TavikError::Io(format!(
             "Failed to fork supervisor process: {}",
             std::io::Error::last_os_error()
@@ -140,7 +374,10 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
 
     if supervisor_pid > 0 {
         // --- TRAMPOLINE CALLER PROCESS ---
-        unsafe { libc::close(trampoline_pipe[1]) };
+        unsafe {
+            libc::close(control_listener_fd);
+            libc::close(trampoline_pipe[1]);
+        };
 
         let mut buf = [0u8; 256];
         let n = unsafe {
@@ -171,7 +408,7 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
         libc::setsid();
     }
 
-    // 5. Initialize cgroups v2 resource limits with fail-closed RAII cleanup guard
+    // 6. Initialize cgroups v2 resource limits with fail-closed RAII cleanup guard
     let cgroup_guard = if let Some(linux) = &spec.linux {
         if linux.resources.is_some() {
             let mgr = match tavik_cgroups::CgroupManager::new() {
@@ -180,18 +417,30 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
                     let msg = format!("Failed to initialize cgroups v2 manager: {}", e);
                     let _ =
                         unsafe { libc::write(trampoline_pipe[1], msg.as_ptr() as _, msg.len()) };
-                    unsafe { libc::_exit(1) };
+                    unsafe {
+                        libc::close(control_listener_fd);
+                        let _ = fs::remove_file(&control_sock_path);
+                        libc::_exit(1);
+                    };
                 }
             };
             if let Err(e) = mgr.validate_cgroup_v2() {
                 let msg = format!("Requested resources require cgroup v2: {}", e);
                 let _ = unsafe { libc::write(trampoline_pipe[1], msg.as_ptr() as _, msg.len()) };
-                unsafe { libc::_exit(1) };
+                unsafe {
+                    libc::close(control_listener_fd);
+                    let _ = fs::remove_file(&control_sock_path);
+                    libc::_exit(1);
+                };
             }
             if let Err(e) = mgr.create_container_cgroup(id) {
                 let msg = format!("Failed to create cgroup for container '{}': {}", id, e);
                 let _ = unsafe { libc::write(trampoline_pipe[1], msg.as_ptr() as _, msg.len()) };
-                unsafe { libc::_exit(1) };
+                unsafe {
+                    libc::close(control_listener_fd);
+                    let _ = fs::remove_file(&control_sock_path);
+                    libc::_exit(1);
+                };
             }
             let guard = CgroupGuard::new(mgr, id.to_string());
             if let Some(resources) = &linux.resources {
@@ -200,7 +449,11 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
                     let _ =
                         unsafe { libc::write(trampoline_pipe[1], msg.as_ptr() as _, msg.len()) };
                     drop(guard);
-                    unsafe { libc::_exit(1) };
+                    unsafe {
+                        libc::close(control_listener_fd);
+                        let _ = fs::remove_file(&control_sock_path);
+                        libc::_exit(1);
+                    };
                 }
             }
             Some(guard)
@@ -211,7 +464,7 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
         None
     };
 
-    // 6. Unshare PID namespace
+    // 7. Unshare PID namespace
     // Calling unshare(CLONE_NEWPID) puts the NEXT child into the new PID namespace!
     if unsafe { libc::unshare(libc::CLONE_NEWPID) } != 0 {
         let msg = format!(
@@ -220,10 +473,14 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
         );
         let _ = unsafe { libc::write(trampoline_pipe[1], msg.as_ptr() as _, msg.len()) };
         drop(cgroup_guard);
-        unsafe { libc::_exit(1) };
+        unsafe {
+            libc::close(control_listener_fd);
+            let _ = fs::remove_file(&control_sock_path);
+            libc::_exit(1);
+        };
     }
 
-    // 7. Prepare ready pipe for synchronous handshake between child init and supervisor
+    // 8. Prepare ready pipe for synchronous handshake between child init and supervisor
     let mut ready_pipe = [0i32; 2];
     if unsafe { libc::pipe(ready_pipe.as_mut_ptr()) } != 0 {
         let msg = format!(
@@ -232,10 +489,14 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
         );
         let _ = unsafe { libc::write(trampoline_pipe[1], msg.as_ptr() as _, msg.len()) };
         drop(cgroup_guard);
-        unsafe { libc::_exit(1) };
+        unsafe {
+            libc::close(control_listener_fd);
+            let _ = fs::remove_file(&control_sock_path);
+            libc::_exit(1);
+        };
     }
 
-    // 8. Fork container init process (this child is PID 1 in the new PID namespace!)
+    // 9. Fork container init process (this child is PID 1 in the new PID namespace!)
     let child_pid = unsafe { libc::fork() };
     if child_pid < 0 {
         let msg = format!(
@@ -244,12 +505,17 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
         );
         let _ = unsafe { libc::write(trampoline_pipe[1], msg.as_ptr() as _, msg.len()) };
         drop(cgroup_guard);
-        unsafe { libc::_exit(1) };
+        unsafe {
+            libc::close(control_listener_fd);
+            let _ = fs::remove_file(&control_sock_path);
+            libc::_exit(1);
+        };
     }
 
     if child_pid == 0 {
         // --- CONTAINER INIT CHILD PROCESS (PID 1 in new PID namespace) ---
         unsafe {
+            libc::close(control_listener_fd);
             libc::close(trampoline_pipe[1]);
             libc::close(ready_pipe[0]);
         }
@@ -268,13 +534,36 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
         libc::close(ready_pipe[1]);
     }
 
-    // 9. Enroll child PID into cgroups v2 container group (FAIL-CLOSED)
+    // Acquire pidfd immediately while supervisor is guaranteed to own the child
+    let child_pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child_pid, 0) as i32 };
+    if child_pidfd < 0 {
+        let msg = format!(
+            "Failed to acquire pidfd for child PID {}: {}",
+            child_pid,
+            std::io::Error::last_os_error()
+        );
+        unsafe {
+            libc::kill(child_pid, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(child_pid, &mut status, 0);
+            libc::close(control_listener_fd);
+            let _ = fs::remove_file(&control_sock_path);
+            let _ = libc::write(trampoline_pipe[1], msg.as_ptr() as _, msg.len());
+        }
+        drop(cgroup_guard);
+        unsafe { libc::_exit(1) };
+    }
+
+    // 10. Enroll child PID into cgroups v2 container group (FAIL-CLOSED)
     if let Some(guard) = &cgroup_guard {
         if let Err(e) = guard.manager().add_process(id, child_pid as u32) {
             unsafe {
                 libc::kill(child_pid, libc::SIGKILL);
                 let mut status = 0;
                 libc::waitpid(child_pid, &mut status, 0);
+                libc::close(child_pidfd);
+                libc::close(control_listener_fd);
+                let _ = fs::remove_file(&control_sock_path);
             }
             let msg = format!("Failed to enroll child PID {} in cgroup: {}", child_pid, e);
             let _ = unsafe { libc::write(trampoline_pipe[1], msg.as_ptr() as _, msg.len()) };
@@ -283,7 +572,7 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
         }
     }
 
-    // 10. Wait for child init process to signal readiness over pipe
+    // 11. Wait for child init process to signal readiness over pipe
     let mut buf = [0u8; 512];
     let n = unsafe {
         libc::read(
@@ -301,6 +590,9 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
             libc::kill(child_pid, libc::SIGKILL);
             let mut status = 0;
             libc::waitpid(child_pid, &mut status, 0);
+            libc::close(child_pidfd);
+            libc::close(control_listener_fd);
+            let _ = fs::remove_file(&control_sock_path);
         }
         let err_msg = if n > 0 {
             format!(
@@ -315,7 +607,7 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
         unsafe { libc::_exit(1) };
     }
 
-    // 11. Record host PID and persist state as Created (FAIL-CLOSED)
+    // 12. Record host PID and persist state as Created (FAIL-CLOSED)
     let pid_write_res = fs::write(&pid_file, child_pid.to_string());
     let state_write_res = (|| -> Result<()> {
         pid_write_res.map_err(|e| TavikError::Io(format!("Failed to write pid file: {}", e)))?;
@@ -336,6 +628,9 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
             libc::kill(child_pid, libc::SIGKILL);
             let mut status = 0;
             libc::waitpid(child_pid, &mut status, 0);
+            libc::close(child_pidfd);
+            libc::close(control_listener_fd);
+            let _ = fs::remove_file(&control_sock_path);
         }
         let msg = format!("Failed to persist Created container state: {}", e);
         let _ = unsafe { libc::write(trampoline_pipe[1], msg.as_ptr() as _, msg.len()) };
@@ -355,80 +650,289 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
     unsafe { libc::close(trampoline_pipe[1]) };
 
     // --- SUPERVISORY LOOP ---
-    // The supervisor remains active to reap the child and update state upon exit
-    let mut status = 0;
+    // The supervisor monitors control requests and waits for child termination via pidfd
+    let mut child_reaped = false;
+
     loop {
-        let res = unsafe { libc::waitpid(child_pid, &mut status, 0) };
-        if res < 0 {
+        let mut pfds = [
+            libc::pollfd {
+                fd: control_listener_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: child_pidfd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+
+        let poll_ret = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+        if poll_ret < 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            eprintln!(
-                "Supervisor waitpid on child PID {} failed: {}",
-                child_pid, err
-            );
+            eprintln!("Supervisor poll error on control and pidfd: {}", err);
             break;
         }
-        if res == child_pid {
+
+        // 1. Check for incoming control command
+        if (pfds[0].revents & libc::POLLIN) != 0 {
+            let client_fd = unsafe {
+                libc::accept4(
+                    control_listener_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    libc::SOCK_CLOEXEC,
+                )
+            };
+            if client_fd >= 0 {
+                let mut cmd_buf = [0u8; 128];
+                let n = unsafe {
+                    libc::read(
+                        client_fd,
+                        cmd_buf.as_mut_ptr() as *mut libc::c_void,
+                        cmd_buf.len() - 1,
+                    )
+                };
+                if n > 0 {
+                    let cmd_str = String::from_utf8_lossy(&cmd_buf[..n as usize])
+                        .trim()
+                        .to_string();
+                    if cmd_str.starts_with("KILL ") {
+                        let sig_str = cmd_str.trim_start_matches("KILL ").trim();
+                        if let Ok(sig) = sig_str.parse::<i32>() {
+                            let ret = unsafe {
+                                libc::syscall(
+                                    libc::SYS_pidfd_send_signal,
+                                    child_pidfd,
+                                    sig,
+                                    std::ptr::null::<libc::c_void>(),
+                                    0,
+                                )
+                            };
+                            if ret == 0
+                                || std::io::Error::last_os_error().raw_os_error()
+                                    == Some(libc::ESRCH)
+                            {
+                                let _ = unsafe { libc::write(client_fd, b"OK\n".as_ptr() as _, 3) };
+                            } else {
+                                let err_msg = format!("ERR {}\n", std::io::Error::last_os_error());
+                                let _ = unsafe {
+                                    libc::write(client_fd, err_msg.as_ptr() as _, err_msg.len())
+                                };
+                            }
+                        }
+                    } else if cmd_str.starts_with("STOP ") {
+                        let parts: Vec<&str> = cmd_str.split_whitespace().collect();
+                        let sig = parts
+                            .get(1)
+                            .and_then(|s| s.parse::<i32>().ok())
+                            .unwrap_or(libc::SIGTERM);
+                        let timeout_ms = parts
+                            .get(2)
+                            .and_then(|s| s.parse::<i32>().ok())
+                            .unwrap_or(10000);
+
+                        let _ = unsafe {
+                            libc::syscall(
+                                libc::SYS_pidfd_send_signal,
+                                child_pidfd,
+                                sig,
+                                std::ptr::null::<libc::c_void>(),
+                                0,
+                            )
+                        };
+
+                        let mut stop_pfd = libc::pollfd {
+                            fd: child_pidfd,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        };
+                        let start_time = std::time::Instant::now();
+                        let mut terminated = false;
+                        let timeout_dur = std::time::Duration::from_millis(timeout_ms as u64);
+
+                        while start_time.elapsed() < timeout_dur {
+                            let rem_ms = (timeout_dur
+                                .saturating_sub(start_time.elapsed())
+                                .as_millis() as i32)
+                                .max(1);
+                            let pret = unsafe { libc::poll(&mut stop_pfd, 1, rem_ms) };
+                            if pret < 0 {
+                                let err = std::io::Error::last_os_error();
+                                if err.raw_os_error() == Some(libc::EINTR) {
+                                    continue;
+                                }
+                                break;
+                            }
+                            if pret > 0 && (stop_pfd.revents & libc::POLLIN != 0) {
+                                terminated = true;
+                                break;
+                            }
+                        }
+
+                        if !terminated {
+                            let _ = unsafe {
+                                libc::syscall(
+                                    libc::SYS_pidfd_send_signal,
+                                    child_pidfd,
+                                    libc::SIGKILL,
+                                    std::ptr::null::<libc::c_void>(),
+                                    0,
+                                )
+                            };
+                            let mut kill_pfd = libc::pollfd {
+                                fd: child_pidfd,
+                                events: libc::POLLIN,
+                                revents: 0,
+                            };
+                            let _ = unsafe { libc::poll(&mut kill_pfd, 1, 2000) };
+                        }
+
+                        let mut status = 0;
+                        loop {
+                            let wres = unsafe { libc::waitpid(child_pid, &mut status, 0) };
+                            if wres < 0 {
+                                let werr = std::io::Error::last_os_error();
+                                if werr.raw_os_error() == Some(libc::EINTR) {
+                                    continue;
+                                }
+                                eprintln!("Supervisor waitpid after STOP failed: {}", werr);
+                                break;
+                            }
+                            if wres == child_pid {
+                                child_reaped = true;
+                                break;
+                            }
+                        }
+
+                        let _ = unsafe { libc::write(client_fd, b"OK\n".as_ptr() as _, 3) };
+                        unsafe { libc::close(client_fd) };
+                        break;
+                    } else if cmd_str == "CANCEL" {
+                        let _ = unsafe {
+                            libc::syscall(
+                                libc::SYS_pidfd_send_signal,
+                                child_pidfd,
+                                libc::SIGKILL,
+                                std::ptr::null::<libc::c_void>(),
+                                0,
+                            )
+                        };
+                        let mut cancel_pfd = libc::pollfd {
+                            fd: child_pidfd,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        };
+                        let _ = unsafe { libc::poll(&mut cancel_pfd, 1, 2000) };
+
+                        let mut status = 0;
+                        loop {
+                            let wres = unsafe { libc::waitpid(child_pid, &mut status, 0) };
+                            if wres < 0 {
+                                let werr = std::io::Error::last_os_error();
+                                if werr.raw_os_error() == Some(libc::EINTR) {
+                                    continue;
+                                }
+                                eprintln!("Supervisor waitpid after CANCEL failed: {}", werr);
+                                break;
+                            }
+                            if wres == child_pid {
+                                child_reaped = true;
+                                break;
+                            }
+                        }
+
+                        let _ = unsafe { libc::write(client_fd, b"OK\n".as_ptr() as _, 3) };
+                        unsafe { libc::close(client_fd) };
+                        break;
+                    }
+                }
+                unsafe { libc::close(client_fd) };
+            }
+        }
+
+        // 2. Check for child termination
+        if (pfds[1].revents & libc::POLLIN) != 0 {
+            let mut status = 0;
+            loop {
+                let res = unsafe { libc::waitpid(child_pid, &mut status, 0) };
+                if res < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    eprintln!(
+                        "CRITICAL: Supervisor failed to reap child PID {}: {}",
+                        child_pid, err
+                    );
+                    break;
+                }
+                if res == child_pid {
+                    child_reaped = true;
+                    break;
+                }
+            }
             break;
         }
     }
 
-    // Child exited: transition container state to Stopped with StateLock
-    let lock_path = container_dir.join("state.lock");
-    if let Ok(_lock) = crate::executor::StateLock::acquire(&lock_path) {
-        if let Ok(content) = fs::read_to_string(&state_file) {
-            if let Ok(mut st) = serde_json::from_str::<ContainerState>(&content) {
-                st.status = ContainerStatus::Stopped;
-                let tmp_file = container_dir.join("state.json.tmp");
-                if let Ok(json) = serde_json::to_string_pretty(&st) {
-                    if fs::write(&tmp_file, json).is_ok() {
-                        let _ = fs::rename(&tmp_file, &state_file);
+    unsafe {
+        libc::close(child_pidfd);
+        libc::close(control_listener_fd);
+    }
+
+    if child_reaped {
+        // Confirmed termination: transition container state to Stopped with StateLock
+        let lock_path = container_dir.join("state.lock");
+        if let Ok(_lock) = crate::executor::StateLock::acquire(&lock_path) {
+            if let Ok(content) = fs::read_to_string(&state_file) {
+                if let Ok(mut st) = serde_json::from_str::<ContainerState>(&content) {
+                    st.status = ContainerStatus::Stopped;
+                    let tmp_file = container_dir.join("state.json.tmp");
+                    if let Ok(json) = serde_json::to_string_pretty(&st) {
+                        if fs::write(&tmp_file, json).is_ok() {
+                            let _ = fs::rename(&tmp_file, &state_file);
+                        }
                     }
                 }
             }
         }
-    }
 
-    // Destroy container cgroup on exit ONLY if owned by this supervisor
-    if owns_cgroup {
-        match tavik_cgroups::CgroupManager::new() {
-            Ok(mgr) => {
-                if let Err(e) = mgr.destroy_container_cgroup(id) {
+        // Destroy container cgroup on exit ONLY if owned by this supervisor
+        if owns_cgroup {
+            match tavik_cgroups::CgroupManager::new() {
+                Ok(mgr) => {
+                    if let Err(e) = mgr.destroy_container_cgroup(id) {
+                        eprintln!(
+                            "Warning: failed to destroy cgroup for container '{}': {}",
+                            id, e
+                        );
+                    }
+                }
+                Err(e) => {
                     eprintln!(
-                        "Warning: failed to destroy cgroup for container '{}': {}",
+                        "Warning: failed to initialize cgroup manager for cleanup of '{}': {}",
                         id, e
                     );
                 }
             }
-            Err(e) => {
-                eprintln!(
-                    "Warning: failed to initialize cgroup manager for cleanup of '{}': {}",
-                    id, e
-                );
-            }
         }
-    }
 
-    if let Err(e) = fs::remove_file(&start_fifo_path) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            eprintln!(
-                "Warning: failed to remove start FIFO {:?}: {}",
-                start_fifo_path, e
-            );
-        }
-    }
-    if let Err(e) = fs::remove_file(&exec_fifo_path) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            eprintln!(
-                "Warning: failed to remove exec FIFO {:?}: {}",
-                exec_fifo_path, e
-            );
-        }
-    }
+        let _ = fs::remove_file(&start_fifo_path);
+        let _ = fs::remove_file(&exec_fifo_path);
+        let _ = fs::remove_file(&control_sock_path);
 
-    unsafe { libc::_exit(0) };
+        unsafe { libc::_exit(0) };
+    } else {
+        eprintln!(
+            "CRITICAL: Supervisor for container '{}' exiting without confirming child PID {} reaped; resources preserved for safety",
+            id, child_pid
+        );
+        unsafe { libc::_exit(1) };
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -734,13 +1238,7 @@ fn run_container_init_child(
 
     // --- CONTAINER START LIFECYCLE: Strict Security Enforcement ---
     // 9. File descriptor sanitization: close all fds >= 5 (preserving stdin 0, stdout 1, stderr 2, fd 3 closed, EXEC_STATUS_FD 4)
-    unsafe {
-        if libc::close_range(5, !0u32, 0) != 0 {
-            for fd in 5..256 {
-                libc::close(fd);
-            }
-        }
-    }
+    close_inherited_descriptors_above(5);
 
     // 10. Parse capability sets if configured
     let cap_sets = if let Some(caps) = &proc.capabilities {

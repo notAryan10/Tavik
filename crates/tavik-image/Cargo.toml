@@ -12,6 +12,7 @@ tavik-store.workspace = true
 tar.workspace = true
 flate2.workspace = true
 zstd.workspace = true
+libc.workspace = true
 
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "sync"] }

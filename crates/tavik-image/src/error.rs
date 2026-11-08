@@ -42,6 +42,9 @@ pub enum ImageError {
         actual: String,
     },
 
+    #[error("Invalid layer digest '{0}': digest must not be empty and must specify sha256 algorithm (sha256:<64-hex>)")]
+    InvalidDigest(String),
+
     #[error("Invalid UID {uid} or GID {gid}: value cannot be represented safely")]
     InvalidOwnership { uid: u64, gid: u64 },
 

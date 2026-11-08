@@ -259,9 +259,9 @@ impl SafeDir {
             };
 
             if next_raw < 0 {
-                let err = std::io::Error::last_os_error();
+                let open_err = std::io::Error::last_os_error();
 
-                // Explicitly check if the intermediate component is a symbolic link.
+                // Explicitly check if the intermediate component is a symbolic link or file with fstatat.
                 // On macOS and some Linux systems, openat with O_DIRECTORY may return ENOTDIR
                 // instead of ELOOP for a symlink. We must always fail with ELOOP on any intermediate symlink.
                 let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
@@ -273,20 +273,36 @@ impl SafeDir {
                         libc::AT_SYMLINK_NOFOLLOW,
                     )
                 };
-                if s_ret == 0 && (stat_buf.st_mode & libc::S_IFMT) == libc::S_IFLNK {
-                    return Err(ImageError::Io(std::io::Error::from_raw_os_error(
-                        libc::ELOOP,
-                    )));
-                }
 
-                let is_not_found = err.kind() == std::io::ErrorKind::NotFound || s_ret != 0;
-                let is_regular_file =
-                    s_ret == 0 && (stat_buf.st_mode & libc::S_IFMT) == libc::S_IFREG;
+                let (is_not_found, is_regular_file) = if s_ret == 0 {
+                    let is_symlink = (stat_buf.st_mode & libc::S_IFMT) == libc::S_IFLNK;
+                    if is_symlink {
+                        return Err(ImageError::Io(std::io::Error::from_raw_os_error(
+                            libc::ELOOP,
+                        )));
+                    }
+                    let is_reg = (stat_buf.st_mode & libc::S_IFMT) == libc::S_IFREG;
+                    (false, is_reg)
+                } else {
+                    let stat_err = std::io::Error::last_os_error();
+                    if stat_err.raw_os_error() == Some(libc::ENOENT) {
+                        (true, false)
+                    } else {
+                        // Distinguish missing entries from unexpected filesystem errors (EACCES, EIO, etc.)
+                        return Err(ImageError::Io(stat_err));
+                    }
+                };
 
                 if create_missing && (is_not_found || is_regular_file) {
                     if is_regular_file {
                         // Replacing an existing regular file from lower layer with a directory
-                        unsafe { libc::unlinkat(current_raw, c_comp.as_ptr(), 0) };
+                        let u_ret = unsafe { libc::unlinkat(current_raw, c_comp.as_ptr(), 0) };
+                        if u_ret != 0 {
+                            let u_err = std::io::Error::last_os_error();
+                            if u_err.raw_os_error() != Some(libc::ENOENT) {
+                                return Err(ImageError::Io(u_err));
+                            }
+                        }
                     }
 
                     let ret = unsafe { libc::mkdirat(current_raw, c_comp.as_ptr(), 0o755) };
@@ -307,9 +323,14 @@ impl SafeDir {
                                     | libc::O_CLOEXEC,
                             )
                         };
-                        if tmp_raw >= 0 {
-                            unsafe { libc::fchmod(tmp_raw, 0o755) };
-                            unsafe { libc::close(tmp_raw) };
+                        if tmp_raw < 0 {
+                            return Err(ImageError::Io(std::io::Error::last_os_error()));
+                        }
+                        let ret = unsafe { libc::fchmod(tmp_raw, 0o755) };
+                        let chmod_err = std::io::Error::last_os_error();
+                        unsafe { libc::close(tmp_raw) };
+                        if ret != 0 {
+                            return Err(ImageError::Io(chmod_err));
                         }
                     }
                     next_raw = unsafe {
@@ -323,7 +344,7 @@ impl SafeDir {
                         return Err(ImageError::Io(std::io::Error::last_os_error()));
                     }
                 } else {
-                    return Err(ImageError::Io(err));
+                    return Err(ImageError::Io(open_err));
                 }
             }
 

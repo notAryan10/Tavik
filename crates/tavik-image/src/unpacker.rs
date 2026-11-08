@@ -20,6 +20,109 @@ struct EntryMetadata {
     mtime_nsec: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlobStatSnapshot {
+    ino: libc::ino_t,
+    dev: libc::dev_t,
+    size: libc::off_t,
+    mtime: libc::time_t,
+    mtime_nsec: libc::c_long,
+    ctime: libc::time_t,
+    ctime_nsec: libc::c_long,
+}
+
+impl BlobStatSnapshot {
+    fn from_stat(s: &libc::stat) -> Self {
+        Self {
+            ino: s.st_ino,
+            dev: s.st_dev,
+            size: s.st_size,
+            mtime: s.st_mtime,
+            #[cfg(target_os = "macos")]
+            mtime_nsec: s.st_mtime_nsec,
+            #[cfg(target_os = "linux")]
+            mtime_nsec: s.st_mtime_nsec,
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            mtime_nsec: 0,
+            ctime: s.st_ctime,
+            #[cfg(target_os = "macos")]
+            ctime_nsec: s.st_ctime_nsec,
+            #[cfg(target_os = "linux")]
+            ctime_nsec: s.st_ctime_nsec,
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            ctime_nsec: 0,
+        }
+    }
+}
+
+fn validate_layer_digest(digest: &str) -> Result<&str, ImageError> {
+    if digest.trim().is_empty() {
+        return Err(ImageError::InvalidDigest(
+            "layer digest is empty".to_string(),
+        ));
+    }
+    let (algo, hex_str) = digest
+        .split_once(':')
+        .ok_or_else(|| ImageError::InvalidDigest(digest.to_string()))?;
+
+    if !algo.eq_ignore_ascii_case("sha256") {
+        return Err(ImageError::InvalidDigest(format!(
+            "unsupported digest algorithm '{algo}': only 'sha256' is supported"
+        )));
+    }
+
+    if hex_str.len() != 64 || !hex_str.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ImageError::InvalidDigest(format!(
+            "invalid sha256 hex length or characters: '{digest}'"
+        )));
+    }
+
+    Ok(hex_str)
+}
+
+fn compute_and_verify_blob_digest(
+    file: &std::fs::File,
+    expected_hex: &str,
+    expected_size: u64,
+    blob_path: &Path,
+) -> Result<String, ImageError> {
+    (&*file).seek(SeekFrom::Start(0)).map_err(ImageError::Io)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut reader = file;
+    let mut total_read = 0u64;
+    loop {
+        let n = reader.read(&mut buf).map_err(ImageError::Io)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total_read += n as u64;
+    }
+
+    if expected_size > 0 && total_read != expected_size {
+        return Err(ImageError::BlobSizeMismatch {
+            path: blob_path.to_path_buf(),
+            expected: expected_size,
+            actual: total_read,
+        });
+    }
+
+    let actual_hex = hex::encode(hasher.finalize());
+    let actual_digest = format!("sha256:{}", actual_hex);
+
+    if !actual_hex.eq_ignore_ascii_case(expected_hex) {
+        return Err(ImageError::BlobDigestMismatch {
+            path: blob_path.to_path_buf(),
+            expected: format!("sha256:{}", expected_hex),
+            actual: actual_digest,
+        });
+    }
+
+    (&*file).seek(SeekFrom::Start(0)).map_err(ImageError::Io)?;
+    Ok(actual_digest)
+}
+
 fn rename_no_replace(
     parent_fd: RawFd,
     staging_name: &CString,
@@ -75,21 +178,38 @@ fn rename_no_replace(
 }
 
 /// Layer unpacker that safely extracts layers and processes OCI whiteout markers.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ImageUnpacker {
     decompression_limit: Option<u64>,
+    #[doc(hidden)]
+    pub mid_pass_hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl std::fmt::Debug for ImageUnpacker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageUnpacker")
+            .field("decompression_limit", &self.decompression_limit)
+            .field("has_mid_pass_hook", &self.mid_pass_hook.is_some())
+            .finish()
+    }
 }
 
 impl ImageUnpacker {
     pub fn new() -> Self {
         Self {
             decompression_limit: None,
+            mid_pass_hook: None,
         }
     }
 
     pub fn with_decompression_limit(mut self, limit: u64) -> Self {
         self.decompression_limit = Some(limit);
         self
+    }
+
+    #[doc(hidden)]
+    pub fn set_mid_pass_hook<F: Fn() + Send + Sync + 'static>(&mut self, hook: F) {
+        self.mid_pass_hook = Some(std::sync::Arc::new(hook));
     }
 
     /// Unpacks a single layer archive into the target rootfs directory.
@@ -100,7 +220,10 @@ impl ImageUnpacker {
             rootfs.display()
         );
 
-        // 1. Open layer blob exactly once using O_RDONLY | O_CLOEXEC | O_NOFOLLOW
+        // 1. Mandatory SHA-256 digest format and algorithm validation
+        let expected_hex = validate_layer_digest(&layer.digest)?;
+
+        // 2. Open layer blob exactly once using O_RDONLY | O_CLOEXEC | O_NOFOLLOW
         let c_blob_path = CString::new(layer.blob_path.as_os_str().as_bytes()).map_err(|e| {
             ImageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
         })?;
@@ -116,7 +239,7 @@ impl ImageUnpacker {
         }
         let blob_file = unsafe { std::fs::File::from_raw_fd(raw_blob_fd) };
 
-        // 2. Verify with fstat that it is a regular file
+        // 3. Verify with fstat that it is a regular file
         let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
         let s_ret = unsafe { libc::fstat(blob_file.as_raw_fd(), &mut stat_buf) };
         if s_ret != 0 {
@@ -130,7 +253,7 @@ impl ImageUnpacker {
             )));
         }
 
-        // 3. Validate the expected compressed blob size
+        // 4. Validate the expected compressed blob size
         let actual_size = stat_buf.st_size as u64;
         if layer.size > 0 && actual_size != layer.size {
             return Err(ImageError::BlobSizeMismatch {
@@ -140,49 +263,11 @@ impl ImageUnpacker {
             });
         }
 
-        // 4. Verify Layer.digest against the actual compressed blob bytes (streaming in 64KB chunks)
-        if !layer.digest.is_empty() {
-            let mut hasher = Sha256::new();
-            let mut buf = [0u8; 64 * 1024];
-            let mut reader = &blob_file;
-            let mut total_read = 0u64;
-            loop {
-                let n = reader.read(&mut buf).map_err(ImageError::Io)?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-                total_read += n as u64;
-            }
+        // Take snapshot of high-resolution timestamps, ctime, size, and inode before Pass 1
+        let snap_before_pass1 = BlobStatSnapshot::from_stat(&stat_buf);
 
-            if layer.size > 0 && total_read != layer.size {
-                return Err(ImageError::BlobSizeMismatch {
-                    path: layer.blob_path.clone(),
-                    expected: layer.size,
-                    actual: total_read,
-                });
-            }
-
-            let actual_hex = hex::encode(hasher.finalize());
-            let actual_digest = format!("sha256:{}", actual_hex);
-
-            let expected_hex = layer
-                .digest
-                .strip_prefix("sha256:")
-                .unwrap_or(&layer.digest);
-            if !actual_hex.eq_ignore_ascii_case(expected_hex) {
-                return Err(ImageError::BlobDigestMismatch {
-                    path: layer.blob_path.clone(),
-                    expected: layer.digest.clone(),
-                    actual: actual_digest,
-                });
-            }
-        }
-
-        // Rewind to beginning of the blob
-        (&blob_file)
-            .seek(SeekFrom::Start(0))
-            .map_err(ImageError::Io)?;
+        // 5. Initial streaming SHA-256 digest verification before Pass 1
+        compute_and_verify_blob_digest(&blob_file, expected_hex, layer.size, &layer.blob_path)?;
 
         // =========================================================================
         // Pass 1: Validate entries, paths, symlink targets, and collect whiteouts
@@ -265,18 +350,36 @@ impl ImageUnpacker {
             .seek(SeekFrom::Start(0))
             .map_err(ImageError::Io)?;
 
-        // Ensure blob wasn't modified between passes
+        // If a mid-pass hook is registered (for testing concurrent mutation), invoke it now.
+        if let Some(ref hook) = self.mid_pass_hook {
+            hook();
+        }
+
+        // Ensure blob wasn't modified between passes (high-resolution timestamps, ctime, size, inode)
         let mut stat_buf2: libc::stat = unsafe { std::mem::zeroed() };
         let s_ret2 = unsafe { libc::fstat(blob_file.as_raw_fd(), &mut stat_buf2) };
         if s_ret2 != 0 {
             return Err(ImageError::Io(std::io::Error::last_os_error()));
         }
-        if stat_buf2.st_ino != stat_buf.st_ino
-            || stat_buf2.st_size != stat_buf.st_size
-            || stat_buf2.st_mtime != stat_buf.st_mtime
-        {
+        let snap_between_passes = BlobStatSnapshot::from_stat(&stat_buf2);
+        if snap_between_passes != snap_before_pass1 {
             return Err(ImageError::CorruptArchive(format!(
-                "Layer blob '{}' was modified between archive passes",
+                "Layer blob '{}' was modified between archive passes (high-resolution metadata changed)",
+                layer.blob_path.display()
+            )));
+        }
+
+        // Also check if the path on disk was replaced by opening it afresh
+        let mid_check_file = std::fs::File::open(&layer.blob_path).map_err(ImageError::Io)?;
+        let mut stat_buf_path: libc::stat = unsafe { std::mem::zeroed() };
+        let s_ret_path = unsafe { libc::fstat(mid_check_file.as_raw_fd(), &mut stat_buf_path) };
+        if s_ret_path != 0 {
+            return Err(ImageError::Io(std::io::Error::last_os_error()));
+        }
+        let snap_path = BlobStatSnapshot::from_stat(&stat_buf_path);
+        if snap_path != snap_before_pass1 {
+            return Err(ImageError::CorruptArchive(format!(
+                "Layer blob '{}' was replaced or modified on disk between archive passes",
                 layer.blob_path.display()
             )));
         }
@@ -454,6 +557,26 @@ impl ImageUnpacker {
             )?;
         }
 
+        // =========================================================================
+        // Post-Pass-2 Validation: Ensure blob was not modified during Pass 2
+        // =========================================================================
+        let post_file = std::fs::File::open(&layer.blob_path).map_err(ImageError::Io)?;
+        let mut stat_buf3: libc::stat = unsafe { std::mem::zeroed() };
+        let s_ret3 = unsafe { libc::fstat(post_file.as_raw_fd(), &mut stat_buf3) };
+        if s_ret3 != 0 {
+            return Err(ImageError::Io(std::io::Error::last_os_error()));
+        }
+        let snap_after_pass2 = BlobStatSnapshot::from_stat(&stat_buf3);
+        if snap_after_pass2 != snap_before_pass1 {
+            return Err(ImageError::CorruptArchive(format!(
+                "Layer blob '{}' was modified during Pass 2 (high-resolution metadata changed)",
+                layer.blob_path.display()
+            )));
+        }
+
+        // Re-verify SHA-256 digest after Pass 2
+        compute_and_verify_blob_digest(&post_file, expected_hex, layer.size, &layer.blob_path)?;
+
         Ok(())
     }
 }
@@ -553,7 +676,7 @@ impl RootfsBuilder {
             return Err(ImageError::Io(std::io::Error::last_os_error()));
         }
 
-        // Explicitly enforce 0700 permissions on staging directory via fchmod
+        // Explicitly enforce 0700 permissions on staging directory via fchmod (propagate errors)
         let staging_open = unsafe {
             libc::openat(
                 parent_fd.as_raw_fd(),
@@ -561,9 +684,14 @@ impl RootfsBuilder {
                 libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )
         };
-        if staging_open >= 0 {
-            unsafe { libc::fchmod(staging_open, 0o700) };
-            unsafe { libc::close(staging_open) };
+        if staging_open < 0 {
+            return Err(ImageError::Io(std::io::Error::last_os_error()));
+        }
+        let ret = unsafe { libc::fchmod(staging_open, 0o700) };
+        let chmod_err = std::io::Error::last_os_error();
+        unsafe { libc::close(staging_open) };
+        if ret != 0 {
+            return Err(ImageError::Io(chmod_err));
         }
 
         // Reliable RAII Cleanup Guard for staging directory
@@ -609,7 +737,7 @@ impl RootfsBuilder {
             self.unpacker.unpack_layer(layer, &staging_path)?;
         }
 
-        // Ensure root staging directory permissions are accessible (0755) before publication
+        // Ensure root staging directory permissions are accessible (0755) before publication (propagate errors)
         let staging_open = unsafe {
             libc::openat(
                 parent_fd.as_raw_fd(),
@@ -617,14 +745,24 @@ impl RootfsBuilder {
                 libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )
         };
-        if staging_open >= 0 {
-            let mut root_stat: libc::stat = unsafe { std::mem::zeroed() };
-            if unsafe { libc::fstat(staging_open, &mut root_stat) } == 0 {
-                // If staging root is still 0700, change to 0755 so container root is accessible
-                if (root_stat.st_mode & 0o777) == 0o700 {
-                    unsafe { libc::fchmod(staging_open, 0o755) };
-                }
+        if staging_open < 0 {
+            return Err(ImageError::Io(std::io::Error::last_os_error()));
+        }
+        let mut root_stat: libc::stat = unsafe { std::mem::zeroed() };
+        let s_ret = unsafe { libc::fstat(staging_open, &mut root_stat) };
+        if s_ret != 0 {
+            let stat_err = std::io::Error::last_os_error();
+            unsafe { libc::close(staging_open) };
+            return Err(ImageError::Io(stat_err));
+        }
+        if (root_stat.st_mode & 0o777) == 0o700 {
+            let ret = unsafe { libc::fchmod(staging_open, 0o755) };
+            let chmod_err = std::io::Error::last_os_error();
+            unsafe { libc::close(staging_open) };
+            if ret != 0 {
+                return Err(ImageError::Io(chmod_err));
             }
+        } else {
             unsafe { libc::close(staging_open) };
         }
 

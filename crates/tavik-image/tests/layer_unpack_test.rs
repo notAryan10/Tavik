@@ -843,15 +843,64 @@ fn test_blob_modification_replacement_between_passes() {
     tar_builder
         .append_data(&mut header, "test.txt", Cursor::new(data))
         .unwrap();
-    let tar_bytes = tar_builder.into_inner().unwrap();
 
+    let tar_bytes = tar_builder.into_inner().unwrap();
     let blob_path = temp.path().join("layer.tar");
     let layer = write_tar_layer(&tar_bytes, &blob_path, false);
 
-    // Verify that unpack_layer succeeds when unmodified
+    let mut unpacker = ImageUnpacker::new();
+    let blob_path_clone = blob_path.clone();
+    unpacker.set_mid_pass_hook(move || {
+        // Mutate blob file in place between pass 1 and pass 2
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&blob_path_clone)
+            .unwrap();
+        use std::io::Write;
+        f.write_all(b"corrupt_concurrent_mutation").unwrap();
+        f.flush().unwrap();
+    });
+
+    let res = unpacker.unpack_layer(&layer, &rootfs);
+
+    // Must fail because the blob was mutated between passes
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert!(matches!(
+        err,
+        ImageError::CorruptArchive(_) | ImageError::BlobDigestMismatch { .. }
+    ));
+}
+
+#[test]
+fn test_empty_or_unsupported_layer_digest_rejected() {
+    let temp = tempdir().unwrap();
+    let rootfs = temp.path().join("rootfs");
+    std::fs::create_dir_all(&rootfs).unwrap();
+
+    let blob_path = temp.path().join("layer.tar");
+    std::fs::write(&blob_path, b"dummy data").unwrap();
     let unpacker = ImageUnpacker::new();
-    unpacker.unpack_layer(&layer, &rootfs).unwrap();
-    assert_eq!(std::fs::read(rootfs.join("test.txt")).unwrap(), data);
+
+    // 1. Empty digest
+    let empty_layer = Layer::new("", &blob_path, 10);
+    let err = unpacker.unpack_layer(&empty_layer, &rootfs).unwrap_err();
+    assert!(matches!(err, ImageError::InvalidDigest(_)));
+
+    // 2. Whitespace-only digest
+    let ws_layer = Layer::new("   ", &blob_path, 10);
+    let err = unpacker.unpack_layer(&ws_layer, &rootfs).unwrap_err();
+    assert!(matches!(err, ImageError::InvalidDigest(_)));
+
+    // 3. Unsupported algorithm (e.g. sha512 or md5)
+    let md5_layer = Layer::new("md5:d41d8cd98f00b204e9800998ecf8427e", &blob_path, 10);
+    let err = unpacker.unpack_layer(&md5_layer, &rootfs).unwrap_err();
+    assert!(matches!(err, ImageError::InvalidDigest(_)));
+
+    // 4. Invalid hex length
+    let short_layer = Layer::new("sha256:1234abcd", &blob_path, 10);
+    let err = unpacker.unpack_layer(&short_layer, &rootfs).unwrap_err();
+    assert!(matches!(err, ImageError::InvalidDigest(_)));
 }
 
 #[test]

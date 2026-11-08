@@ -153,6 +153,14 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
     }
 
     if n <= 0 || &buf[..n as usize] != b"ready\n" {
+        unsafe {
+            libc::kill(child_pid, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(child_pid, &mut status, 0);
+        }
+        if let Some(cg) = &cgroup {
+            let _ = cg.destroy();
+        }
         return Err(TavikError::Execution(format!(
             "Container init child failed to signal readiness: {:?}",
             if n > 0 { &buf[..n as usize] } else { &[] }
@@ -326,23 +334,12 @@ fn run_container_init_child(
         let _ = libc::rmdir(old_root_unmount.as_ptr());
     }
 
-    // 7. Change working directory
     let proc = spec
         .process
         .as_ref()
         .ok_or_else(|| TavikError::Config("Spec missing process definition".to_string()))?;
 
-    let c_cwd = CString::new(proc.cwd.as_str())
-        .map_err(|e| TavikError::Config(format!("Invalid working directory path: {}", e)))?;
-    if unsafe { libc::chdir(c_cwd.as_ptr()) } != 0 {
-        return Err(TavikError::Execution(format!(
-            "Failed to change working directory to '{}': {}",
-            proc.cwd,
-            std::io::Error::last_os_error()
-        )));
-    }
-
-    // 8. Signal readiness to trampoline
+    // 7. Signal readiness to trampoline
     unsafe {
         libc::write(
             ready_pipe_write_fd,
@@ -352,7 +349,7 @@ fn run_container_init_child(
         libc::close(ready_pipe_write_fd);
     }
 
-    // 9. Block waiting for start signal on start FIFO
+    // 8. Block waiting for start signal on start FIFO
     let mut start_buf = [0u8; 1];
     let n = unsafe { libc::read(fifo_fd, start_buf.as_mut_ptr() as *mut libc::c_void, 1) };
     unsafe {
@@ -366,12 +363,12 @@ fn run_container_init_child(
     }
 
     // --- CONTAINER START LIFECYCLE: Strict Security Enforcement ---
-    // 10. File descriptor sanitization: close all fds >= 3
+    // 9. File descriptor sanitization: close all fds >= 3
     unsafe {
         libc::close_range(3, !0u32, 0);
     }
 
-    // 11. Parse capability sets if configured
+    // 10. Parse capability sets if configured
     let cap_sets = if let Some(caps) = &proc.capabilities {
         Some(caps.to_capability_sets().map_err(|e| {
             TavikError::Execution(format!("Failed to parse capability sets: {}", e))
@@ -380,7 +377,7 @@ fn run_container_init_child(
         None
     };
 
-    // 12. If capability bounding set is configured, drop unrequested capabilities
+    // 11. If capability bounding set is configured, drop unrequested capabilities
     // while still root (UID 0) prior to any privilege transition.
     // In Linux, PR_CAPBSET_DROP strictly requires CAP_SETPCAP.
     if let Some(sets) = &cap_sets {
@@ -391,7 +388,7 @@ fn run_container_init_child(
         }
     }
 
-    // 13. Privilege transition: supplementary groups, GID, UID (FAIL-CLOSED)
+    // 12. Privilege transition: supplementary groups, primary GID, primary UID (FAIL-CLOSED)
     if proc.user.uid > 0 {
         // Enable PR_SET_KEEPCAPS so permitted capabilities are preserved across setuid().
         let keepcaps_res = unsafe { libc::prctl(libc::PR_SET_KEEPCAPS, 1, 0, 0, 0) };
@@ -424,29 +421,26 @@ fn run_container_init_child(
         )));
     }
 
-    if proc.user.gid > 0 {
-        let setgid_res = unsafe { libc::setgid(proc.user.gid as libc::gid_t) };
-        if setgid_res != 0 {
-            return Err(TavikError::Execution(format!(
-                "Failed to setgid to {}: {}",
-                proc.user.gid,
-                std::io::Error::last_os_error()
-            )));
-        }
+    // Unconditionally establish primary GID and UID (never rely on inherited launcher credentials)
+    let setgid_res = unsafe { libc::setgid(proc.user.gid as libc::gid_t) };
+    if setgid_res != 0 {
+        return Err(TavikError::Execution(format!(
+            "Failed to setgid to {}: {}",
+            proc.user.gid,
+            std::io::Error::last_os_error()
+        )));
     }
 
-    if proc.user.uid > 0 {
-        let setuid_res = unsafe { libc::setuid(proc.user.uid as libc::uid_t) };
-        if setuid_res != 0 {
-            return Err(TavikError::Execution(format!(
-                "Failed to setuid to {}: {}",
-                proc.user.uid,
-                std::io::Error::last_os_error()
-            )));
-        }
+    let setuid_res = unsafe { libc::setuid(proc.user.uid as libc::uid_t) };
+    if setuid_res != 0 {
+        return Err(TavikError::Execution(format!(
+            "Failed to setuid to {}: {}",
+            proc.user.uid,
+            std::io::Error::last_os_error()
+        )));
     }
 
-    // 14. Apply thread capabilities (permitted, effective, inheritable, ambient)
+    // 13. Apply thread capabilities (permitted, effective, inheritable, ambient)
     // Using apply_thread_capabilities ensures PR_CAPBSET_DROP is not attempted post-setuid.
     if let Some(sets) = &cap_sets {
         tavik_security::apply_thread_capabilities(sets).map_err(|e| {
@@ -461,11 +455,22 @@ fn run_container_init_child(
         }
     }
 
-    // 15. Security: PR_SET_NO_NEW_PRIVS barrier
+    // 14. Security: PR_SET_NO_NEW_PRIVS barrier
     if proc.no_new_privileges {
         tavik_security::ensure_no_new_privs().map_err(|e| {
             TavikError::Execution(format!("Failed to set PR_SET_NO_NEW_PRIVS: {}", e))
         })?;
+    }
+
+    // 15. Apply working directory under container credentials
+    let c_cwd = CString::new(proc.cwd.as_str())
+        .map_err(|e| TavikError::Config(format!("Invalid working directory path: {}", e)))?;
+    if unsafe { libc::chdir(c_cwd.as_ptr()) } != 0 {
+        return Err(TavikError::Execution(format!(
+            "Failed to change working directory to '{}': {}",
+            proc.cwd,
+            std::io::Error::last_os_error()
+        )));
     }
 
     // 16. Resolve executable command inside pivoted rootfs using container credentials BEFORE seccomp

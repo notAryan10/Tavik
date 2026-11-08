@@ -102,7 +102,14 @@ impl ContainerExecutor {
         self.save_state(&initial_state)?;
 
         // Platform-specific container init creation
-        let final_state = self.platform_create(id, &spec, &canonical_bundle, initial_state)?;
+        let final_state = match self.platform_create(id, &spec, &canonical_bundle, initial_state) {
+            Ok(s) => s,
+            Err(e) => {
+                // Clean up failed container state directory so no stale Creating state is left behind
+                let _ = fs::remove_dir_all(&container_dir);
+                return Err(e);
+            }
+        };
         self.save_state(&final_state)?;
 
         Ok(final_state)
@@ -121,6 +128,29 @@ impl ContainerExecutor {
 
         info!("Starting OCI container '{}'", id);
         self.platform_start(id, &state)?;
+
+        // Verify container init child did not immediately exit with failure
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(pid) = state.pid {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let mut status = 0;
+                let wait_res = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
+                if wait_res == pid as i32 {
+                    state.status = ContainerStatus::Stopped;
+                    let _ = self.save_state(&state);
+                    let exit_code = if libc::WIFEXITED(status) {
+                        libc::WEXITSTATUS(status)
+                    } else {
+                        -1
+                    };
+                    return Err(TavikError::Execution(format!(
+                        "Container '{}' process (PID {}) terminated immediately on start with exit code {}",
+                        id, pid, exit_code
+                    )));
+                }
+            }
+        }
 
         state.status = ContainerStatus::Running;
         self.save_state(&state)?;

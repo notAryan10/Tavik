@@ -55,6 +55,9 @@ pub enum ImageServiceError {
     #[error("Invalid signal '{0}': {1}")]
     InvalidSignal(String, String),
 
+    #[error("Unsupported operation or platform: {0}")]
+    Unsupported(String),
+
     #[error("Store error: {0}")]
     Store(#[from] StoreError),
 
@@ -258,76 +261,13 @@ impl ImageService {
         Ok(())
     }
 
-    /// Resolves executable command inside the container rootfs safely along the container's PATH.
-    /// Never touches host process PATH or host executables.
+    /// Returns the command name without inspecting the host filesystem.
+    /// Real executable path lookup is strictly performed by the runtime init after pivot_root.
     pub fn resolve_executable_path(
-        rootfs_path: &Path,
+        _rootfs_path: &Path,
         command: &str,
-        env: &[String],
+        _env: &[String],
     ) -> Result<String, ImageServiceError> {
-        if command.contains('/') {
-            // Explicit relative or absolute path within rootfs
-            return Ok(command.to_string());
-        }
-
-        let path_var = env
-            .iter()
-            .find_map(|e| e.strip_prefix("PATH="))
-            .unwrap_or("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
-
-        for dir in path_var.split(':') {
-            if dir.is_empty() {
-                continue;
-            }
-            let rel_dir = dir.trim_start_matches('/');
-            let candidate_path = rootfs_path.join(rel_dir).join(command);
-
-            // Follow symlink safely within rootfs if candidate is a symlink
-            let target_path = if candidate_path.is_symlink() {
-                match fs::read_link(&candidate_path) {
-                    Ok(link_target) => {
-                        if link_target.is_absolute() {
-                            rootfs_path.join(link_target.strip_prefix("/").unwrap_or(&link_target))
-                        } else {
-                            candidate_path
-                                .parent()
-                                .unwrap_or(rootfs_path)
-                                .join(link_target)
-                        }
-                    }
-                    Err(_) => continue,
-                }
-            } else {
-                candidate_path.clone()
-            };
-
-            // Inspect metadata
-            match fs::metadata(&target_path) {
-                Ok(meta) => {
-                    // Reject directories
-                    if meta.is_dir() {
-                        continue;
-                    }
-                    // Reject non-executable files
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        if meta.permissions().mode() & 0o111 == 0 {
-                            continue;
-                        }
-                    }
-                    let resolved = format!("{}/{}", dir.trim_end_matches('/'), command);
-                    debug!(
-                        "Resolved container executable '{}' along container PATH to '{}'",
-                        command, resolved
-                    );
-                    return Ok(resolved);
-                }
-                Err(_) => continue,
-            }
-        }
-
-        // Return original command name so runtime init can perform in-container evaluation
         Ok(command.to_string())
     }
 
@@ -338,7 +278,7 @@ impl ImageService {
         effective: &EffectiveImageConfig,
         user: &ResolvedUser,
         volumes: &[ImageVolume],
-        rootfs_path: &Path,
+        _rootfs_path: &Path,
     ) -> Result<Spec, ImageServiceError> {
         let mut spec = Spec::default_linux();
 
@@ -348,12 +288,9 @@ impl ImageService {
             ));
         }
 
-        // Resolve executable path safely within rootfs
-        let resolved_exec =
-            Self::resolve_executable_path(rootfs_path, &effective.args[0], &effective.env)?;
-
-        let mut final_args = effective.args.clone();
-        final_args[0] = resolved_exec;
+        // Preserve process arguments exactly; executable lookup is strictly performed
+        // inside the runtime after pivot_root with container credentials to prevent host filesystem probing.
+        let final_args = effective.args.clone();
 
         let process = Process {
             terminal: false,
@@ -507,7 +444,13 @@ impl ImageService {
             .create_bundle(reference, bundle_dir, overrides, true)
             .await?;
         let _state = executor.create(container_id, &bundle_info.bundle_dir)?;
-        let running_state = executor.start(container_id)?;
+        let running_state = match executor.start(container_id) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = executor.delete(container_id, true);
+                return Err(ImageServiceError::Runtime(e));
+            }
+        };
         Ok(running_state)
     }
 
@@ -591,20 +534,56 @@ fn atomic_rename_noreplace(src: &Path, dst: &Path) -> Result<(), ImageServiceErr
                 dst.to_path_buf(),
             ));
         }
-        if err.raw_os_error() == Some(libc::ENOSYS) || err.raw_os_error() == Some(libc::EINVAL) {
-            return fs::rename(src, dst).map_err(ImageServiceError::Io);
-        }
-        return Err(ImageServiceError::Io(err));
+
+        // Fail closed! Never fall back to ordinary fs::rename
+        return Err(ImageServiceError::Unsupported(format!(
+            "Atomic no-replace rename failed or is unsupported on this filesystem: {}",
+            err
+        )));
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
-        if dst.exists() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let c_src = CString::new(src.as_os_str().as_bytes())
+            .map_err(|e| ImageServiceError::Config(format!("Invalid path for rename: {}", e)))?;
+        let c_dst = CString::new(dst.as_os_str().as_bytes())
+            .map_err(|e| ImageServiceError::Config(format!("Invalid path for rename: {}", e)))?;
+
+        extern "C" {
+            fn renamex_np(
+                from: *const libc::c_char,
+                to: *const libc::c_char,
+                flags: libc::c_uint,
+            ) -> libc::c_int;
+        }
+        const RENAME_EXCL: libc::c_uint = 0x00000004;
+
+        let ret = unsafe { renamex_np(c_src.as_ptr(), c_dst.as_ptr(), RENAME_EXCL) };
+        if ret == 0 {
+            return Ok(());
+        }
+
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EEXIST) {
             return Err(ImageServiceError::DestinationAlreadyExists(
                 dst.to_path_buf(),
             ));
         }
-        fs::rename(src, dst).map_err(ImageServiceError::Io)
+
+        Err(ImageServiceError::Unsupported(format!(
+            "Atomic exclusive rename failed or is unsupported on this filesystem: {}",
+            err
+        )))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(ImageServiceError::Unsupported(
+            "Atomic exclusive rename is not supported on this platform".to_string(),
+        ))
     }
 }
 
@@ -625,6 +604,12 @@ pub fn parse_signal(sig: &str) -> Result<i32, ImageServiceError> {
                 format!("Signal number must be positive (1..=64), got {num}"),
             ));
         }
+        if num == 18 || num == 19 {
+            return Err(ImageServiceError::InvalidSignal(
+                sig.to_string(),
+                "Process-control signals (STOP=19, CONT=18) cannot be used as container stop signals".to_string(),
+            ));
+        }
         if num > 64 {
             return Err(ImageServiceError::InvalidSignal(
                 sig.to_string(),
@@ -637,6 +622,14 @@ pub fn parse_signal(sig: &str) -> Result<i32, ImageServiceError> {
     // Symbolic signal
     let normalized = trimmed.to_ascii_uppercase();
     let name = normalized.strip_prefix("SIG").unwrap_or(&normalized);
+
+    if name == "STOP" || name == "CONT" {
+        return Err(ImageServiceError::InvalidSignal(
+            sig.to_string(),
+            "Process-control signals (SIGSTOP, SIGCONT) cannot be used as container stop signals"
+                .to_string(),
+        ));
+    }
 
     let signum = match name {
         "HUP" => 1,
@@ -656,8 +649,6 @@ pub fn parse_signal(sig: &str) -> Result<i32, ImageServiceError> {
         "TERM" => 15,
         "STKFLT" => 16,
         "CHLD" => 17,
-        "CONT" => 18,
-        "STOP" => 19,
         "TSTP" => 20,
         "TTIN" => 21,
         "TTOU" => 22,

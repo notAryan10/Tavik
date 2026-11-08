@@ -963,7 +963,7 @@ fn test_working_directory_validation_runtime() {
         let _ = executor.kill(container_id, 9);
         let _ = executor.delete(container_id, true);
 
-        // 2. Invalid working directory must fail during creation/init
+        // 2. Invalid working directory must fail during start when child applies cwd
         let bundle_bad = temp.path().join("bundle_bad");
         let rootfs_bad = bundle_bad.join("rootfs");
         fs::create_dir_all(rootfs_bad.join("bin")).unwrap();
@@ -980,7 +980,208 @@ fn test_working_directory_validation_runtime() {
         )
         .unwrap();
 
-        let err = executor.create("test-bad-cwd", &bundle_bad).unwrap_err();
+        let _ = executor.create("test-bad-cwd", &bundle_bad).unwrap();
+        let err = executor.start("test-bad-cwd").unwrap_err();
         assert!(matches!(err, tavik_common::error::TavikError::Execution(_)));
+        let _ = executor.delete("test-bad-cwd", true);
+    }
+}
+
+#[test]
+fn test_working_directory_inaccessible_to_container_user() {
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping rootful test (requires root)");
+            return;
+        }
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let bundle_dir = temp.path().join("bundle");
+        let rootfs = bundle_dir.join("rootfs");
+        let bin_dir = rootfs.join("bin");
+        let dev_dir = rootfs.join("dev");
+        let root_only_dir = rootfs.join("root_only");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&dev_dir).unwrap();
+        fs::create_dir_all(&root_only_dir).unwrap();
+        let _ = fs::File::create(dev_dir.join("null"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(dev_dir.join("null"), fs::Permissions::from_mode(0o666));
+            // root_only directory is mode 0700 (accessible ONLY to UID 0)
+            let _ = fs::set_permissions(&root_only_dir, fs::Permissions::from_mode(0o700));
+        }
+
+        let busybox_path = if Path::new("/usr/bin/busybox").exists() {
+            "/usr/bin/busybox"
+        } else {
+            "/bin/busybox"
+        };
+        fs::copy(busybox_path, bin_dir.join("busybox")).unwrap();
+
+        let mut spec = Spec::default_linux();
+        if let Some(proc) = &mut spec.process {
+            proc.cwd = "/root_only".to_string();
+            proc.user = tavik_runtime::spec::User {
+                uid: 1000,
+                gid: 1000,
+                additional_gids: vec![],
+            };
+            proc.args = vec!["/bin/busybox".to_string(), "true".to_string()];
+        }
+
+        let config_path = bundle_dir.join("config.json");
+        fs::write(&config_path, serde_json::to_string_pretty(&spec).unwrap()).unwrap();
+
+        let executor = ContainerExecutor::new(state_dir).unwrap();
+        let container_id = "test-inaccessible-cwd";
+
+        let _ = executor.create(container_id, &bundle_dir).unwrap();
+        // Container start must fail because user UID 1000 cannot chdir into mode 0700 dir
+        let start_res = executor.start(container_id);
+        assert!(start_res.is_err());
+        let _ = executor.delete(container_id, true);
+    }
+}
+
+#[test]
+fn test_container_creation_retry_with_same_id_after_failure() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let bundle_invalid = temp.path().join("bundle_invalid");
+    fs::create_dir_all(&bundle_invalid).unwrap();
+    // Missing rootfs/config.json - creation will fail
+    fs::write(bundle_invalid.join("config.json"), "invalid json").unwrap();
+
+    let executor = ContainerExecutor::new(state_dir.clone()).unwrap();
+    let container_id = "test-retry-creation-id";
+
+    // 1. Initial creation fails due to invalid bundle
+    let first_res = executor.create(container_id, &bundle_invalid);
+    assert!(first_res.is_err());
+
+    // Verify container directory was cleaned up and not left in stale Creating state
+    let container_dir = state_dir.join("containers").join(container_id);
+    assert!(
+        !container_dir.exists(),
+        "Container state directory should have been cleaned up on creation failure"
+    );
+
+    // 2. Setting up a valid bundle
+    let bundle_valid = temp.path().join("bundle_valid");
+    let rootfs_valid = bundle_valid.join("rootfs");
+    fs::create_dir_all(&rootfs_valid).unwrap();
+    let mut valid_spec = Spec::default_linux();
+    if let Some(proc) = &mut valid_spec.process {
+        proc.args = vec!["true".to_string()];
+    }
+    fs::write(
+        bundle_valid.join("config.json"),
+        serde_json::to_string_pretty(&valid_spec).unwrap(),
+    )
+    .unwrap();
+
+    // 3. Retry with exact same container ID should not be blocked by ContainerAlreadyExists
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } == 0 {
+            let second_res = executor.create(container_id, &bundle_valid);
+            assert!(
+                second_res.is_ok(),
+                "Retry with same container_id should succeed after failed creation cleanup"
+            );
+            let _ = executor.delete(container_id, true);
+        }
+    }
+}
+
+#[test]
+fn test_explicit_uid_gid_zero_credential_transition() {
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping rootful test (requires root)");
+            return;
+        }
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let bundle_dir = temp.path().join("bundle");
+        let rootfs = bundle_dir.join("rootfs");
+        let bin_dir = rootfs.join("bin");
+        let dev_dir = rootfs.join("dev");
+        let tmp_dir = rootfs.join("tmp");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&dev_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let _ = fs::File::create(dev_dir.join("null"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(dev_dir.join("null"), fs::Permissions::from_mode(0o666));
+            let _ = fs::set_permissions(&tmp_dir, fs::Permissions::from_mode(0o777));
+        }
+
+        let busybox_path = if Path::new("/usr/bin/busybox").exists() {
+            "/usr/bin/busybox"
+        } else {
+            "/bin/busybox"
+        };
+        fs::copy(busybox_path, bin_dir.join("busybox")).unwrap();
+
+        let mut spec = Spec::default_linux();
+        if let Some(proc) = &mut spec.process {
+            proc.user = tavik_runtime::spec::User {
+                uid: 0,
+                gid: 0,
+                additional_gids: vec![],
+            };
+            proc.args = vec![
+                "/bin/busybox".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "/bin/busybox id > /tmp/id_root.txt; sleep 1".to_string(),
+            ];
+        }
+
+        let config_path = bundle_dir.join("config.json");
+        fs::write(&config_path, serde_json::to_string_pretty(&spec).unwrap()).unwrap();
+
+        let executor = ContainerExecutor::new(state_dir).unwrap();
+        let container_id = "test-uid-zero-explicit";
+
+        let _ = executor.create(container_id, &bundle_dir).unwrap();
+        let _ = executor.start(container_id).unwrap();
+
+        let mut id_output = String::new();
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(50));
+            if let Ok(content) = fs::read_to_string(rootfs.join("tmp/id_root.txt")) {
+                let trimmed = content.trim().to_string();
+                if !trimmed.is_empty() {
+                    id_output = trimmed;
+                    break;
+                }
+            }
+        }
+
+        assert!(
+            id_output.contains("uid=0"),
+            "Expected uid=0, got: {:?}",
+            id_output
+        );
+        assert!(
+            id_output.contains("gid=0"),
+            "Expected gid=0, got: {:?}",
+            id_output
+        );
+
+        let _ = executor.kill(container_id, 9);
+        let _ = executor.delete(container_id, true);
     }
 }

@@ -445,10 +445,10 @@ async fn test_create_bundle_command_override_behavior() {
         .create_bundle(&setup.reference, &bundle_dir3, Some(&overrides3), false)
         .await
         .unwrap();
-    // Notice "sh" was resolved along container PATH to "/bin/sh"
+    // In Phase 4.5D.2, argv[0] is preserved directly in spec without host path expansion
     assert_eq!(
         info3.spec.process.as_ref().unwrap().args,
-        vec!["/bin/sh", "run.sh"]
+        vec!["sh", "run.sh"]
     );
 }
 
@@ -456,63 +456,25 @@ async fn test_create_bundle_command_override_behavior() {
 async fn test_executable_path_resolution_in_rootfs() {
     let temp = tempdir().unwrap();
     let rootfs_dir = temp.path().join("rootfs");
-    let bin_dir = rootfs_dir.join("bin");
-    let local_bin = rootfs_dir.join("usr/local/bin");
-    std::fs::create_dir_all(&bin_dir).unwrap();
-    std::fs::create_dir_all(&local_bin).unwrap();
+    let env = vec!["PATH=/usr/local/bin:/bin".to_string()];
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        // 1. First PATH entry /usr/local/bin contains a directory named "app_tool"
-        let app_dir = local_bin.join("app_tool");
-        std::fs::create_dir(&app_dir).unwrap();
-
-        // 2. Second PATH entry /bin contains the actual executable "app_tool"
-        let app_exec = bin_dir.join("app_tool");
-        std::fs::write(&app_exec, b"#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&app_exec, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        // 3. First PATH entry contains a non-executable file "script_tool" (mode 0644)
-        let non_exec = local_bin.join("script_tool");
-        std::fs::write(&non_exec, b"non-executable").unwrap();
-        std::fs::set_permissions(&non_exec, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-        // Second PATH entry contains the executable "script_tool" (mode 0755)
-        let exec_script = bin_dir.join("script_tool");
-        std::fs::write(&exec_script, b"#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&exec_script, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        // 4. In-rootfs symlink: /usr/local/bin/sym_tool -> /bin/app_tool
-        let sym_tool = local_bin.join("sym_tool");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink("/bin/app_tool", &sym_tool).unwrap();
-
-        let env = vec!["PATH=/usr/local/bin:/bin".to_string()];
-
-        // App tool: first candidate is directory -> skips it -> selects /bin/app_tool!
-        let res_app = ImageService::resolve_executable_path(&rootfs_dir, "app_tool", &env).unwrap();
-        assert_eq!(res_app, "/bin/app_tool");
-
-        // Script tool: first candidate is non-executable file -> skips it -> selects /bin/script_tool!
-        let res_script =
-            ImageService::resolve_executable_path(&rootfs_dir, "script_tool", &env).unwrap();
-        assert_eq!(res_script, "/bin/script_tool");
-
-        // Symlink tool: resolves through in-rootfs symlink!
-        let res_sym = ImageService::resolve_executable_path(&rootfs_dir, "sym_tool", &env).unwrap();
-        assert_eq!(res_sym, "/usr/local/bin/sym_tool");
-
-        // Command not found preserves original command name
-        let res_missing =
-            ImageService::resolve_executable_path(&rootfs_dir, "nonexistent", &env).unwrap();
-        assert_eq!(res_missing, "nonexistent");
-
-        // Explicit relative path preserved as-is
-        let res_rel = ImageService::resolve_executable_path(&rootfs_dir, "./my_cmd", &env).unwrap();
-        assert_eq!(res_rel, "./my_cmd");
-    }
+    // ImageService::resolve_executable_path preserves argv[0] without host filesystem inspection
+    assert_eq!(
+        ImageService::resolve_executable_path(&rootfs_dir, "app_tool", &env).unwrap(),
+        "app_tool"
+    );
+    assert_eq!(
+        ImageService::resolve_executable_path(&rootfs_dir, "sh", &env).unwrap(),
+        "sh"
+    );
+    assert_eq!(
+        ImageService::resolve_executable_path(&rootfs_dir, "/bin/sh", &env).unwrap(),
+        "/bin/sh"
+    );
+    assert_eq!(
+        ImageService::resolve_executable_path(&rootfs_dir, "./my_cmd", &env).unwrap(),
+        "./my_cmd"
+    );
 }
 
 #[tokio::test]
@@ -528,14 +490,20 @@ async fn test_stop_signal_parsing() {
     assert_eq!(parse_signal("SIGHUP").unwrap(), 1);
     assert_eq!(parse_signal("SIGUSR1").unwrap(), 10);
     assert_eq!(parse_signal("SIGUSR2").unwrap(), 12);
-    assert_eq!(parse_signal("SIGSTOP").unwrap(), 19);
-    assert_eq!(parse_signal("SIGCONT").unwrap(), 18);
     assert_eq!(parse_signal("15").unwrap(), 15);
     assert_eq!(parse_signal("9").unwrap(), 9);
     assert_eq!(parse_signal("2").unwrap(), 2);
     assert_eq!(parse_signal("1").unwrap(), 1);
     assert_eq!(parse_signal("31").unwrap(), 31);
     assert_eq!(parse_signal("64").unwrap(), 64);
+
+    // Process-control signals are rejected (cannot be used as container stop signals)
+    assert!(parse_signal("SIGSTOP").is_err());
+    assert!(parse_signal("STOP").is_err());
+    assert!(parse_signal("19").is_err());
+    assert!(parse_signal("SIGCONT").is_err());
+    assert!(parse_signal("CONT").is_err());
+    assert!(parse_signal("18").is_err());
 
     // Invalid signals: unknown names, zero, negative, out of range, empty
     assert!(parse_signal("UNKNOWN").is_err());

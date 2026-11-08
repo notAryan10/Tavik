@@ -1,4 +1,4 @@
-use tavik_image::{ImageConfiguration, ImageError};
+use tavik_image::{ImageConfigOverrides, ImageConfiguration, ImageError};
 use tempfile::NamedTempFile;
 
 #[test]
@@ -537,4 +537,439 @@ fn test_invalid_json_fails_loudly() {
     let malformed_json = r#"{ "architecture": "arm64", "#;
     let err = ImageConfiguration::from_bytes(malformed_json.as_bytes()).unwrap_err();
     assert!(matches!(err, ImageError::Json(_)));
+}
+
+// =========================================================================
+// Phase 4.5B — Effective Configuration Resolver Tests
+// =========================================================================
+
+fn make_test_config(
+    entrypoint: Option<Vec<&str>>,
+    cmd: Option<Vec<&str>>,
+    env: Option<Vec<&str>>,
+    working_dir: Option<&str>,
+    user: Option<&str>,
+    stop_signal: Option<&str>,
+) -> ImageConfiguration {
+    let mut config_json = serde_json::Map::new();
+
+    if let Some(ep) = entrypoint {
+        config_json.insert("Entrypoint".into(), serde_json::to_value(ep).unwrap());
+    }
+    if let Some(c) = cmd {
+        config_json.insert("Cmd".into(), serde_json::to_value(c).unwrap());
+    }
+    if let Some(e) = env {
+        config_json.insert("Env".into(), serde_json::to_value(e).unwrap());
+    }
+    if let Some(wd) = working_dir {
+        config_json.insert("WorkingDir".into(), serde_json::to_value(wd).unwrap());
+    }
+    if let Some(u) = user {
+        config_json.insert("User".into(), serde_json::to_value(u).unwrap());
+    }
+    if let Some(sig) = stop_signal {
+        config_json.insert("StopSignal".into(), serde_json::to_value(sig).unwrap());
+    }
+
+    let top = serde_json::json!({
+        "architecture": "arm64",
+        "os": "linux",
+        "config": config_json,
+        "rootfs": {
+            "type": "layers",
+            "diff_ids": []
+        }
+    });
+
+    ImageConfiguration::from_bytes(&serde_json::to_vec(&top).unwrap()).unwrap()
+}
+
+#[test]
+fn test_resolve_entrypoint_plus_cmd() {
+    let img = make_test_config(
+        Some(vec!["/bin/sh"]),
+        Some(vec!["-c", "echo hello"]),
+        None,
+        None,
+        None,
+        None,
+    );
+    let resolved = img.resolve(&ImageConfigOverrides::new()).unwrap();
+    assert_eq!(resolved.args, vec!["/bin/sh", "-c", "echo hello"]);
+}
+
+#[test]
+fn test_resolve_entrypoint_without_cmd() {
+    let img = make_test_config(Some(vec!["/usr/bin/python3"]), None, None, None, None, None);
+    let resolved = img.resolve(&ImageConfigOverrides::new()).unwrap();
+    assert_eq!(resolved.args, vec!["/usr/bin/python3"]);
+}
+
+#[test]
+fn test_resolve_cmd_without_entrypoint() {
+    let img = make_test_config(None, Some(vec!["/bin/sleep", "30"]), None, None, None, None);
+    let resolved = img.resolve(&ImageConfigOverrides::new()).unwrap();
+    assert_eq!(resolved.args, vec!["/bin/sleep", "30"]);
+}
+
+#[test]
+fn test_resolve_user_command_replacing_image_cmd() {
+    let img = make_test_config(
+        Some(vec!["/docker-entrypoint.sh"]),
+        Some(vec!["default_cmd"]),
+        None,
+        None,
+        None,
+        None,
+    );
+    let overrides = ImageConfigOverrides::new().with_command(vec!["custom", "--flag"]);
+    let resolved = img.resolve(&overrides).unwrap();
+    assert_eq!(
+        resolved.args,
+        vec!["/docker-entrypoint.sh", "custom", "--flag"]
+    );
+}
+
+#[test]
+fn test_resolve_user_entrypoint_replacing_image_entrypoint() {
+    let img = make_test_config(
+        Some(vec!["/old-entrypoint.sh"]),
+        Some(vec!["arg1", "arg2"]),
+        None,
+        None,
+        None,
+        None,
+    );
+    let overrides = ImageConfigOverrides::new().with_entrypoint(vec!["/custom/entry.sh"]);
+    let resolved = img.resolve(&overrides).unwrap();
+    assert_eq!(resolved.args, vec!["/custom/entry.sh", "arg1", "arg2"]);
+}
+
+#[test]
+fn test_resolve_explicitly_empty_entrypoint_override() {
+    let img = make_test_config(
+        Some(vec!["/entrypoint.sh"]),
+        Some(vec!["/bin/echo", "hello"]),
+        None,
+        None,
+        None,
+        None,
+    );
+    let overrides = ImageConfigOverrides::new().with_entrypoint(Vec::<String>::new());
+    let resolved = img.resolve(&overrides).unwrap();
+    // With entrypoint explicitly cleared to empty, argv becomes Cmd
+    assert_eq!(resolved.args, vec!["/bin/echo", "hello"]);
+}
+
+#[test]
+fn test_resolve_empty_final_command_fails() {
+    let img = make_test_config(None, None, None, None, None, None);
+    let err = img.resolve(&ImageConfigOverrides::new()).unwrap_err();
+    assert!(
+        matches!(err, ImageError::InvalidConfiguration(ref s) if s.contains("No executable specified"))
+    );
+
+    // Explicitly clearing both entrypoint and command fails
+    let overrides = ImageConfigOverrides::new()
+        .with_entrypoint(Vec::<String>::new())
+        .with_command(Vec::<String>::new());
+    let err2 = img.resolve(&overrides).unwrap_err();
+    assert!(matches!(err2, ImageError::InvalidConfiguration(_)));
+}
+
+#[test]
+fn test_resolve_arguments_preserving_whitespace_and_boundaries() {
+    let img = make_test_config(
+        Some(vec!["python3"]),
+        Some(vec!["-c", "import sys; print('arg with spaces')"]),
+        None,
+        None,
+        None,
+        None,
+    );
+    let resolved = img.resolve(&ImageConfigOverrides::new()).unwrap();
+    assert_eq!(resolved.args.len(), 3);
+    assert_eq!(resolved.args[0], "python3");
+    assert_eq!(resolved.args[1], "-c");
+    assert_eq!(resolved.args[2], "import sys; print('arg with spaces')");
+}
+
+#[test]
+fn test_resolve_arguments_containing_null_bytes_fails() {
+    let img = make_test_config(Some(vec!["/bin/sh\0"]), None, None, None, None, None);
+    let err = img.resolve(&ImageConfigOverrides::new()).unwrap_err();
+    assert!(matches!(err, ImageError::InvalidConfiguration(ref s) if s.contains("null byte")));
+
+    // Empty executable in argv[0] fails
+    let img2 = make_test_config(Some(vec!["   "]), None, None, None, None, None);
+    let err2 = img2.resolve(&ImageConfigOverrides::new()).unwrap_err();
+    assert!(
+        matches!(err2, ImageError::InvalidConfiguration(ref s) if s.contains("must not be empty or whitespace"))
+    );
+}
+
+#[test]
+fn test_resolve_image_only_environment() {
+    let img = make_test_config(
+        Some(vec!["/bin/sh"]),
+        None,
+        Some(vec!["PATH=/usr/bin", "FOO=bar"]),
+        None,
+        None,
+        None,
+    );
+    let resolved = img.resolve(&ImageConfigOverrides::new()).unwrap();
+    assert_eq!(resolved.env, vec!["PATH=/usr/bin", "FOO=bar"]);
+}
+
+#[test]
+fn test_resolve_override_existing_image_variable() {
+    let img = make_test_config(
+        Some(vec!["/bin/sh"]),
+        None,
+        Some(vec!["PORT=8080", "MODE=production"]),
+        None,
+        None,
+        None,
+    );
+    let overrides = ImageConfigOverrides::new().with_env(vec!["PORT=9090"]);
+    let resolved = img.resolve(&overrides).unwrap();
+    assert_eq!(resolved.env, vec!["PORT=9090", "MODE=production"]);
+}
+
+#[test]
+fn test_resolve_add_new_variable() {
+    let img = make_test_config(
+        Some(vec!["/bin/sh"]),
+        None,
+        Some(vec!["PORT=8080"]),
+        None,
+        None,
+        None,
+    );
+    let overrides = ImageConfigOverrides::new().with_env(vec!["NEW_KEY=val123"]);
+    let resolved = img.resolve(&overrides).unwrap();
+    assert_eq!(resolved.env, vec!["PORT=8080", "NEW_KEY=val123"]);
+}
+
+#[test]
+fn test_resolve_empty_environment_values() {
+    let img = make_test_config(
+        Some(vec!["/bin/sh"]),
+        None,
+        Some(vec!["IMAGE_EMPTY="]),
+        None,
+        None,
+        None,
+    );
+    let overrides = ImageConfigOverrides::new().with_env(vec!["OVERRIDE_EMPTY="]);
+    let resolved = img.resolve(&overrides).unwrap();
+    assert_eq!(resolved.env, vec!["IMAGE_EMPTY=", "OVERRIDE_EMPTY="]);
+}
+
+#[test]
+fn test_resolve_environment_values_containing_equals() {
+    let img = make_test_config(
+        Some(vec!["/bin/sh"]),
+        None,
+        Some(vec!["CONNECTION_STRING=host=localhost;port=5432;db=test"]),
+        None,
+        None,
+        None,
+    );
+    let resolved = img.resolve(&ImageConfigOverrides::new()).unwrap();
+    assert_eq!(
+        resolved.env,
+        vec!["CONNECTION_STRING=host=localhost;port=5432;db=test"]
+    );
+}
+
+#[test]
+fn test_resolve_duplicate_environment_keys_last_write_wins() {
+    let img = make_test_config(
+        Some(vec!["/bin/sh"]),
+        None,
+        Some(vec!["A=1", "A=2"]),
+        None,
+        None,
+        None,
+    );
+    let overrides = ImageConfigOverrides::new().with_env(vec!["A=3", "B=x", "A=4"]);
+    let resolved = img.resolve(&overrides).unwrap();
+    assert_eq!(resolved.env, vec!["A=4", "B=x"]);
+}
+
+#[test]
+fn test_resolve_invalid_environment_entries() {
+    let img = make_test_config(Some(vec!["/bin/sh"]), None, None, None, None, None);
+
+    // Missing '='
+    let o1 = ImageConfigOverrides::new().with_env(vec!["NO_EQUALS"]);
+    assert!(img.resolve(&o1).is_err());
+
+    // Empty name
+    let o2 = ImageConfigOverrides::new().with_env(vec!["=VALUE"]);
+    assert!(img.resolve(&o2).is_err());
+
+    // Null byte in name or value
+    let o3 = ImageConfigOverrides::new().with_env(vec!["N\0AME=val"]);
+    assert!(img.resolve(&o3).is_err());
+
+    let o4 = ImageConfigOverrides::new().with_env(vec!["NAME=val\0"]);
+    assert!(img.resolve(&o4).is_err());
+}
+
+#[test]
+fn test_resolve_working_dir_image_default() {
+    let img = make_test_config(
+        Some(vec!["/bin/sh"]),
+        None,
+        None,
+        Some("/var/www"),
+        None,
+        None,
+    );
+    let resolved = img.resolve(&ImageConfigOverrides::new()).unwrap();
+    assert_eq!(resolved.working_dir, "/var/www");
+}
+
+#[test]
+fn test_resolve_working_dir_container_override() {
+    let img = make_test_config(
+        Some(vec!["/bin/sh"]),
+        None,
+        None,
+        Some("/var/www"),
+        None,
+        None,
+    );
+    let overrides = ImageConfigOverrides::new().with_working_dir("/custom/app");
+    let resolved = img.resolve(&overrides).unwrap();
+    assert_eq!(resolved.working_dir, "/custom/app");
+}
+
+#[test]
+fn test_resolve_working_dir_default_root() {
+    let img = make_test_config(Some(vec!["/bin/sh"]), None, None, None, None, None);
+    let resolved = img.resolve(&ImageConfigOverrides::new()).unwrap();
+    assert_eq!(resolved.working_dir, "/");
+}
+
+#[test]
+fn test_resolve_working_dir_invalid_explicit_override_fails() {
+    let img = make_test_config(
+        Some(vec!["/bin/sh"]),
+        None,
+        None,
+        Some("/var/www"),
+        None,
+        None,
+    );
+
+    // Relative path override must fail (never silently fall back to image default)
+    let o1 = ImageConfigOverrides::new().with_working_dir("relative/path");
+    let err1 = img.resolve(&o1).unwrap_err();
+    assert!(
+        matches!(err1, ImageError::InvalidConfiguration(ref s) if s.contains("must be an absolute path"))
+    );
+
+    // Parent traversal in override must fail
+    let o2 = ImageConfigOverrides::new().with_working_dir("/var/../etc");
+    let err2 = img.resolve(&o2).unwrap_err();
+    assert!(
+        matches!(err2, ImageError::InvalidConfiguration(ref s) if s.contains("parent traversal '..' is forbidden"))
+    );
+
+    // Null byte in override must fail
+    let o3 = ImageConfigOverrides::new().with_working_dir("/var/\0app");
+    assert!(img.resolve(&o3).is_err());
+}
+
+#[test]
+fn test_resolve_user_image_default() {
+    let img = make_test_config(
+        Some(vec!["/bin/sh"]),
+        None,
+        None,
+        None,
+        Some("1000:1000"),
+        None,
+    );
+    let resolved = img.resolve(&ImageConfigOverrides::new()).unwrap();
+    assert_eq!(resolved.user.as_deref(), Some("1000:1000"));
+}
+
+#[test]
+fn test_resolve_user_explicit_override() {
+    let img = make_test_config(
+        Some(vec!["/bin/sh"]),
+        None,
+        None,
+        None,
+        Some("1000:1000"),
+        None,
+    );
+    let overrides = ImageConfigOverrides::new().with_user("root");
+    let resolved = img.resolve(&overrides).unwrap();
+    assert_eq!(resolved.user.as_deref(), Some("root"));
+}
+
+#[test]
+fn test_resolve_user_missing_image_user() {
+    let img = make_test_config(Some(vec!["/bin/sh"]), None, None, None, None, None);
+    let resolved = img.resolve(&ImageConfigOverrides::new()).unwrap();
+    assert_eq!(resolved.user, None);
+}
+
+#[test]
+fn test_resolve_user_empty_value_policy_clears_user() {
+    let img = make_test_config(
+        Some(vec!["/bin/sh"]),
+        None,
+        None,
+        None,
+        Some("default_user"),
+        None,
+    );
+    let overrides = ImageConfigOverrides::new().with_user("");
+    let resolved = img.resolve(&overrides).unwrap();
+    // Empty user override explicitly clears the setting to None
+    assert_eq!(resolved.user, None);
+}
+
+#[test]
+fn test_resolve_stop_signal_image_default() {
+    let img = make_test_config(
+        Some(vec!["/bin/sh"]),
+        None,
+        None,
+        None,
+        None,
+        Some("SIGQUIT"),
+    );
+    let resolved = img.resolve(&ImageConfigOverrides::new()).unwrap();
+    assert_eq!(resolved.stop_signal, "SIGQUIT");
+}
+
+#[test]
+fn test_resolve_stop_signal_explicit_override() {
+    let img = make_test_config(
+        Some(vec!["/bin/sh"]),
+        None,
+        None,
+        None,
+        None,
+        Some("SIGQUIT"),
+    );
+    let overrides = ImageConfigOverrides::new().with_stop_signal("SIGINT");
+    let resolved = img.resolve(&overrides).unwrap();
+    assert_eq!(resolved.stop_signal, "SIGINT");
+}
+
+#[test]
+fn test_resolve_stop_signal_default_sigterm() {
+    let img = make_test_config(Some(vec!["/bin/sh"]), None, None, None, None, None);
+    let resolved = img.resolve(&ImageConfigOverrides::new()).unwrap();
+    assert_eq!(resolved.stop_signal, "SIGTERM");
 }

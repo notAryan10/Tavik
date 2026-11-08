@@ -7,7 +7,10 @@ pub mod unpacker;
 pub mod whiteout;
 
 pub use archive::{ArchiveReader, CompressionFormat, LimitedReader};
-pub use config::{ContainerConfig, HistoryRecord, ImageConfiguration, RootFs};
+pub use config::{
+    ContainerConfig, EffectiveImageConfig, HistoryRecord, ImageConfigOverrides, ImageConfiguration,
+    RootFs,
+};
 pub use error::ImageError;
 pub use filesystem::{normalize_symlink_target, sanitize_entry_path, SafeDir};
 pub use layer::Layer;

@@ -226,6 +226,7 @@ impl SafeDir {
     fn resolve_parent_dir<'a>(
         &'a self,
         components: &[&'a std::ffi::OsStr],
+        create_missing: bool,
     ) -> Result<(ParentDir<'a>, &'a std::ffi::OsStr), ImageError> {
         let (parent_comps, final_comp) = match components.split_last() {
             Some((last, rest)) => (rest, *last),
@@ -249,7 +250,7 @@ impl SafeDir {
                 ImageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
             })?;
 
-            let next_raw = unsafe {
+            let mut next_raw = unsafe {
                 libc::openat(
                     current_raw,
                     c_comp.as_ptr(),
@@ -258,7 +259,56 @@ impl SafeDir {
             };
 
             if next_raw < 0 {
-                return Err(ImageError::Io(std::io::Error::last_os_error()));
+                let err = std::io::Error::last_os_error();
+
+                // Explicitly check if the intermediate component is a symbolic link.
+                // On macOS and some Linux systems, openat with O_DIRECTORY may return ENOTDIR
+                // instead of ELOOP for a symlink. We must always fail with ELOOP on any intermediate symlink.
+                let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
+                let s_ret = unsafe {
+                    libc::fstatat(
+                        current_raw,
+                        c_comp.as_ptr(),
+                        &mut stat_buf,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                };
+                if s_ret == 0 && (stat_buf.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+                    return Err(ImageError::Io(std::io::Error::from_raw_os_error(
+                        libc::ELOOP,
+                    )));
+                }
+
+                let is_not_found = err.kind() == std::io::ErrorKind::NotFound || s_ret != 0;
+                let is_regular_file =
+                    s_ret == 0 && (stat_buf.st_mode & libc::S_IFMT) == libc::S_IFREG;
+
+                if create_missing && (is_not_found || is_regular_file) {
+                    if is_regular_file {
+                        // Replacing an existing regular file from lower layer with a directory
+                        unsafe { libc::unlinkat(current_raw, c_comp.as_ptr(), 0) };
+                    }
+
+                    let ret = unsafe { libc::mkdirat(current_raw, c_comp.as_ptr(), 0o700) };
+                    if ret != 0 {
+                        let mk_err = std::io::Error::last_os_error();
+                        if mk_err.raw_os_error() != Some(libc::EEXIST) {
+                            return Err(ImageError::Io(mk_err));
+                        }
+                    }
+                    next_raw = unsafe {
+                        libc::openat(
+                            current_raw,
+                            c_comp.as_ptr(),
+                            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                        )
+                    };
+                    if next_raw < 0 {
+                        return Err(ImageError::Io(std::io::Error::last_os_error()));
+                    }
+                } else {
+                    return Err(ImageError::Io(err));
+                }
             }
 
             let next_owned = unsafe { OwnedFd::from_raw_fd(next_raw) };
@@ -273,7 +323,16 @@ impl SafeDir {
     /// Checks if an entry at `rel_path` exists and whether it is a symlink (without following it).
     pub fn is_symlink_at(&self, rel_path: &Path) -> Result<bool, ImageError> {
         let components = self.validate_path(rel_path)?;
-        let (parent_dir, final_comp) = self.resolve_parent_dir(&components)?;
+        let (parent_dir, final_comp) = match self.resolve_parent_dir(&components, false) {
+            Ok(res) => res,
+            Err(ImageError::Io(e))
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.raw_os_error() == Some(libc::ENOTDIR) =>
+            {
+                return Ok(false)
+            }
+            Err(e) => return Err(e),
+        };
         let c_final = CString::new(final_comp.as_bytes()).map_err(|e| {
             ImageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
         })?;
@@ -306,7 +365,7 @@ impl SafeDir {
     /// or regular files are strictly rejected with ENOTDIR.
     pub fn mkdir_at(&self, rel_path: &Path, mode: u32) -> Result<(), ImageError> {
         let components = self.validate_path(rel_path)?;
-        let (parent_dir, final_comp) = self.resolve_parent_dir(&components)?;
+        let (parent_dir, final_comp) = self.resolve_parent_dir(&components, true)?;
         let c_final = CString::new(final_comp.as_bytes()).map_err(|e| {
             ImageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
         })?;
@@ -357,7 +416,7 @@ impl SafeDir {
         let link_parent = link_rel.parent().unwrap_or_else(|| Path::new(""));
         let _ = normalize_symlink_target(&self.path, link_parent, target)?;
 
-        let (parent_dir, final_comp) = self.resolve_parent_dir(&components)?;
+        let (parent_dir, final_comp) = self.resolve_parent_dir(&components, true)?;
         let c_target = CString::new(target.as_os_str().as_bytes()).map_err(|e| {
             ImageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
         })?;
@@ -383,7 +442,7 @@ impl SafeDir {
         mode: u32,
     ) -> Result<std::fs::File, ImageError> {
         let components = self.validate_path(rel_path)?;
-        let (parent_dir, final_comp) = self.resolve_parent_dir(&components)?;
+        let (parent_dir, final_comp) = self.resolve_parent_dir(&components, true)?;
         let c_final = CString::new(final_comp.as_bytes()).map_err(|e| {
             ImageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
         })?;
@@ -405,10 +464,429 @@ impl SafeDir {
         Ok(file)
     }
 
+    /// Checks if an entry exists at `rel_path` without following symlinks.
+    pub fn exists_at(&self, rel_path: &Path) -> Result<bool, ImageError> {
+        let components = self.validate_path(rel_path)?;
+        let (parent_dir, final_comp) = match self.resolve_parent_dir(&components, false) {
+            Ok(res) => res,
+            Err(ImageError::Io(e))
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.raw_os_error() == Some(libc::ENOTDIR) =>
+            {
+                return Ok(false)
+            }
+            Err(e) => return Err(e),
+        };
+        let c_final = CString::new(final_comp.as_bytes()).map_err(|e| {
+            ImageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        })?;
+
+        let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
+        let ret = unsafe {
+            libc::fstatat(
+                parent_dir.as_raw_fd(),
+                c_final.as_ptr(),
+                &mut stat_buf,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+
+        if ret == 0 {
+            Ok(true)
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::NotFound {
+                Ok(false)
+            } else {
+                Err(ImageError::Io(err))
+            }
+        }
+    }
+
+    /// Creates a hard link at `link_rel` pointing to `source_rel` relative to this rootfs.
+    /// Both source and destination paths are validated descriptor-by-descriptor without symlink following.
+    pub fn hardlink_at(&self, source_rel: &Path, link_rel: &Path) -> Result<(), ImageError> {
+        let src_comps = self.validate_path(source_rel)?;
+        let dst_comps = self.validate_path(link_rel)?;
+
+        let (src_parent_dir, src_final) = self.resolve_parent_dir(&src_comps, false)?;
+        let (dst_parent_dir, dst_final) = self.resolve_parent_dir(&dst_comps, true)?;
+
+        let c_src = CString::new(src_final.as_bytes()).map_err(|e| {
+            ImageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        })?;
+        let c_dst = CString::new(dst_final.as_bytes()).map_err(|e| {
+            ImageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        })?;
+
+        // Unlink destination first if it already exists (replacement semantics)
+        let _ = unsafe { libc::unlinkat(dst_parent_dir.as_raw_fd(), c_dst.as_ptr(), 0) };
+
+        let ret = unsafe {
+            libc::linkat(
+                src_parent_dir.as_raw_fd(),
+                c_src.as_ptr(),
+                dst_parent_dir.as_raw_fd(),
+                c_dst.as_ptr(),
+                0,
+            )
+        };
+
+        if ret != 0 {
+            return Err(ImageError::Io(std::io::Error::last_os_error()));
+        }
+
+        Ok(())
+    }
+
+    /// Sets metadata (ownership, modification time, and permissions) at `rel_path` without following symlinks.
+    pub fn set_metadata_at(
+        &self,
+        rel_path: &Path,
+        mode: Option<u32>,
+        uid: u32,
+        gid: u32,
+        mtime_sec: i64,
+    ) -> Result<(), ImageError> {
+        let components = self.validate_path(rel_path)?;
+        let (parent_dir, final_comp) = self.resolve_parent_dir(&components, false)?;
+        let c_final = CString::new(final_comp.as_bytes()).map_err(|e| {
+            ImageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        })?;
+
+        let parent_fd = parent_dir.as_raw_fd();
+
+        // 1. Ownership (fchownat with AT_SYMLINK_NOFOLLOW)
+        let ret = unsafe {
+            libc::fchownat(
+                parent_fd,
+                c_final.as_ptr(),
+                uid as libc::uid_t,
+                gid as libc::gid_t,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            let is_unprivileged = unsafe { libc::geteuid() != 0 };
+            if !(err.raw_os_error() == Some(libc::EPERM) && is_unprivileged) {
+                return Err(ImageError::Io(err));
+            }
+        }
+
+        // 2. Timestamps (utimensat with AT_SYMLINK_NOFOLLOW)
+        let times = [
+            libc::timespec {
+                tv_sec: mtime_sec as libc::time_t,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: mtime_sec as libc::time_t,
+                tv_nsec: 0,
+            },
+        ];
+        let ret = unsafe {
+            libc::utimensat(
+                parent_fd,
+                c_final.as_ptr(),
+                times.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if ret != 0 {
+            return Err(ImageError::Io(std::io::Error::last_os_error()));
+        }
+
+        // 3. Permissions (mode): applied if not a symlink
+        if let Some(m) = mode {
+            let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
+            let ret = unsafe {
+                libc::fstatat(
+                    parent_fd,
+                    c_final.as_ptr(),
+                    &mut stat_buf,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if ret == 0 && (stat_buf.st_mode & libc::S_IFMT) != libc::S_IFLNK {
+                let raw_open = unsafe {
+                    libc::openat(
+                        parent_fd,
+                        c_final.as_ptr(),
+                        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if raw_open >= 0 {
+                    let ret = unsafe { libc::fchmod(raw_open, (m & 0o7777) as libc::mode_t) };
+                    unsafe { libc::close(raw_open) };
+                    if ret != 0 {
+                        return Err(ImageError::Io(std::io::Error::last_os_error()));
+                    }
+                } else {
+                    let ret = unsafe {
+                        libc::fchmodat(parent_fd, c_final.as_ptr(), (m & 0o7777) as libc::mode_t, 0)
+                    };
+                    if ret != 0 {
+                        return Err(ImageError::Io(std::io::Error::last_os_error()));
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Prepares a destination path for writing a new entry, handling type replacement semantics.
+    /// If an existing entry at `rel_path` has an incompatible type with `new_is_dir`, it is removed.
+    pub fn prepare_for_entry(&self, rel_path: &Path, new_is_dir: bool) -> Result<(), ImageError> {
+        let components = self.validate_path(rel_path)?;
+        let (parent_dir, final_comp) = match self.resolve_parent_dir(&components, false) {
+            Ok(res) => res,
+            Err(ImageError::Io(e))
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.raw_os_error() == Some(libc::ENOTDIR) =>
+            {
+                return Ok(())
+            }
+            Err(e) => return Err(e),
+        };
+        let c_final = CString::new(final_comp.as_bytes()).map_err(|e| {
+            ImageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        })?;
+
+        let parent_fd = parent_dir.as_raw_fd();
+        let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
+        let ret = unsafe {
+            libc::fstatat(
+                parent_fd,
+                c_final.as_ptr(),
+                &mut stat_buf,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+
+        if ret != 0 {
+            return Ok(());
+        }
+
+        let existing_is_dir = (stat_buf.st_mode & libc::S_IFMT) == libc::S_IFDIR;
+        let existing_is_symlink = (stat_buf.st_mode & libc::S_IFMT) == libc::S_IFLNK;
+
+        if new_is_dir {
+            if !existing_is_dir {
+                // Replacing a file or symlink with a directory
+                let ret = unsafe { libc::unlinkat(parent_fd, c_final.as_ptr(), 0) };
+                if ret != 0 {
+                    return Err(ImageError::Io(std::io::Error::last_os_error()));
+                }
+            }
+        } else if existing_is_dir {
+            // Replacing a directory with a file or symlink
+            let raw_dir = unsafe {
+                libc::openat(
+                    parent_fd,
+                    c_final.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if raw_dir >= 0 {
+                let owned_dir = unsafe { OwnedFd::from_raw_fd(raw_dir) };
+                Self::remove_dir_contents_fd(owned_dir.as_raw_fd())?;
+            }
+            let ret = unsafe { libc::unlinkat(parent_fd, c_final.as_ptr(), libc::AT_REMOVEDIR) };
+            if ret != 0 {
+                return Err(ImageError::Io(std::io::Error::last_os_error()));
+            }
+        } else if existing_is_symlink {
+            // Replacing a symlink with a file, symlink, or hardlink
+            let ret = unsafe { libc::unlinkat(parent_fd, c_final.as_ptr(), 0) };
+            if ret != 0 {
+                return Err(ImageError::Io(std::io::Error::last_os_error()));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Removes an entry (file, symlink, or directory tree) at `rel_path` descriptor-relatively.
+    pub fn remove_entry_at(&self, rel_path: &Path) -> Result<(), ImageError> {
+        let components = self.validate_path(rel_path)?;
+        let (parent_dir, final_comp) = match self.resolve_parent_dir(&components, false) {
+            Ok(res) => res,
+            Err(ImageError::Io(e))
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.raw_os_error() == Some(libc::ENOTDIR) =>
+            {
+                return Ok(())
+            }
+            Err(e) => return Err(e),
+        };
+        let c_final = CString::new(final_comp.as_bytes()).map_err(|e| {
+            ImageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        })?;
+
+        let parent_fd = parent_dir.as_raw_fd();
+        let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
+        let ret = unsafe {
+            libc::fstatat(
+                parent_fd,
+                c_final.as_ptr(),
+                &mut stat_buf,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::NotFound {
+                return Ok(());
+            }
+            return Err(ImageError::Io(err));
+        }
+
+        if (stat_buf.st_mode & libc::S_IFMT) == libc::S_IFDIR {
+            let raw_dir = unsafe {
+                libc::openat(
+                    parent_fd,
+                    c_final.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if raw_dir >= 0 {
+                let owned_dir = unsafe { OwnedFd::from_raw_fd(raw_dir) };
+                Self::remove_dir_contents_fd(owned_dir.as_raw_fd())?;
+            }
+            let ret = unsafe { libc::unlinkat(parent_fd, c_final.as_ptr(), libc::AT_REMOVEDIR) };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    return Err(ImageError::Io(err));
+                }
+            }
+        } else {
+            let ret = unsafe { libc::unlinkat(parent_fd, c_final.as_ptr(), 0) };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    return Err(ImageError::Io(err));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Recursively removes all contents inside a directory at `rel_path` descriptor-relatively,
+    /// while leaving the directory itself intact.
+    pub fn remove_dir_contents_at(&self, rel_path: &Path) -> Result<(), ImageError> {
+        if rel_path.as_os_str().is_empty() {
+            return Self::remove_dir_contents_fd(self.fd.as_raw_fd());
+        }
+
+        let components = self.validate_path(rel_path)?;
+        let (parent_dir, final_comp) = match self.resolve_parent_dir(&components, false) {
+            Ok(res) => res,
+            Err(ImageError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let c_final = CString::new(final_comp.as_bytes()).map_err(|e| {
+            ImageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        })?;
+
+        let raw_dir = unsafe {
+            libc::openat(
+                parent_dir.as_raw_fd(),
+                c_final.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if raw_dir < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::NotFound {
+                return Ok(());
+            }
+            return Err(ImageError::Io(err));
+        }
+
+        let owned_dir = unsafe { OwnedFd::from_raw_fd(raw_dir) };
+        Self::remove_dir_contents_fd(owned_dir.as_raw_fd())
+    }
+
+    fn remove_dir_contents_fd(dir_fd: RawFd) -> Result<(), ImageError> {
+        let dup_fd = unsafe { libc::dup(dir_fd) };
+        if dup_fd < 0 {
+            return Err(ImageError::Io(std::io::Error::last_os_error()));
+        }
+
+        let dir_ptr = unsafe { libc::fdopendir(dup_fd) };
+        if dir_ptr.is_null() {
+            unsafe { libc::close(dup_fd) };
+            return Err(ImageError::Io(std::io::Error::last_os_error()));
+        }
+
+        let mut entries = Vec::new();
+        loop {
+            let entry_ptr = unsafe { libc::readdir(dir_ptr) };
+            if entry_ptr.is_null() {
+                break;
+            }
+            let entry = unsafe { &*entry_ptr };
+            let c_str = unsafe { std::ffi::CStr::from_ptr(entry.d_name.as_ptr()) };
+            let name_bytes = c_str.to_bytes();
+            if name_bytes == b"." || name_bytes == b".." {
+                continue;
+            }
+            entries.push(c_str.to_owned());
+        }
+        unsafe { libc::closedir(dir_ptr) };
+
+        for c_name in entries {
+            let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
+            let ret = unsafe {
+                libc::fstatat(
+                    dir_fd,
+                    c_name.as_ptr(),
+                    &mut stat_buf,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if ret != 0 {
+                continue;
+            }
+
+            if (stat_buf.st_mode & libc::S_IFMT) == libc::S_IFDIR {
+                let child_raw = unsafe {
+                    libc::openat(
+                        dir_fd,
+                        c_name.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if child_raw >= 0 {
+                    let child_owned = unsafe { OwnedFd::from_raw_fd(child_raw) };
+                    Self::remove_dir_contents_fd(child_owned.as_raw_fd())?;
+                }
+                unsafe { libc::unlinkat(dir_fd, c_name.as_ptr(), libc::AT_REMOVEDIR) };
+            } else {
+                unsafe { libc::unlinkat(dir_fd, c_name.as_ptr(), 0) };
+            }
+        }
+
+        Ok(())
+    }
+
     /// Unlinks a file or symlink at `rel_path` relative to this directory descriptor without following symlinks.
     pub fn unlink_at(&self, rel_path: &Path) -> Result<(), ImageError> {
         let components = self.validate_path(rel_path)?;
-        let (parent_dir, final_comp) = self.resolve_parent_dir(&components)?;
+        let (parent_dir, final_comp) = match self.resolve_parent_dir(&components, false) {
+            Ok(res) => res,
+            Err(ImageError::Io(e))
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.raw_os_error() == Some(libc::ENOTDIR) =>
+            {
+                return Ok(())
+            }
+            Err(e) => return Err(e),
+        };
         let c_final = CString::new(final_comp.as_bytes()).map_err(|e| {
             ImageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
         })?;

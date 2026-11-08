@@ -208,3 +208,191 @@ fn test_alpine_layer_with_malicious_traversal_rejected() {
     let err = sanitize_entry_path(rootfs, &path).unwrap_err();
     assert!(matches!(err, ImageError::PathTraversal { .. }));
 }
+
+#[test]
+fn test_alpine_rootfs_end_to_end_assembly() {
+    use std::os::unix::fs::MetadataExt;
+    use tavik_image::{Layer, RootfsBuilder};
+
+    let temp = tempdir().unwrap();
+    let dest_rootfs = temp.path().join("alpine_rootfs");
+
+    // 1. Layer 0: Alpine Base Layer
+    let mut tar0 = Builder::new(Vec::new());
+
+    // /bin/busybox
+    let mut h_bb = Header::new_gnu();
+    h_bb.set_entry_type(EntryType::Regular);
+    h_bb.set_mode(0o755);
+    h_bb.set_size(14);
+    h_bb.set_cksum();
+    tar0.append_data(&mut h_bb, "bin/busybox", Cursor::new(b"busybox_binary"))
+        .unwrap();
+
+    // /bin/sh -> /bin/busybox
+    let mut h_sh = Header::new_gnu();
+    h_sh.set_entry_type(EntryType::Symlink);
+    h_sh.set_link_name("/bin/busybox").unwrap();
+    h_sh.set_size(0);
+    h_sh.set_cksum();
+    tar0.append_data(&mut h_sh, "bin/sh", Cursor::new(&[]))
+        .unwrap();
+
+    // /etc/os-release
+    let os_content = b"NAME=\"Alpine Linux\"\nID=alpine\n";
+    let mut h_os = Header::new_gnu();
+    h_os.set_entry_type(EntryType::Regular);
+    h_os.set_mode(0o644);
+    h_os.set_size(os_content.len() as u64);
+    h_os.set_cksum();
+    tar0.append_data(&mut h_os, "etc/os-release", Cursor::new(os_content))
+        .unwrap();
+
+    // /etc/hosts (to be removed in layer 1)
+    let hosts_content = b"127.0.0.1 localhost\n";
+    let mut h_hosts = Header::new_gnu();
+    h_hosts.set_entry_type(EntryType::Regular);
+    h_hosts.set_mode(0o644);
+    h_hosts.set_size(hosts_content.len() as u64);
+    h_hosts.set_cksum();
+    tar0.append_data(&mut h_hosts, "etc/hosts", Cursor::new(hosts_content))
+        .unwrap();
+
+    // /var/cache/apk/old_index (to be wiped by opaque whiteout in layer 1)
+    let mut h_old = Header::new_gnu();
+    h_old.set_entry_type(EntryType::Regular);
+    h_old.set_mode(0o644);
+    h_old.set_size(9);
+    h_old.set_cksum();
+    tar0.append_data(
+        &mut h_old,
+        "var/cache/apk/old_index",
+        Cursor::new(b"old_index"),
+    )
+    .unwrap();
+
+    let tar0_raw = tar0.into_inner().unwrap();
+    let mut gz0 = GzEncoder::new(Vec::new(), Compression::default());
+    gz0.write_all(&tar0_raw).unwrap();
+    let l0_bytes = gz0.finish().unwrap();
+    let l0_path = temp.path().join("layer0.tar.gz");
+    std::fs::write(&l0_path, &l0_bytes).unwrap();
+    let layer0 = Layer::new("sha256:layer0", &l0_path, l0_bytes.len() as u64);
+
+    // 2. Layer 1: Alpine Modification Layer
+    let mut tar1 = Builder::new(Vec::new());
+
+    // Deletes /etc/hosts
+    let mut h_wh = Header::new_gnu();
+    h_wh.set_entry_type(EntryType::Regular);
+    h_wh.set_size(0);
+    h_wh.set_cksum();
+    tar1.append_data(&mut h_wh, "etc/.wh.hosts", Cursor::new(&[]))
+        .unwrap();
+
+    // Opaque whiteout on /var/cache/apk
+    let mut h_opq = Header::new_gnu();
+    h_opq.set_entry_type(EntryType::Regular);
+    h_opq.set_size(0);
+    h_opq.set_cksum();
+    tar1.append_data(&mut h_opq, "var/cache/apk/.wh..wh..opq", Cursor::new(&[]))
+        .unwrap();
+
+    // New cache index
+    let mut h_new = Header::new_gnu();
+    h_new.set_entry_type(EntryType::Regular);
+    h_new.set_mode(0o644);
+    h_new.set_size(9);
+    h_new.set_cksum();
+    tar1.append_data(
+        &mut h_new,
+        "var/cache/apk/new_index",
+        Cursor::new(b"new_index"),
+    )
+    .unwrap();
+
+    // Hard link /usr/bin/busybox pointing to /bin/busybox
+    let mut h_hl = Header::new_gnu();
+    h_hl.set_entry_type(EntryType::Link);
+    h_hl.set_link_name("bin/busybox").unwrap();
+    h_hl.set_mode(0o755);
+    h_hl.set_size(0);
+    h_hl.set_cksum();
+    tar1.append_data(&mut h_hl, "usr/bin/busybox", Cursor::new(&[]))
+        .unwrap();
+
+    // /etc/alpine-release
+    let mut h_rel = Header::new_gnu();
+    h_rel.set_entry_type(EntryType::Regular);
+    h_rel.set_mode(0o644);
+    h_rel.set_size(6);
+    h_rel.set_cksum();
+    tar1.append_data(&mut h_rel, "etc/alpine-release", Cursor::new(b"3.20.0"))
+        .unwrap();
+
+    let tar1_raw = tar1.into_inner().unwrap();
+    let mut gz1 = GzEncoder::new(Vec::new(), Compression::default());
+    gz1.write_all(&tar1_raw).unwrap();
+    let l1_bytes = gz1.finish().unwrap();
+    let l1_path = temp.path().join("layer1.tar.gz");
+    std::fs::write(&l1_path, &l1_bytes).unwrap();
+    let layer1 = Layer::new("sha256:layer1", &l1_path, l1_bytes.len() as u64);
+
+    // 3. Build rootfs with RootfsBuilder
+    let builder = RootfsBuilder::new();
+    let rootfs_result = builder
+        .build_rootfs(&[layer0, layer1], &dest_rootfs)
+        .unwrap();
+
+    assert_eq!(rootfs_result, dest_rootfs);
+
+    // 4. Assertions on assembled Alpine rootfs
+    assert!(dest_rootfs.join("bin/busybox").is_file());
+    assert_eq!(
+        std::fs::read(dest_rootfs.join("bin/busybox")).unwrap(),
+        b"busybox_binary"
+    );
+    assert_eq!(
+        std::fs::metadata(dest_rootfs.join("bin/busybox"))
+            .unwrap()
+            .mode()
+            & 0o777,
+        0o755
+    );
+
+    // Symlink
+    assert!(dest_rootfs.join("bin/sh").is_symlink());
+    assert_eq!(
+        std::fs::read_link(dest_rootfs.join("bin/sh")).unwrap(),
+        Path::new("/bin/busybox")
+    );
+
+    // /etc/os-release
+    assert_eq!(
+        std::fs::read(dest_rootfs.join("etc/os-release")).unwrap(),
+        os_content
+    );
+
+    // /etc/hosts removed by whiteout
+    assert!(!dest_rootfs.join("etc/hosts").exists());
+
+    // /var/cache/apk/old_index removed by opaque whiteout
+    assert!(!dest_rootfs.join("var/cache/apk/old_index").exists());
+
+    // /var/cache/apk/new_index present
+    assert_eq!(
+        std::fs::read(dest_rootfs.join("var/cache/apk/new_index")).unwrap(),
+        b"new_index"
+    );
+
+    // Hard link /usr/bin/busybox shares inode with /bin/busybox
+    let bb_meta = std::fs::metadata(dest_rootfs.join("bin/busybox")).unwrap();
+    let hl_meta = std::fs::metadata(dest_rootfs.join("usr/bin/busybox")).unwrap();
+    assert_eq!(bb_meta.ino(), hl_meta.ino());
+
+    // /etc/alpine-release
+    assert_eq!(
+        std::fs::read(dest_rootfs.join("etc/alpine-release")).unwrap(),
+        b"3.20.0"
+    );
+}

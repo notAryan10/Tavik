@@ -7,3 +7,13 @@ pub struct Layer {
     pub blob_path: PathBuf,
     pub size: u64,
 }
+
+impl Layer {
+    pub fn new(digest: impl Into<String>, blob_path: impl Into<PathBuf>, size: u64) -> Self {
+        Self {
+            digest: digest.into(),
+            blob_path: blob_path.into(),
+            size,
+        }
+    }
+}

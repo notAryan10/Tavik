@@ -25,6 +25,16 @@ pub enum ImageError {
     #[error("Unsupported archive compression format")]
     UnsupportedCompression,
 
+    #[error("Destination rootfs already exists: '{0}'")]
+    DestinationAlreadyExists(PathBuf),
+
+    #[error("Blob size mismatch for '{path}': expected {expected} bytes, found {actual} bytes")]
+    BlobSizeMismatch {
+        path: PathBuf,
+        expected: u64,
+        actual: u64,
+    },
+
     #[error("Corrupt archive data: {0}")]
     CorruptArchive(String),
 

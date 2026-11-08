@@ -454,44 +454,238 @@ async fn test_create_bundle_command_override_behavior() {
 
 #[tokio::test]
 async fn test_executable_path_resolution_in_rootfs() {
-    let arch = detect_host_arch();
-    let setup = setup_test_image(arch, "linux", None, None, None, None).await;
-    let bundle_dir = setup._temp.path().join("bundle_path_res");
-    let rootfs_dir = bundle_dir.join("rootfs");
+    let temp = tempdir().unwrap();
+    let rootfs_dir = temp.path().join("rootfs");
+    let bin_dir = rootfs_dir.join("bin");
+    let local_bin = rootfs_dir.join("usr/local/bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&local_bin).unwrap();
 
-    let (record, _) = setup
-        .service
-        .load_image_config(&setup.reference)
-        .await
-        .unwrap();
-    setup.service.assemble_rootfs(&record, &rootfs_dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
 
-    let env = vec!["PATH=/usr/bin:/bin".to_string()];
+        // 1. First PATH entry /usr/local/bin contains a directory named "app_tool"
+        let app_dir = local_bin.join("app_tool");
+        std::fs::create_dir(&app_dir).unwrap();
 
-    // Unqualified "sh" resolves to "/bin/sh" inside rootfs
-    let resolved = ImageService::resolve_executable_path(&rootfs_dir, "sh", &env).unwrap();
-    assert_eq!(resolved, "/bin/sh");
+        // 2. Second PATH entry /bin contains the actual executable "app_tool"
+        let app_exec = bin_dir.join("app_tool");
+        std::fs::write(&app_exec, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&app_exec, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    // Explicit path "/bin/sh" preserved as-is
-    let explicit = ImageService::resolve_executable_path(&rootfs_dir, "/bin/sh", &env).unwrap();
-    assert_eq!(explicit, "/bin/sh");
+        // 3. First PATH entry contains a non-executable file "script_tool" (mode 0644)
+        let non_exec = local_bin.join("script_tool");
+        std::fs::write(&non_exec, b"non-executable").unwrap();
+        std::fs::set_permissions(&non_exec, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-    // Command not found in rootfs PATH preserves original name
-    let unknown = ImageService::resolve_executable_path(&rootfs_dir, "unknown_tool", &env).unwrap();
-    assert_eq!(unknown, "unknown_tool");
+        // Second PATH entry contains the executable "script_tool" (mode 0755)
+        let exec_script = bin_dir.join("script_tool");
+        std::fs::write(&exec_script, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&exec_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // 4. In-rootfs symlink: /usr/local/bin/sym_tool -> /bin/app_tool
+        let sym_tool = local_bin.join("sym_tool");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/bin/app_tool", &sym_tool).unwrap();
+
+        let env = vec!["PATH=/usr/local/bin:/bin".to_string()];
+
+        // App tool: first candidate is directory -> skips it -> selects /bin/app_tool!
+        let res_app = ImageService::resolve_executable_path(&rootfs_dir, "app_tool", &env).unwrap();
+        assert_eq!(res_app, "/bin/app_tool");
+
+        // Script tool: first candidate is non-executable file -> skips it -> selects /bin/script_tool!
+        let res_script =
+            ImageService::resolve_executable_path(&rootfs_dir, "script_tool", &env).unwrap();
+        assert_eq!(res_script, "/bin/script_tool");
+
+        // Symlink tool: resolves through in-rootfs symlink!
+        let res_sym = ImageService::resolve_executable_path(&rootfs_dir, "sym_tool", &env).unwrap();
+        assert_eq!(res_sym, "/usr/local/bin/sym_tool");
+
+        // Command not found preserves original command name
+        let res_missing =
+            ImageService::resolve_executable_path(&rootfs_dir, "nonexistent", &env).unwrap();
+        assert_eq!(res_missing, "nonexistent");
+
+        // Explicit relative path preserved as-is
+        let res_rel = ImageService::resolve_executable_path(&rootfs_dir, "./my_cmd", &env).unwrap();
+        assert_eq!(res_rel, "./my_cmd");
+    }
 }
 
 #[tokio::test]
 async fn test_stop_signal_parsing() {
-    assert_eq!(parse_signal("SIGTERM"), 15);
-    assert_eq!(parse_signal("15"), 15);
-    assert_eq!(parse_signal("SIGKILL"), 9);
-    assert_eq!(parse_signal("9"), 9);
-    assert_eq!(parse_signal("SIGINT"), 2);
-    assert_eq!(parse_signal("SIGQUIT"), 3);
-    assert_eq!(parse_signal("SIGUSR1"), 10);
-    assert_eq!(parse_signal("SIGUSR2"), 12);
-    assert_eq!(parse_signal("UNKNOWN"), 15); // Fallback to 15 (SIGTERM)
+    // Valid signals (symbolic with/without SIG prefix, and numeric)
+    assert_eq!(parse_signal("SIGTERM").unwrap(), 15);
+    assert_eq!(parse_signal("TERM").unwrap(), 15);
+    assert_eq!(parse_signal("SIGKILL").unwrap(), 9);
+    assert_eq!(parse_signal("KILL").unwrap(), 9);
+    assert_eq!(parse_signal("SIGINT").unwrap(), 2);
+    assert_eq!(parse_signal("INT").unwrap(), 2);
+    assert_eq!(parse_signal("SIGQUIT").unwrap(), 3);
+    assert_eq!(parse_signal("SIGHUP").unwrap(), 1);
+    assert_eq!(parse_signal("SIGUSR1").unwrap(), 10);
+    assert_eq!(parse_signal("SIGUSR2").unwrap(), 12);
+    assert_eq!(parse_signal("SIGSTOP").unwrap(), 19);
+    assert_eq!(parse_signal("SIGCONT").unwrap(), 18);
+    assert_eq!(parse_signal("15").unwrap(), 15);
+    assert_eq!(parse_signal("9").unwrap(), 9);
+    assert_eq!(parse_signal("2").unwrap(), 2);
+    assert_eq!(parse_signal("1").unwrap(), 1);
+    assert_eq!(parse_signal("31").unwrap(), 31);
+    assert_eq!(parse_signal("64").unwrap(), 64);
+
+    // Invalid signals: unknown names, zero, negative, out of range, empty
+    assert!(parse_signal("UNKNOWN").is_err());
+    assert!(parse_signal("SIGINVALID").is_err());
+    assert!(parse_signal("0").is_err());
+    assert!(parse_signal("-1").is_err());
+    assert!(parse_signal("-15").is_err());
+    assert!(parse_signal("65").is_err());
+    assert!(parse_signal("100").is_err());
+    assert!(parse_signal("").is_err());
+    assert!(parse_signal("   ").is_err());
+}
+
+#[tokio::test]
+async fn test_config_blob_digest_corruption_detected() {
+    let arch = detect_host_arch();
+    let setup = setup_test_image(arch, "linux", None, None, None, None).await;
+
+    // Mutate the configuration blob in CAS store
+    let config_path = setup._store.blob_path(&setup.config_digest).unwrap();
+    let mut config_bytes = std::fs::read(&config_path).unwrap();
+    if let Some(last) = config_bytes.last_mut() {
+        *last ^= 0xFF;
+    }
+    std::fs::write(&config_path, &config_bytes).unwrap();
+
+    let err = setup
+        .service
+        .load_image_config(&setup.reference)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            err,
+            ImageServiceError::ConfigDigestMismatch {
+                ref expected,
+                ref actual
+            } if expected == &setup.config_digest && actual != expected
+        ),
+        "Expected ConfigDigestMismatch, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_create_and_run_container_enforces_diff_id_verification() {
+    let arch = detect_host_arch();
+    let setup = setup_test_image(arch, "linux", None, None, None, None).await;
+
+    // Modify image config diff_ids to cause mismatch
+    let corrupt_diff_id =
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string();
+    let config_json = serde_json::json!({
+        "architecture": arch,
+        "os": "linux",
+        "rootfs": {
+            "type": "layers",
+            "diff_ids": [corrupt_diff_id]
+        },
+        "config": {
+            "Entrypoint": ["/bin/sh"],
+            "Cmd": ["-c", "echo test"]
+        }
+    });
+
+    let config_bytes = serde_json::to_vec(&config_json).unwrap();
+    let (config_digest, _, _) = setup
+        ._store
+        .ingest_bytes(&config_bytes, None)
+        .await
+        .unwrap();
+
+    let record = ImageRecord {
+        reference: "mismatched-diffid:1.0".to_string(),
+        manifest_digest: "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+            .to_string(),
+        config_digest,
+        layer_digests: vec![setup._layer_digest.clone()],
+        size: 100,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    setup._store.metadata().save_image(record).await.unwrap();
+
+    let state_dir = setup._temp.path().join("state");
+    let executor = tavik_runtime::ContainerExecutor::new(state_dir).unwrap();
+    let bundle_dir = setup._temp.path().join("bundle_diffid_fail");
+
+    let err = setup
+        .service
+        .create_and_run_container(
+            &executor,
+            "cont-diff-fail",
+            "mismatched-diffid:1.0",
+            &bundle_dir,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, ImageServiceError::DiffIdMismatch { index: 0, .. }),
+        "Expected DiffIdMismatch, got: {err:?}"
+    );
+
+    // Verify bundle directory was not created or was cleaned up
+    assert!(!bundle_dir.exists());
+}
+
+#[tokio::test]
+async fn test_bundle_atomic_publication_and_existing_sentinel() {
+    let arch = detect_host_arch();
+    let setup = setup_test_image(arch, "linux", None, None, None, None).await;
+
+    let dest_bundle = setup._temp.path().join("preexisting_bundle");
+    std::fs::create_dir_all(&dest_bundle).unwrap();
+    let sentinel_file = dest_bundle.join("sentinel.txt");
+    std::fs::write(&sentinel_file, b"precious_data").unwrap();
+
+    // Attempt create_bundle onto pre-existing directory must fail
+    let err = setup
+        .service
+        .create_bundle(&setup.reference, &dest_bundle, None, false)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, ImageServiceError::DestinationAlreadyExists(ref p) if p == &dest_bundle),
+        "Expected DestinationAlreadyExists, got: {err:?}"
+    );
+
+    // Sentinel file must be completely untouched!
+    assert!(sentinel_file.exists());
+    assert_eq!(std::fs::read(&sentinel_file).unwrap(), b"precious_data");
+
+    // Failure during config resolution leaves no partial destination
+    let fail_bundle = setup._temp.path().join("fail_bundle_no_dest");
+    let bad_overrides = ImageConfigOverrides {
+        entrypoint: Some(vec![]),
+        command: Some(vec![]),
+        ..Default::default()
+    };
+    let err2 = setup
+        .service
+        .create_bundle(&setup.reference, &fail_bundle, Some(&bad_overrides), false)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err2, ImageServiceError::Image(_)));
+    assert!(!fail_bundle.exists(), "No partial destination should exist");
 }
 
 #[tokio::test]
@@ -552,12 +746,16 @@ async fn test_create_and_run_container_linux_e2e() {
         let store = Arc::new(ContentStore::new(temp.path().join("store")).await.unwrap());
         let service = ImageService::new(store.clone());
 
-        let dev_null = b"";
         let (layer_bytes, diff_id) = create_tar_gz_layer(&[
             ("bin/busybox", &busybox_bytes, 0o755),
-            ("dev/null", dev_null, 0o666),
-            ("etc/passwd", b"root:x:0:0:root:/root:/bin/sh\n", 0o644),
-            ("etc/group", b"root:x:0:\n", 0o644),
+            ("app/run.sh", b"#!/bin/busybox sh\necho test\n", 0o755),
+            ("dev/null", b"", 0o666),
+            ("etc/passwd", b"user:x:1001:2001:User:/app:/bin/sh\n", 0o644),
+            (
+                "etc/group",
+                b"group:x:2001:\nsubgroup1:x:3001:user\nsubgroup2:x:3002:user\n",
+                0o644,
+            ),
         ]);
 
         let (layer_digest, layer_size, _) = store
@@ -573,8 +771,11 @@ async fn test_create_and_run_container_linux_e2e() {
                 "diff_ids": [diff_id]
             },
             "config": {
-                "Entrypoint": ["/bin/busybox", "sh", "-c"],
-                "Cmd": ["echo running_from_image > /test.out && sleep 10"],
+                "User": "user",
+                "WorkingDir": "/app",
+                "Env": ["PATH=/nonexistent:/bin"],
+                "Entrypoint": ["busybox", "sh", "-c"],
+                "Cmd": ["busybox id -u > /uid.out && busybox id -g > /gid.out && busybox id -G > /gids.out && busybox pwd > /cwd.out && sleep 10"],
                 "StopSignal": "SIGTERM"
             }
         });
@@ -616,16 +817,34 @@ async fn test_create_and_run_container_linux_e2e() {
         );
         assert!(running_state.pid.is_some());
 
-        // Wait a brief moment for container to execute echo
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // Wait a brief moment for container to execute id and pwd commands
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
-        let out_file = bundle_dir.join("rootfs").join("test.out");
-        assert!(
-            out_file.exists(),
-            "Expected /test.out to exist inside container rootfs"
+        let rootfs = bundle_dir.join("rootfs");
+        let uid_out = std::fs::read_to_string(rootfs.join("uid.out")).expect("uid.out must exist");
+        let gid_out = std::fs::read_to_string(rootfs.join("gid.out")).expect("gid.out must exist");
+        let gids_out =
+            std::fs::read_to_string(rootfs.join("gids.out")).expect("gids.out must exist");
+        let cwd_out = std::fs::read_to_string(rootfs.join("cwd.out")).expect("cwd.out must exist");
+
+        // Verify container UID and GID match resolved user
+        assert_eq!(uid_out.trim(), "1001", "Expected UID 1001");
+        assert_eq!(gid_out.trim(), "2001", "Expected GID 2001");
+
+        // Verify supplementary groups contain 2001, 3001, 3002 and NO host groups
+        let groups: Vec<&str> = gids_out.split_whitespace().collect();
+        assert!(groups.contains(&"2001"));
+        assert!(groups.contains(&"3001"));
+        assert!(groups.contains(&"3002"));
+        assert_eq!(
+            groups.len(),
+            3,
+            "Expected exactly 3 groups in container: {:?}",
+            groups
         );
-        let content = std::fs::read_to_string(&out_file).unwrap();
-        assert_eq!(content.trim(), "running_from_image");
+
+        // Verify working directory
+        assert_eq!(cwd_out.trim(), "/app", "Expected CWD /app");
 
         // Stop container using its configured stop signal
         service
@@ -642,5 +861,83 @@ async fn test_create_and_run_container_linux_e2e() {
         );
 
         executor.delete(container_id, false).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn test_invalid_working_directory_fails_linux() {
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping rootful container execution test (requires root)");
+            return;
+        }
+
+        let busybox_path = if std::path::Path::new("/usr/bin/busybox").exists() {
+            "/usr/bin/busybox"
+        } else if std::path::Path::new("/bin/busybox").exists() {
+            "/bin/busybox"
+        } else {
+            return;
+        };
+
+        let busybox_bytes = std::fs::read(busybox_path).unwrap();
+        let arch = detect_host_arch();
+        let temp = tempdir().unwrap();
+        let store = Arc::new(ContentStore::new(temp.path().join("store")).await.unwrap());
+        let service = ImageService::new(store.clone());
+
+        let (layer_bytes, diff_id) = create_tar_gz_layer(&[
+            ("bin/busybox", &busybox_bytes, 0o755),
+            ("dev/null", b"", 0o666),
+            ("etc/passwd", b"root:x:0:0:root:/root:/bin/sh\n", 0o644),
+            ("etc/group", b"root:x:0:\n", 0o644),
+        ]);
+
+        let (layer_digest, layer_size, _) = store.ingest_bytes(&layer_bytes, None).await.unwrap();
+
+        let config_json = serde_json::json!({
+            "architecture": arch,
+            "os": "linux",
+            "rootfs": {
+                "type": "layers",
+                "diff_ids": [diff_id]
+            },
+            "config": {
+                "WorkingDir": "/nonexistent_invalid_cwd",
+                "Entrypoint": ["/bin/busybox", "sh", "-c"],
+                "Cmd": ["echo ok"]
+            }
+        });
+
+        let config_bytes = serde_json::to_vec(&config_json).unwrap();
+        let (config_digest, _, _) = store.ingest_bytes(&config_bytes, None).await.unwrap();
+
+        let reference = "invalid-cwd-image:1.0".to_string();
+        let record = ImageRecord {
+            reference: reference.clone(),
+            manifest_digest:
+                "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+                    .to_string(),
+            config_digest,
+            layer_digests: vec![layer_digest],
+            size: layer_size,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        store.metadata().save_image(record).await.unwrap();
+
+        let state_dir = temp.path().join("state");
+        let executor = tavik_runtime::ContainerExecutor::new(state_dir).unwrap();
+        let bundle_dir = temp.path().join("bundle_bad_cwd");
+
+        let err = service
+            .create_and_run_container(&executor, "bad-cwd-cont", &reference, &bundle_dir, None)
+            .await
+            .unwrap_err();
+
+        // Must fail closed due to invalid CWD during init
+        assert!(matches!(err, ImageServiceError::Runtime(_)));
     }
 }

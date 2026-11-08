@@ -9,7 +9,6 @@ use tavik_image::archive::ArchiveReader;
 use tavik_image::config::{
     EffectiveImageConfig, ImageConfigOverrides, ImageConfiguration, ImageVolume,
 };
-use tavik_image::filesystem::SafeDir;
 use tavik_image::layer::Layer;
 use tavik_image::unpacker::RootfsBuilder;
 use tavik_image::user::{resolve_user, ResolvedUser};
@@ -46,6 +45,15 @@ pub enum ImageServiceError {
         layer_count: usize,
         diff_id_count: usize,
     },
+
+    #[error("Destination bundle directory already exists: '{0}'")]
+    DestinationAlreadyExists(PathBuf),
+
+    #[error("Configuration blob digest mismatch: expected '{expected}', got actual '{actual}'")]
+    ConfigDigestMismatch { expected: String, actual: String },
+
+    #[error("Invalid signal '{0}': {1}")]
+    InvalidSignal(String, String),
 
     #[error("Store error: {0}")]
     Store(#[from] StoreError),
@@ -112,6 +120,18 @@ impl ImageService {
         );
 
         let config_bytes = self.store.read_blob(&record.config_digest).await?;
+
+        // Verify configuration blob integrity against record.config_digest
+        let mut hasher = Sha256::new();
+        hasher.update(&config_bytes);
+        let actual_digest = format!("sha256:{}", hex::encode(hasher.finalize()));
+        if !actual_digest.eq_ignore_ascii_case(&record.config_digest) {
+            return Err(ImageServiceError::ConfigDigestMismatch {
+                expected: record.config_digest.clone(),
+                actual: actual_digest,
+            });
+        }
+
         let config = ImageConfiguration::from_bytes(&config_bytes)?;
         config.validate()?;
 
@@ -255,26 +275,59 @@ impl ImageService {
             .find_map(|e| e.strip_prefix("PATH="))
             .unwrap_or("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
 
-        let safe_dir = SafeDir::open_rootfs(rootfs_path)?;
-
         for dir in path_var.split(':') {
             if dir.is_empty() {
                 continue;
             }
             let rel_dir = dir.trim_start_matches('/');
-            let candidate_rel = Path::new(rel_dir).join(command);
+            let candidate_path = rootfs_path.join(rel_dir).join(command);
 
-            if let Ok(true) = safe_dir.exists_at(&candidate_rel) {
-                let resolved = format!("{}/{}", dir.trim_end_matches('/'), command);
-                debug!(
-                    "Resolved container executable '{}' along container PATH to '{}'",
-                    command, resolved
-                );
-                return Ok(resolved);
+            // Follow symlink safely within rootfs if candidate is a symlink
+            let target_path = if candidate_path.is_symlink() {
+                match fs::read_link(&candidate_path) {
+                    Ok(link_target) => {
+                        if link_target.is_absolute() {
+                            rootfs_path.join(link_target.strip_prefix("/").unwrap_or(&link_target))
+                        } else {
+                            candidate_path
+                                .parent()
+                                .unwrap_or(rootfs_path)
+                                .join(link_target)
+                        }
+                    }
+                    Err(_) => continue,
+                }
+            } else {
+                candidate_path.clone()
+            };
+
+            // Inspect metadata
+            match fs::metadata(&target_path) {
+                Ok(meta) => {
+                    // Reject directories
+                    if meta.is_dir() {
+                        continue;
+                    }
+                    // Reject non-executable files
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if meta.permissions().mode() & 0o111 == 0 {
+                            continue;
+                        }
+                    }
+                    let resolved = format!("{}/{}", dir.trim_end_matches('/'), command);
+                    debug!(
+                        "Resolved container executable '{}' along container PATH to '{}'",
+                        command, resolved
+                    );
+                    return Ok(resolved);
+                }
+                Err(_) => continue,
             }
         }
 
-        // Fall back to original command name if not found in rootfs PATH
+        // Return original command name so runtime init can perform in-container evaluation
         Ok(command.to_string())
     }
 
@@ -368,71 +421,57 @@ impl ImageService {
         overrides: Option<&ImageConfigOverrides>,
         verify_diff_ids: bool,
     ) -> Result<BundleInfo, ImageServiceError> {
+        if dest_bundle_dir.exists() {
+            return Err(ImageServiceError::DestinationAlreadyExists(
+                dest_bundle_dir.to_path_buf(),
+            ));
+        }
+
         let (record, config) = self.load_image_config(reference).await?;
 
         if verify_diff_ids {
             self.verify_layer_diff_ids(&record, &config)?;
         }
 
-        fs::create_dir_all(dest_bundle_dir)?;
+        let parent = dest_bundle_dir.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
 
-        let rootfs_dir = dest_bundle_dir.join("rootfs");
-        if let Err(e) = self.assemble_rootfs(&record, &rootfs_dir) {
-            // Clean up bundle directory on rootfs assembly failure
-            let _ = fs::remove_dir_all(dest_bundle_dir);
-            return Err(e);
-        }
+        let dest_name = dest_bundle_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("bundle");
+        let staging_dir = parent.join(format!(
+            ".tmp-bundle-{}-{}",
+            dest_name,
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&staging_dir)?;
+        let mut staging_guard = StagingGuard::new(staging_dir.clone());
+
+        let rootfs_dir = staging_dir.join("rootfs");
+        self.assemble_rootfs(&record, &rootfs_dir)?;
 
         let default_overrides = ImageConfigOverrides::default();
-        let effective = match config.resolve(overrides.unwrap_or(&default_overrides)) {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = fs::remove_dir_all(dest_bundle_dir);
-                return Err(ImageServiceError::Image(e));
-            }
-        };
+        let effective = config.resolve(overrides.unwrap_or(&default_overrides))?;
 
-        let user = match resolve_user(&rootfs_dir, effective.user.as_deref()) {
-            Ok(u) => u,
-            Err(e) => {
-                let _ = fs::remove_dir_all(dest_bundle_dir);
-                return Err(ImageServiceError::Image(e));
-            }
-        };
+        let user = resolve_user(&rootfs_dir, effective.user.as_deref())?;
+        let volumes = config.declared_volumes()?;
 
-        let volumes = match config.declared_volumes() {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = fs::remove_dir_all(dest_bundle_dir);
-                return Err(ImageServiceError::Image(e));
-            }
-        };
+        // Validate stop signal
+        let _ = parse_signal(&effective.stop_signal)?;
 
-        let spec = match self.build_spec(&config, &effective, &user, &volumes, &rootfs_dir) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = fs::remove_dir_all(dest_bundle_dir);
-                return Err(e);
-            }
-        };
+        let spec = self.build_spec(&config, &effective, &user, &volumes, &rootfs_dir)?;
 
-        // Write config.json atomically
-        let config_json_path = dest_bundle_dir.join("config.json");
-        let tmp_config_path = dest_bundle_dir.join("config.json.tmp");
+        let config_json_path = staging_dir.join("config.json");
         let spec_data = serde_json::to_vec_pretty(&spec).map_err(|e| {
-            let _ = fs::remove_dir_all(dest_bundle_dir);
             ImageServiceError::Config(format!("Failed to serialize OCI config.json: {}", e))
         })?;
 
-        if let Err(e) = fs::write(&tmp_config_path, &spec_data) {
-            let _ = fs::remove_dir_all(dest_bundle_dir);
-            return Err(ImageServiceError::Io(e));
-        }
+        fs::write(&config_json_path, &spec_data)?;
 
-        if let Err(e) = fs::rename(&tmp_config_path, &config_json_path) {
-            let _ = fs::remove_dir_all(dest_bundle_dir);
-            return Err(ImageServiceError::Io(e));
-        }
+        // Atomic publish using no-replace rename
+        atomic_rename_noreplace(&staging_dir, dest_bundle_dir)?;
+        staging_guard.disarm();
 
         let stop_signal = effective.stop_signal.clone();
 
@@ -444,7 +483,7 @@ impl ImageService {
 
         Ok(BundleInfo {
             bundle_dir: dest_bundle_dir.to_path_buf(),
-            rootfs_dir,
+            rootfs_dir: dest_bundle_dir.join("rootfs"),
             spec,
             image_record: record,
             image_config: config,
@@ -465,7 +504,7 @@ impl ImageService {
         overrides: Option<&ImageConfigOverrides>,
     ) -> Result<ContainerState, ImageServiceError> {
         let bundle_info = self
-            .create_bundle(reference, bundle_dir, overrides, false)
+            .create_bundle(reference, bundle_dir, overrides, true)
             .await?;
         let _state = executor.create(container_id, &bundle_info.bundle_dir)?;
         let running_state = executor.start(container_id)?;
@@ -486,25 +525,160 @@ impl ImageService {
             .map(|s| s.as_str())
             .unwrap_or("SIGTERM");
 
-        let signal_num = parse_signal(signal_str);
+        let signal_num = parse_signal(signal_str)?;
         executor.kill(container_id, signal_num)?;
         Ok(())
     }
 }
 
-pub fn parse_signal(sig: &str) -> i32 {
-    match sig.to_uppercase().as_str() {
-        "SIGTERM" | "15" => 15,
-        "SIGKILL" | "9" => 9,
-        "SIGINT" | "2" => 2,
-        "SIGHUP" | "1" => 1,
-        "SIGQUIT" | "3" => 3,
-        "SIGSTOP" | "19" => 19,
-        "SIGCONT" | "18" => 18,
-        "SIGUSR1" | "10" => 10,
-        "SIGUSR2" | "12" => 12,
-        other => other.parse::<i32>().unwrap_or(15),
+struct StagingGuard {
+    path: Option<PathBuf>,
+}
+
+impl StagingGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
     }
+
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        if let Some(ref path) = self.path {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
+
+fn atomic_rename_noreplace(src: &Path, dst: &Path) -> Result<(), ImageServiceError> {
+    if dst.exists() {
+        return Err(ImageServiceError::DestinationAlreadyExists(
+            dst.to_path_buf(),
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let c_src = CString::new(src.as_os_str().as_bytes())
+            .map_err(|e| ImageServiceError::Config(format!("Invalid path for rename: {}", e)))?;
+        let c_dst = CString::new(dst.as_os_str().as_bytes())
+            .map_err(|e| ImageServiceError::Config(format!("Invalid path for rename: {}", e)))?;
+
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                c_src.as_ptr(),
+                libc::AT_FDCWD,
+                c_dst.as_ptr(),
+                1u32, // RENAME_NOREPLACE
+            )
+        };
+
+        if ret == 0 {
+            return Ok(());
+        }
+
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EEXIST) {
+            return Err(ImageServiceError::DestinationAlreadyExists(
+                dst.to_path_buf(),
+            ));
+        }
+        if err.raw_os_error() == Some(libc::ENOSYS) || err.raw_os_error() == Some(libc::EINVAL) {
+            return fs::rename(src, dst).map_err(ImageServiceError::Io);
+        }
+        return Err(ImageServiceError::Io(err));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        if dst.exists() {
+            return Err(ImageServiceError::DestinationAlreadyExists(
+                dst.to_path_buf(),
+            ));
+        }
+        fs::rename(src, dst).map_err(ImageServiceError::Io)
+    }
+}
+
+pub fn parse_signal(sig: &str) -> Result<i32, ImageServiceError> {
+    let trimmed = sig.trim();
+    if trimmed.is_empty() {
+        return Err(ImageServiceError::InvalidSignal(
+            sig.to_string(),
+            "Signal cannot be empty".to_string(),
+        ));
+    }
+
+    // Check if numeric
+    if let Ok(num) = trimmed.parse::<i64>() {
+        if num <= 0 {
+            return Err(ImageServiceError::InvalidSignal(
+                sig.to_string(),
+                format!("Signal number must be positive (1..=64), got {num}"),
+            ));
+        }
+        if num > 64 {
+            return Err(ImageServiceError::InvalidSignal(
+                sig.to_string(),
+                format!("Signal number {num} exceeds maximum supported signal (64)"),
+            ));
+        }
+        return Ok(num as i32);
+    }
+
+    // Symbolic signal
+    let normalized = trimmed.to_ascii_uppercase();
+    let name = normalized.strip_prefix("SIG").unwrap_or(&normalized);
+
+    let signum = match name {
+        "HUP" => 1,
+        "INT" => 2,
+        "QUIT" => 3,
+        "ILL" => 4,
+        "TRAP" => 5,
+        "ABRT" | "IOT" => 6,
+        "BUS" => 7,
+        "FPE" => 8,
+        "KILL" => 9,
+        "USR1" => 10,
+        "SEGV" => 11,
+        "USR2" => 12,
+        "PIPE" => 13,
+        "ALRM" => 14,
+        "TERM" => 15,
+        "STKFLT" => 16,
+        "CHLD" => 17,
+        "CONT" => 18,
+        "STOP" => 19,
+        "TSTP" => 20,
+        "TTIN" => 21,
+        "TTOU" => 22,
+        "URG" => 23,
+        "XCPU" => 24,
+        "XFSZ" => 25,
+        "VTALRM" => 26,
+        "PROF" => 27,
+        "WINCH" => 28,
+        "IO" | "POLL" => 29,
+        "PWR" => 30,
+        "SYS" => 31,
+        unknown => {
+            return Err(ImageServiceError::InvalidSignal(
+                sig.to_string(),
+                format!("Unknown signal name: '{unknown}'"),
+            ));
+        }
+    };
+
+    Ok(signum)
 }
 
 fn default_caps() -> Vec<String> {

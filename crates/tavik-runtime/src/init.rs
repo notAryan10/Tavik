@@ -332,9 +332,14 @@ fn run_container_init_child(
         .as_ref()
         .ok_or_else(|| TavikError::Config("Spec missing process definition".to_string()))?;
 
-    let c_cwd = CString::new(proc.cwd.as_str()).unwrap_or_else(|_| slash.clone());
-    unsafe {
-        libc::chdir(c_cwd.as_ptr());
+    let c_cwd = CString::new(proc.cwd.as_str())
+        .map_err(|e| TavikError::Config(format!("Invalid working directory path: {}", e)))?;
+    if unsafe { libc::chdir(c_cwd.as_ptr()) } != 0 {
+        return Err(TavikError::Execution(format!(
+            "Failed to change working directory to '{}': {}",
+            proc.cwd,
+            std::io::Error::last_os_error()
+        )));
     }
 
     // 8. Signal readiness to trampoline
@@ -398,20 +403,25 @@ fn run_container_init_child(
         }
     }
 
-    if !proc.user.additional_gids.is_empty() {
-        let gids: Vec<libc::gid_t> = proc
-            .user
-            .additional_gids
-            .iter()
-            .map(|&g| g as libc::gid_t)
-            .collect();
-        let setgroups_res = unsafe { libc::setgroups(gids.len(), gids.as_ptr()) };
-        if setgroups_res != 0 {
-            return Err(TavikError::Execution(format!(
-                "Failed to set supplementary groups: {}",
-                std::io::Error::last_os_error()
-            )));
+    // Set container supplementary groups (must exactly match additional_gids; empty clears inherited groups)
+    let gids: Vec<libc::gid_t> = proc
+        .user
+        .additional_gids
+        .iter()
+        .map(|&g| g as libc::gid_t)
+        .collect();
+    let setgroups_res = unsafe {
+        if gids.is_empty() {
+            libc::setgroups(0, std::ptr::null())
+        } else {
+            libc::setgroups(gids.len(), gids.as_ptr())
         }
+    };
+    if setgroups_res != 0 {
+        return Err(TavikError::Execution(format!(
+            "Failed to set supplementary groups: {}",
+            std::io::Error::last_os_error()
+        )));
     }
 
     if proc.user.gid > 0 {
@@ -451,14 +461,105 @@ fn run_container_init_child(
         }
     }
 
-    // 14. Security: PR_SET_NO_NEW_PRIVS barrier
+    // 15. Security: PR_SET_NO_NEW_PRIVS barrier
     if proc.no_new_privileges {
         tavik_security::ensure_no_new_privs().map_err(|e| {
             TavikError::Execution(format!("Failed to set PR_SET_NO_NEW_PRIVS: {}", e))
         })?;
     }
 
-    // 15. Security: Seccomp BPF filter
+    // 16. Resolve executable command inside pivoted rootfs using container credentials BEFORE seccomp
+    let raw_cmd = proc
+        .args
+        .first()
+        .ok_or_else(|| TavikError::Config("Spec missing process arguments".to_string()))?;
+
+    if raw_cmd.is_empty() {
+        return Err(TavikError::Config(
+            "Executable command in argv[0] cannot be empty".to_string(),
+        ));
+    }
+
+    let executable_c = if raw_cmd.contains('/') {
+        let c_path = CString::new(raw_cmd.as_str())
+            .map_err(|e| TavikError::Config(format!("Command contains null byte: {}", e)))?;
+
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::stat(c_path.as_ptr(), &mut st) } != 0 {
+            return Err(TavikError::Execution(format!(
+                "Executable '{}' not found: {}",
+                raw_cmd,
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        if (st.st_mode & libc::S_IFMT) == libc::S_IFDIR {
+            return Err(TavikError::Execution(format!(
+                "Executable '{}' is a directory",
+                raw_cmd
+            )));
+        }
+
+        if unsafe { libc::access(c_path.as_ptr(), libc::X_OK) } != 0 {
+            return Err(TavikError::Execution(format!(
+                "Executable '{}' is not executable: {}",
+                raw_cmd,
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        c_path
+    } else {
+        let container_path = proc
+            .env
+            .iter()
+            .find_map(|e| e.strip_prefix("PATH="))
+            .unwrap_or("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+
+        let mut found = None;
+        for dir in container_path.split(':') {
+            if dir.is_empty() {
+                continue;
+            }
+            let candidate = std::path::Path::new(dir).join(raw_cmd);
+            let candidate_str = match candidate.to_str() {
+                Some(s) => s,
+                None => continue,
+            };
+            let c_cand = match CString::new(candidate_str) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // stat follows in-rootfs symlinks inside pivoted rootfs
+            if unsafe { libc::stat(c_cand.as_ptr(), &mut st) } != 0 {
+                continue;
+            }
+
+            // Reject directories
+            if (st.st_mode & libc::S_IFMT) == libc::S_IFDIR {
+                continue;
+            }
+
+            // Reject non-executable files under container credentials
+            if unsafe { libc::access(c_cand.as_ptr(), libc::X_OK) } != 0 {
+                continue;
+            }
+
+            found = Some(c_cand);
+            break;
+        }
+
+        found.ok_or_else(|| {
+            TavikError::Execution(format!(
+                "Executable '{}' not found in container PATH '{}'",
+                raw_cmd, container_path
+            ))
+        })?
+    };
+
+    // 17. Security: Seccomp BPF filter
     // Applied as the FINAL security gate immediately before execve so all prior setup calls succeed
     if let Some(linux) = &spec.linux {
         if let Some(seccomp_profile) = &linux.seccomp {
@@ -468,7 +569,7 @@ fn run_container_init_child(
         }
     }
 
-    // 15. execve entrypoint
+    // 18. execve entrypoint
     let c_args: Vec<CString> = proc
         .args
         .iter()
@@ -484,34 +585,6 @@ fn run_container_init_child(
         .collect();
     let mut c_envs_ptrs: Vec<*const libc::c_char> = c_envs.iter().map(|s| s.as_ptr()).collect();
     c_envs_ptrs.push(std::ptr::null());
-
-    // Resolve binary path along the container's PATH if args[0] does not contain '/'
-    // We are already inside the container rootfs post-pivot_root, so access checks
-    // exclusively inspect the container filesystem and never touch host executables.
-    let executable_c = if !proc.args[0].contains('/') {
-        let container_path = proc
-            .env
-            .iter()
-            .find_map(|e| e.strip_prefix("PATH="))
-            .unwrap_or("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
-
-        let mut found_path = None;
-        for dir in container_path.split(':') {
-            if dir.is_empty() {
-                continue;
-            }
-            let candidate = std::path::Path::new(dir).join(&proc.args[0]);
-            if let Ok(c_cand) = CString::new(candidate.to_str().unwrap_or("")) {
-                if unsafe { libc::access(c_cand.as_ptr(), libc::X_OK) } == 0 {
-                    found_path = Some(c_cand);
-                    break;
-                }
-            }
-        }
-        found_path.unwrap_or_else(|| c_args[0].clone())
-    } else {
-        c_args[0].clone()
-    };
 
     unsafe {
         libc::execve(

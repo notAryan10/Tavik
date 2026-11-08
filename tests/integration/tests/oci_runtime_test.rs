@@ -730,3 +730,257 @@ fn test_combined_security_hardening() {
         let _ = executor.delete(container_id, true);
     }
 }
+
+#[test]
+fn test_exact_supplementary_group_isolation_empty() {
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping rootful test (requires root)");
+            return;
+        }
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let bundle_dir = temp.path().join("bundle");
+        let rootfs = bundle_dir.join("rootfs");
+        let bin_dir = rootfs.join("bin");
+        let dev_dir = rootfs.join("dev");
+        let tmp_dir = rootfs.join("tmp");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&dev_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let _ = fs::File::create(dev_dir.join("null"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(dev_dir.join("null"), fs::Permissions::from_mode(0o666));
+            let _ = fs::set_permissions(&tmp_dir, fs::Permissions::from_mode(0o777));
+        }
+
+        let busybox_path = if Path::new("/usr/bin/busybox").exists() {
+            "/usr/bin/busybox"
+        } else {
+            "/bin/busybox"
+        };
+        fs::copy(busybox_path, bin_dir.join("busybox")).unwrap();
+
+        let mut spec = Spec::default_linux();
+        if let Some(proc) = &mut spec.process {
+            proc.user = tavik_runtime::spec::User {
+                uid: 1000,
+                gid: 1000,
+                additional_gids: vec![], // Empty additional_gids must clear inherited host groups!
+            };
+            proc.args = vec![
+                "/bin/busybox".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "/bin/busybox id -G > /tmp/id_g.txt; sleep 1".to_string(),
+            ];
+        }
+
+        let config_path = bundle_dir.join("config.json");
+        fs::write(&config_path, serde_json::to_string_pretty(&spec).unwrap()).unwrap();
+
+        let executor = ContainerExecutor::new(state_dir).unwrap();
+        let container_id = "test-empty-supp-groups";
+
+        let _ = executor.create(container_id, &bundle_dir).unwrap();
+        let _ = executor.start(container_id).unwrap();
+
+        let mut id_output = String::new();
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(50));
+            if let Ok(content) = fs::read_to_string(rootfs.join("tmp/id_g.txt")) {
+                let trimmed = content.trim().to_string();
+                if !trimmed.is_empty() {
+                    id_output = trimmed;
+                    break;
+                }
+            }
+        }
+
+        // When additional_gids is empty, only primary GID 1000 must be present
+        let groups: Vec<&str> = id_output.split_whitespace().collect();
+        assert_eq!(
+            groups,
+            vec!["1000"],
+            "Expected only primary GID 1000, no inherited host supplementary groups. Got: {:?}",
+            groups
+        );
+
+        let _ = executor.kill(container_id, 9);
+        let _ = executor.delete(container_id, true);
+    }
+}
+
+#[test]
+fn test_exact_supplementary_group_isolation_multiple() {
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping rootful test (requires root)");
+            return;
+        }
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let bundle_dir = temp.path().join("bundle");
+        let rootfs = bundle_dir.join("rootfs");
+        let bin_dir = rootfs.join("bin");
+        let dev_dir = rootfs.join("dev");
+        let tmp_dir = rootfs.join("tmp");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&dev_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let _ = fs::File::create(dev_dir.join("null"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(dev_dir.join("null"), fs::Permissions::from_mode(0o666));
+            let _ = fs::set_permissions(&tmp_dir, fs::Permissions::from_mode(0o777));
+        }
+
+        let busybox_path = if Path::new("/usr/bin/busybox").exists() {
+            "/usr/bin/busybox"
+        } else {
+            "/bin/busybox"
+        };
+        fs::copy(busybox_path, bin_dir.join("busybox")).unwrap();
+
+        let mut spec = Spec::default_linux();
+        if let Some(proc) = &mut spec.process {
+            proc.user = tavik_runtime::spec::User {
+                uid: 1000,
+                gid: 1000,
+                additional_gids: vec![1001, 1002, 1003],
+            };
+            proc.args = vec![
+                "/bin/busybox".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "/bin/busybox id -G > /tmp/id_g.txt; sleep 1".to_string(),
+            ];
+        }
+
+        let config_path = bundle_dir.join("config.json");
+        fs::write(&config_path, serde_json::to_string_pretty(&spec).unwrap()).unwrap();
+
+        let executor = ContainerExecutor::new(state_dir).unwrap();
+        let container_id = "test-multi-supp-groups";
+
+        let _ = executor.create(container_id, &bundle_dir).unwrap();
+        let _ = executor.start(container_id).unwrap();
+
+        let mut id_output = String::new();
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(50));
+            if let Ok(content) = fs::read_to_string(rootfs.join("tmp/id_g.txt")) {
+                let trimmed = content.trim().to_string();
+                if !trimmed.is_empty() {
+                    id_output = trimmed;
+                    break;
+                }
+            }
+        }
+
+        let mut groups: Vec<&str> = id_output.split_whitespace().collect();
+        groups.sort();
+        assert_eq!(
+            groups,
+            vec!["1000", "1001", "1002", "1003"],
+            "Expected exact supplementary groups. Got: {:?}",
+            groups
+        );
+
+        let _ = executor.kill(container_id, 9);
+        let _ = executor.delete(container_id, true);
+    }
+}
+
+#[test]
+fn test_working_directory_validation_runtime() {
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping rootful test (requires root)");
+            return;
+        }
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let bundle_dir = temp.path().join("bundle");
+        let rootfs = bundle_dir.join("rootfs");
+        let bin_dir = rootfs.join("bin");
+        let dev_dir = rootfs.join("dev");
+        let app_dir = rootfs.join("custom_app");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&dev_dir).unwrap();
+        fs::create_dir_all(&app_dir).unwrap();
+        let _ = fs::File::create(dev_dir.join("null"));
+
+        let busybox_path = if Path::new("/usr/bin/busybox").exists() {
+            "/usr/bin/busybox"
+        } else {
+            "/bin/busybox"
+        };
+        fs::copy(busybox_path, bin_dir.join("busybox")).unwrap();
+
+        // 1. Valid working directory
+        let mut spec = Spec::default_linux();
+        if let Some(proc) = &mut spec.process {
+            proc.cwd = "/custom_app".to_string();
+            proc.args = vec![
+                "/bin/busybox".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "/bin/busybox pwd > /custom_app/pwd.txt; sleep 1".to_string(),
+            ];
+        }
+
+        let config_path = bundle_dir.join("config.json");
+        fs::write(&config_path, serde_json::to_string_pretty(&spec).unwrap()).unwrap();
+
+        let executor = ContainerExecutor::new(state_dir.clone()).unwrap();
+        let container_id = "test-valid-cwd";
+
+        let _ = executor.create(container_id, &bundle_dir).unwrap();
+        let _ = executor.start(container_id).unwrap();
+
+        let mut pwd_output = String::new();
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(50));
+            if let Ok(content) = fs::read_to_string(rootfs.join("custom_app/pwd.txt")) {
+                let trimmed = content.trim().to_string();
+                if !trimmed.is_empty() {
+                    pwd_output = trimmed;
+                    break;
+                }
+            }
+        }
+        assert_eq!(pwd_output, "/custom_app");
+        let _ = executor.kill(container_id, 9);
+        let _ = executor.delete(container_id, true);
+
+        // 2. Invalid working directory must fail during creation/init
+        let bundle_bad = temp.path().join("bundle_bad");
+        let rootfs_bad = bundle_bad.join("rootfs");
+        fs::create_dir_all(rootfs_bad.join("bin")).unwrap();
+        fs::copy(busybox_path, rootfs_bad.join("bin/busybox")).unwrap();
+
+        let mut bad_spec = Spec::default_linux();
+        if let Some(proc) = &mut bad_spec.process {
+            proc.cwd = "/nonexistent_never_exists".to_string();
+            proc.args = vec!["/bin/busybox".to_string(), "true".to_string()];
+        }
+        fs::write(
+            bundle_bad.join("config.json"),
+            serde_json::to_string_pretty(&bad_spec).unwrap(),
+        )
+        .unwrap();
+
+        let err = executor.create("test-bad-cwd", &bundle_bad).unwrap_err();
+        assert!(matches!(err, tavik_common::error::TavikError::Execution(_)));
+    }
+}

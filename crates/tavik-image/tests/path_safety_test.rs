@@ -153,3 +153,212 @@ fn test_safe_dir_descriptor_relative_operations() {
     safe_dir.unlink_at(Path::new("etc/host_link")).unwrap();
     assert!(!rootfs.join("etc/host_link").exists());
 }
+
+#[test]
+fn test_safe_dir_rejects_absolute_path_supplied_directly() {
+    let temp = tempdir().unwrap();
+    let rootfs = temp.path().join("rootfs");
+    std::fs::create_dir_all(&rootfs).unwrap();
+    let safe_dir = SafeDir::open_rootfs(&rootfs).unwrap();
+
+    let abs_paths = [
+        Path::new("/etc/passwd"),
+        Path::new("/root"),
+        Path::new("/tmp/evil"),
+    ];
+
+    for path in abs_paths {
+        assert!(matches!(
+            safe_dir.open_file_at(path, libc::O_RDONLY, 0).unwrap_err(),
+            ImageError::PathTraversal { .. }
+        ));
+        assert!(matches!(
+            safe_dir.mkdir_at(path, 0o755).unwrap_err(),
+            ImageError::PathTraversal { .. }
+        ));
+        assert!(matches!(
+            safe_dir.symlink_at(Path::new("target"), path).unwrap_err(),
+            ImageError::PathTraversal { .. }
+        ));
+        assert!(matches!(
+            safe_dir.is_symlink_at(path).unwrap_err(),
+            ImageError::PathTraversal { .. }
+        ));
+        assert!(matches!(
+            safe_dir.unlink_at(path).unwrap_err(),
+            ImageError::PathTraversal { .. }
+        ));
+    }
+}
+
+#[test]
+fn test_safe_dir_rejects_parent_traversal_supplied_directly() {
+    let temp = tempdir().unwrap();
+    let rootfs = temp.path().join("rootfs");
+    std::fs::create_dir_all(&rootfs).unwrap();
+    let safe_dir = SafeDir::open_rootfs(&rootfs).unwrap();
+
+    let traversal_paths = [
+        Path::new("../secret"),
+        Path::new("etc/../../secret"),
+        Path::new(".."),
+        Path::new("a/b/../../../escape"),
+    ];
+
+    for path in traversal_paths {
+        assert!(matches!(
+            safe_dir.open_file_at(path, libc::O_RDONLY, 0).unwrap_err(),
+            ImageError::PathTraversal { .. }
+        ));
+        assert!(matches!(
+            safe_dir.mkdir_at(path, 0o755).unwrap_err(),
+            ImageError::PathTraversal { .. }
+        ));
+        assert!(matches!(
+            safe_dir.symlink_at(Path::new("target"), path).unwrap_err(),
+            ImageError::PathTraversal { .. }
+        ));
+        assert!(matches!(
+            safe_dir.is_symlink_at(path).unwrap_err(),
+            ImageError::PathTraversal { .. }
+        ));
+        assert!(matches!(
+            safe_dir.unlink_at(path).unwrap_err(),
+            ImageError::PathTraversal { .. }
+        ));
+    }
+}
+
+#[test]
+fn test_safe_dir_rejects_empty_paths_supplied_directly() {
+    let temp = tempdir().unwrap();
+    let rootfs = temp.path().join("rootfs");
+    std::fs::create_dir_all(&rootfs).unwrap();
+    let safe_dir = SafeDir::open_rootfs(&rootfs).unwrap();
+
+    let empty_paths = [Path::new(""), Path::new(".")];
+
+    for path in empty_paths {
+        assert!(matches!(
+            safe_dir.open_file_at(path, libc::O_RDONLY, 0).unwrap_err(),
+            ImageError::PathTraversal { .. }
+        ));
+        assert!(matches!(
+            safe_dir.mkdir_at(path, 0o755).unwrap_err(),
+            ImageError::PathTraversal { .. }
+        ));
+        assert!(matches!(
+            safe_dir.symlink_at(Path::new("target"), path).unwrap_err(),
+            ImageError::PathTraversal { .. }
+        ));
+        assert!(matches!(
+            safe_dir.is_symlink_at(path).unwrap_err(),
+            ImageError::PathTraversal { .. }
+        ));
+        assert!(matches!(
+            safe_dir.unlink_at(path).unwrap_err(),
+            ImageError::PathTraversal { .. }
+        ));
+    }
+}
+
+#[test]
+fn test_safe_dir_rejects_intermediate_symlink_pointing_outside_rootfs() {
+    let temp = tempdir().unwrap();
+    let outside_dir = temp.path().join("outside");
+    std::fs::create_dir_all(&outside_dir).unwrap();
+
+    let rootfs = temp.path().join("rootfs");
+    std::fs::create_dir_all(&rootfs).unwrap();
+    let safe_dir = SafeDir::open_rootfs(&rootfs).unwrap();
+
+    // Create an intermediate symlink pointing outside rootfs
+    std::os::unix::fs::symlink(&outside_dir, rootfs.join("sym_outside")).unwrap();
+
+    // Every operation attempting to traverse through this intermediate symlink must fail
+    let path = Path::new("sym_outside/pwn.txt");
+
+    assert!(safe_dir
+        .open_file_at(path, libc::O_WRONLY | libc::O_CREAT, 0o644)
+        .is_err());
+    assert!(safe_dir
+        .mkdir_at(Path::new("sym_outside/sub"), 0o755)
+        .is_err());
+    assert!(safe_dir
+        .symlink_at(Path::new("target"), Path::new("sym_outside/link"))
+        .is_err());
+    assert!(safe_dir.is_symlink_at(path).is_err());
+    assert!(safe_dir.unlink_at(path).is_err());
+
+    // Verify nothing was touched or created in outside_dir
+    assert!(!outside_dir.join("pwn.txt").exists());
+    assert!(!outside_dir.join("sub").exists());
+    assert!(!outside_dir.join("link").exists());
+}
+
+#[test]
+fn test_safe_dir_rejects_intermediate_symlink_pointing_inside_rootfs() {
+    let temp = tempdir().unwrap();
+    let rootfs = temp.path().join("rootfs");
+    std::fs::create_dir_all(&rootfs).unwrap();
+    let safe_dir = SafeDir::open_rootfs(&rootfs).unwrap();
+
+    // Create a real directory and a symlink pointing to it inside rootfs
+    safe_dir.mkdir_at(Path::new("internal_dir"), 0o755).unwrap();
+    std::os::unix::fs::symlink("internal_dir", rootfs.join("sym_internal")).unwrap();
+
+    // Every operation attempting to traverse through this intermediate symlink must fail
+    let path = Path::new("sym_internal/pwn.txt");
+
+    assert!(safe_dir
+        .open_file_at(path, libc::O_WRONLY | libc::O_CREAT, 0o644)
+        .is_err());
+    assert!(safe_dir
+        .mkdir_at(Path::new("sym_internal/sub"), 0o755)
+        .is_err());
+    assert!(safe_dir
+        .symlink_at(Path::new("target"), Path::new("sym_internal/link"))
+        .is_err());
+    assert!(safe_dir.is_symlink_at(path).is_err());
+    assert!(safe_dir.unlink_at(path).is_err());
+
+    // Verify nothing was created inside internal_dir
+    assert!(!rootfs.join("internal_dir").join("pwn.txt").exists());
+    assert!(!rootfs.join("internal_dir").join("sub").exists());
+    assert!(!rootfs.join("internal_dir").join("link").exists());
+}
+
+#[test]
+fn test_safe_dir_mkdir_at_rejects_existing_symlink_or_regular_file() {
+    let temp = tempdir().unwrap();
+    let rootfs = temp.path().join("rootfs");
+    std::fs::create_dir_all(&rootfs).unwrap();
+    let safe_dir = SafeDir::open_rootfs(&rootfs).unwrap();
+
+    // 1. Existing symlink
+    safe_dir.mkdir_at(Path::new("target_dir"), 0o755).unwrap();
+    std::os::unix::fs::symlink("target_dir", rootfs.join("sym_link")).unwrap();
+
+    let err_symlink = safe_dir.mkdir_at(Path::new("sym_link"), 0o755).unwrap_err();
+    match err_symlink {
+        ImageError::Io(e) => assert_eq!(e.raw_os_error(), Some(libc::ENOTDIR)),
+        other => panic!("Expected Io(ENOTDIR), got {:?}", other),
+    }
+
+    // 2. Existing regular file
+    use std::io::Write;
+    let mut f = safe_dir
+        .open_file_at(Path::new("file.txt"), libc::O_WRONLY | libc::O_CREAT, 0o644)
+        .unwrap();
+    f.write_all(b"not a directory\n").unwrap();
+    drop(f);
+
+    let err_file = safe_dir.mkdir_at(Path::new("file.txt"), 0o755).unwrap_err();
+    match err_file {
+        ImageError::Io(e) => assert_eq!(e.raw_os_error(), Some(libc::ENOTDIR)),
+        other => panic!("Expected Io(ENOTDIR), got {:?}", other),
+    }
+
+    // 3. Existing directory must succeed on repeated mkdir_at
+    assert!(safe_dir.mkdir_at(Path::new("target_dir"), 0o755).is_ok());
+}

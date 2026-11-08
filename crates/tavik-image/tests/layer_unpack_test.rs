@@ -158,3 +158,90 @@ fn test_invalid_zstd_input_fails_loudly() {
         "Corrupted zstd must return read error"
     );
 }
+
+#[test]
+fn test_limited_reader_never_requests_more_than_remaining_limit() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct CountingReader<R> {
+        inner: R,
+        max_requested: Arc<AtomicUsize>,
+        total_delivered: Arc<AtomicUsize>,
+    }
+
+    impl<R: Read> Read for CountingReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let req_len = buf.len();
+            let prev_max = self.max_requested.load(Ordering::SeqCst);
+            if req_len > prev_max {
+                self.max_requested.store(req_len, Ordering::SeqCst);
+            }
+            let n = self.inner.read(buf)?;
+            self.total_delivered.fetch_add(n, Ordering::SeqCst);
+            Ok(n)
+        }
+    }
+
+    let max_req = Arc::new(AtomicUsize::new(0));
+    let total_del = Arc::new(AtomicUsize::new(0));
+
+    // 1 MiB payload
+    let large_payload = vec![0x42u8; 1024 * 1024];
+    let counting = CountingReader {
+        inner: Cursor::new(large_payload),
+        max_requested: Arc::clone(&max_req),
+        total_delivered: Arc::clone(&total_del),
+    };
+
+    // Configure LimitedReader with a 64-byte limit
+    let limit = 64u64;
+    let mut limited = tavik_image::LimitedReader::new(counting, limit);
+
+    // Caller provides a large 64 KiB buffer
+    let mut big_buf = [0u8; 64 * 1024];
+
+    // Read #1: should read exactly 64 bytes
+    let n1 = limited.read(&mut big_buf).unwrap();
+    assert_eq!(n1, 64);
+    assert_eq!(limited.bytes_read(), 64);
+
+    // Verify LimitedReader clamped request to remaining limit (64 bytes), NOT 64 KiB
+    assert!(max_req.load(Ordering::SeqCst) <= 64);
+
+    // Read #2: at exact limit, probe for EOF with a 1-byte buffer
+    let err = limited.read(&mut big_buf).unwrap_err();
+    assert!(err.to_string().contains("limit exceeded"));
+
+    // Verify probe buffer was exactly 1 byte, so total delivered from inner is 64 + 1 = 65 bytes
+    // It NEVER decompressed or read the rest of the 1 MiB payload!
+    assert_eq!(total_del.load(Ordering::SeqCst), 65);
+}
+
+#[test]
+fn test_limited_reader_exact_limit_probe_success() {
+    let payload = vec![0xABu8; 128];
+    let limit = 128u64;
+
+    let mut limited = tavik_image::LimitedReader::new(Cursor::new(payload.clone()), limit);
+    let mut out = Vec::new();
+    // read_to_end consumes up to limit and probes for EOF
+    limited.read_to_end(&mut out).unwrap();
+    assert_eq!(out, payload);
+    assert_eq!(limited.bytes_read(), limit);
+
+    // Subsequent read returns EOF cleanly
+    let mut extra = [0u8; 10];
+    assert_eq!(limited.read(&mut extra).unwrap(), 0);
+}
+
+#[test]
+fn test_limited_reader_one_byte_over_limit_triggers_probe_failure() {
+    let payload = vec![0xABu8; 129]; // exactly 1 byte over limit
+    let limit = 128u64;
+
+    let mut limited = tavik_image::LimitedReader::new(Cursor::new(payload), limit);
+    let mut out = Vec::new();
+    let err = limited.read_to_end(&mut out).unwrap_err();
+    assert!(err.to_string().contains("limit exceeded"));
+}

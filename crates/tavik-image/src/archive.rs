@@ -28,6 +28,7 @@ pub struct LimitedReader<R> {
     inner: R,
     limit: u64,
     bytes_read: u64,
+    eof_reached: bool,
 }
 
 impl<R: Read> LimitedReader<R> {
@@ -36,6 +37,7 @@ impl<R: Read> LimitedReader<R> {
             inner,
             limit,
             bytes_read: 0,
+            eof_reached: false,
         }
     }
 
@@ -46,12 +48,41 @@ impl<R: Read> LimitedReader<R> {
 
 impl<R: Read> Read for LimitedReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.bytes_read = self.bytes_read.saturating_add(n as u64);
-        if self.bytes_read > self.limit {
-            return Err(io::Error::other(ImageError::DecompressionLimitExceeded {
-                limit: self.limit,
-            }));
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.eof_reached {
+            return Ok(0);
+        }
+
+        let remaining = self.limit.saturating_sub(self.bytes_read);
+        if remaining == 0 {
+            // At the exact limit, probe for EOF with a one-byte buffer.
+            let mut probe = [0u8; 1];
+            loop {
+                match self.inner.read(&mut probe) {
+                    Ok(0) => {
+                        self.eof_reached = true;
+                        return Ok(0);
+                    }
+                    Ok(_) => {
+                        return Err(io::Error::other(ImageError::DecompressionLimitExceeded {
+                            limit: self.limit,
+                        }));
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        // Never request more decompressed bytes than the remaining limit.
+        let to_read = (buf.len() as u64).min(remaining) as usize;
+        let n = self.inner.read(&mut buf[..to_read])?;
+        if n == 0 {
+            self.eof_reached = true;
+        } else {
+            self.bytes_read = self.bytes_read.saturating_add(n as u64);
         }
         Ok(n)
     }

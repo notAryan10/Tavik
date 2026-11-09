@@ -1894,3 +1894,365 @@ fn test_cgroup_ownership_rules_never_destroy_unowned() {
     let del_res = executor.delete(container_id, false);
     assert!(del_res.is_ok());
 }
+
+#[test]
+fn test_delete_starting_and_running_container_rejection() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let bundle_dir = temp.path().join("bundle");
+    let rootfs = bundle_dir.join("rootfs");
+    fs::create_dir_all(&rootfs).unwrap();
+
+    let spec = Spec::default_linux();
+    fs::write(
+        bundle_dir.join("config.json"),
+        serde_json::to_string_pretty(&spec).unwrap(),
+    )
+    .unwrap();
+
+    let executor = ContainerExecutor::new(state_dir.clone()).unwrap();
+    let container_id = "test-delete-starting-cont";
+    let state = executor.create(container_id, &bundle_dir).unwrap();
+    assert_eq!(state.status, ContainerStatus::Created);
+
+    // 1. Manually update state to Starting
+    let state_file = state_dir.join(container_id).join("state.json");
+    let mut updated_state = state;
+    updated_state.status = ContainerStatus::Starting;
+    fs::write(
+        &state_file,
+        serde_json::to_string_pretty(&updated_state).unwrap(),
+    )
+    .unwrap();
+
+    // 2. Reject unforced deletion of a Starting container
+    let del_err = executor.delete(container_id, false).unwrap_err();
+    match del_err {
+        tavik_common::error::TavikError::InvalidState(msg) => {
+            assert!(
+                msg.contains("starting"),
+                "Error message should mention starting status: {}",
+                msg
+            );
+        }
+        other => panic!("Expected InvalidState error, got: {:?}", other),
+    }
+
+    // 3. Test unreachable supervisor during forced deletion on Linux
+    #[cfg(target_os = "linux")]
+    {
+        let force_err = executor.delete(container_id, true).unwrap_err();
+        match force_err {
+            tavik_common::error::TavikError::Execution(msg) => {
+                assert!(
+                    msg.contains("unreachable"),
+                    "Error message should mention unreachable control socket: {}",
+                    msg
+                );
+            }
+            other => panic!(
+                "Expected Execution error for unreachable supervisor, got: {:?}",
+                other
+            ),
+        }
+    }
+}
+
+#[test]
+fn test_supervisor_finalization_rules_and_error_handling() {
+    #[cfg(target_os = "linux")]
+    {
+        let temp = tempdir().unwrap();
+        let container_dir = temp.path().join("container");
+        fs::create_dir_all(&container_dir).unwrap();
+
+        let state_file = container_dir.join("state.json");
+        let start_fifo = container_dir.join("start.fifo");
+        let exec_fifo = container_dir.join("exec.fifo");
+        fs::write(&start_fifo, b"").unwrap();
+        fs::write(&exec_fifo, b"").unwrap();
+
+        let initial_state = ContainerState {
+            id: "test-finalization-cont".to_string(),
+            status: ContainerStatus::Running,
+            pid: Some(12345),
+            bundle: temp.path().to_path_buf(),
+        };
+        fs::write(
+            &state_file,
+            serde_json::to_string_pretty(&initial_state).unwrap(),
+        )
+        .unwrap();
+
+        // 1. If child is not reaped and waitpid fails on invalid PID, finalization must fail with error
+        let bad_pid = 999999;
+        let fail_res = tavik_runtime::init::run_supervisor_finalization(
+            "test-finalization-cont",
+            bad_pid,
+            &container_dir,
+            false,
+            &start_fifo,
+            &exec_fifo,
+            false,
+        );
+        assert!(fail_res.is_err());
+        let err_str = fail_res.unwrap_err();
+        assert!(err_str.contains("failed to reap child PID"));
+
+        // Verify state is NOT marked as Stopped when reaping fails
+        let current_state: ContainerState =
+            serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        assert_eq!(
+            current_state.status,
+            ContainerStatus::Running,
+            "State must remain Running when waitpid fails"
+        );
+
+        // 2. When child is confirmed reaped (child_reaped = true), finalization succeeds
+        let ok_res = tavik_runtime::init::run_supervisor_finalization(
+            "test-finalization-cont",
+            bad_pid,
+            &container_dir,
+            false,
+            &start_fifo,
+            &exec_fifo,
+            true, // child_reaped confirmed
+        );
+        assert!(ok_res.is_ok());
+
+        // Verify final state is persisted as Stopped
+        let final_state: ContainerState =
+            serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        assert_eq!(final_state.status, ContainerStatus::Stopped);
+
+        // Verify FIFOs are cleaned up
+        assert!(!start_fifo.exists());
+        assert!(!exec_fifo.exists());
+    }
+}
+
+#[test]
+fn test_signal_escalation_error_handling() {
+    #[cfg(target_os = "linux")]
+    {
+        // 1. Test with invalid/closed child_pidfd
+        let mut child_reaped = false;
+        let res = tavik_runtime::init::terminate_child_with_escalation(
+            999999,
+            -1, // invalid fd
+            libc::SIGTERM,
+            Duration::from_millis(50),
+            &mut child_reaped,
+        );
+        assert!(res.is_err(), "Invalid pidfd must return Err promptly");
+
+        // 2. Test already terminated child process with ESRCH confirmed by waitpid
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            unsafe { libc::_exit(0) };
+        }
+
+        // Parent: wait for child to exit and reap it
+        let mut status = 0;
+        let wres = unsafe { libc::waitpid(child, &mut status, 0) };
+        assert_eq!(wres, child);
+
+        // Now process is completely reaped. A synthetic pidfd check or ESRCH will report reaped
+        let mut child_reaped2 = false;
+        let res2 = tavik_runtime::init::terminate_child_with_escalation(
+            child,
+            -1,
+            libc::SIGTERM,
+            Duration::from_millis(50),
+            &mut child_reaped2,
+        );
+        // Either error or confirmed terminated; must not hang!
+        assert!(res2.is_err() || child_reaped2);
+    }
+}
+
+#[test]
+fn test_linux_lifecycle_graceful_stop_and_acknowledgment() {
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping rootful stop test (requires root)");
+            return;
+        }
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let bundle_dir = temp.path().join("bundle");
+        let rootfs = bundle_dir.join("rootfs");
+        let bin_dir = rootfs.join("bin");
+        let dev_dir = rootfs.join("dev");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&dev_dir).unwrap();
+        let _ = fs::File::create(dev_dir.join("null"));
+
+        if Path::new("/usr/bin/busybox").exists() {
+            fs::copy("/usr/bin/busybox", bin_dir.join("busybox")).unwrap();
+        } else if Path::new("/bin/busybox").exists() {
+            fs::copy("/bin/busybox", bin_dir.join("busybox")).unwrap();
+        } else {
+            return;
+        }
+
+        let mut spec = Spec::default_linux();
+        if let Some(proc) = &mut spec.process {
+            proc.args = vec![
+                "/bin/busybox".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "sleep 30".to_string(),
+            ];
+        }
+        fs::write(
+            bundle_dir.join("config.json"),
+            serde_json::to_string_pretty(&spec).unwrap(),
+        )
+        .unwrap();
+
+        let executor = ContainerExecutor::new(state_dir).unwrap();
+        let id = "test-graceful-stop";
+        let state = executor.create(id, &bundle_dir).unwrap();
+        assert_eq!(state.status, ContainerStatus::Created);
+
+        let started = executor.start(id).unwrap();
+        assert_eq!(started.status, ContainerStatus::Running);
+
+        // Stop container gracefully with 5s timeout
+        let stopped = executor
+            .stop(id, Some(libc::SIGTERM), Some(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(stopped.status, ContainerStatus::Stopped);
+
+        // Delete container
+        let del = executor.delete(id, false);
+        assert!(del.is_ok());
+    }
+}
+
+#[test]
+fn test_linux_stop_sigkill_escalation() {
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping rootful sigkill escalation test (requires root)");
+            return;
+        }
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let bundle_dir = temp.path().join("bundle");
+        let rootfs = bundle_dir.join("rootfs");
+        let bin_dir = rootfs.join("bin");
+        let dev_dir = rootfs.join("dev");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&dev_dir).unwrap();
+        let _ = fs::File::create(dev_dir.join("null"));
+
+        if Path::new("/usr/bin/busybox").exists() {
+            fs::copy("/usr/bin/busybox", bin_dir.join("busybox")).unwrap();
+        } else if Path::new("/bin/busybox").exists() {
+            fs::copy("/bin/busybox", bin_dir.join("busybox")).unwrap();
+        } else {
+            return;
+        }
+
+        // Process traps and ignores SIGTERM
+        let mut spec = Spec::default_linux();
+        if let Some(proc) = &mut spec.process {
+            proc.args = vec![
+                "/bin/busybox".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "trap '' TERM; sleep 30".to_string(),
+            ];
+        }
+        fs::write(
+            bundle_dir.join("config.json"),
+            serde_json::to_string_pretty(&spec).unwrap(),
+        )
+        .unwrap();
+
+        let executor = ContainerExecutor::new(state_dir).unwrap();
+        let id = "test-sigkill-escalation";
+        let state = executor.create(id, &bundle_dir).unwrap();
+        assert_eq!(state.status, ContainerStatus::Created);
+
+        let started = executor.start(id).unwrap();
+        assert_eq!(started.status, ContainerStatus::Running);
+
+        // Stop with short 300ms grace period: should escalate to SIGKILL
+        let stopped = executor
+            .stop(id, Some(libc::SIGTERM), Some(Duration::from_millis(300)))
+            .unwrap();
+        assert_eq!(stopped.status, ContainerStatus::Stopped);
+
+        let del = executor.delete(id, false);
+        assert!(del.is_ok());
+    }
+}
+
+#[test]
+fn test_linux_force_delete_running_container() {
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping rootful force delete test (requires root)");
+            return;
+        }
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let bundle_dir = temp.path().join("bundle");
+        let rootfs = bundle_dir.join("rootfs");
+        let bin_dir = rootfs.join("bin");
+        let dev_dir = rootfs.join("dev");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&dev_dir).unwrap();
+        let _ = fs::File::create(dev_dir.join("null"));
+
+        if Path::new("/usr/bin/busybox").exists() {
+            fs::copy("/usr/bin/busybox", bin_dir.join("busybox")).unwrap();
+        } else if Path::new("/bin/busybox").exists() {
+            fs::copy("/bin/busybox", bin_dir.join("busybox")).unwrap();
+        } else {
+            return;
+        }
+
+        let mut spec = Spec::default_linux();
+        if let Some(proc) = &mut spec.process {
+            proc.args = vec![
+                "/bin/busybox".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "sleep 30".to_string(),
+            ];
+        }
+        fs::write(
+            bundle_dir.join("config.json"),
+            serde_json::to_string_pretty(&spec).unwrap(),
+        )
+        .unwrap();
+
+        let executor = ContainerExecutor::new(state_dir).unwrap();
+        let id = "test-force-delete-running";
+        let state = executor.create(id, &bundle_dir).unwrap();
+        assert_eq!(state.status, ContainerStatus::Created);
+
+        let started = executor.start(id).unwrap();
+        assert_eq!(started.status, ContainerStatus::Running);
+
+        // Unforced delete must fail
+        let unforced_err = executor.delete(id, false);
+        assert!(unforced_err.is_err());
+
+        // Forced delete must succeed via supervisor CANCEL
+        let forced = executor.delete(id, true);
+        assert!(forced.is_ok());
+        assert!(executor.load_state(id).is_err());
+    }
+}

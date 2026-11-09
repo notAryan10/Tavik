@@ -254,11 +254,12 @@ impl ContainerExecutor {
                 Ok(final_state)
             }
             Err(e) => {
-                // If startup failed, mark state as Stopped, do NOT mark as Running!
-                let _ = self.transition_state(id, |st| {
-                    st.status = ContainerStatus::Stopped;
-                    Ok(())
-                });
+                // Do not transition to Stopped in start() without confirmed termination.
+                let cur = self.load_state(id)?;
+                if cur.status == ContainerStatus::Stopped {
+                    return Err(e);
+                }
+                // Unsuccessful CANCEL leaves container in Starting or reports error clearly
                 Err(e)
             }
         }
@@ -317,20 +318,15 @@ impl ContainerExecutor {
 
             if control_sock.exists() {
                 let cmd = format!("STOP {} {}", sig, timeout_ms);
-                match crate::init::send_control_command(&control_sock, &cmd) {
-                    Ok(_) => {
-                        let final_state = self.load_state(id)?;
-                        return Ok(final_state);
-                    }
-                    Err(e) => {
-                        if let Ok(st) = self.load_state(id) {
-                            if st.status == ContainerStatus::Stopped {
-                                return Ok(st);
-                            }
-                        }
-                        return Err(e);
-                    }
+                crate::init::send_control_command(&control_sock, &cmd)?;
+                let final_state = self.load_state(id)?;
+                if final_state.status != ContainerStatus::Stopped {
+                    return Err(TavikError::Execution(format!(
+                        "Supervisor acknowledged stop for container '{}', but state is '{}' (expected 'stopped')",
+                        id, final_state.status
+                    )));
                 }
+                return Ok(final_state);
             }
 
             let current = self.load_state(id)?;
@@ -338,10 +334,10 @@ impl ContainerExecutor {
                 return Ok(current);
             }
 
-            return Err(TavikError::Execution(format!(
+            Err(TavikError::Execution(format!(
                 "Container '{}' supervisor control channel unavailable and container not stopped",
                 id
-            )));
+            )))
         }
 
         #[cfg(all(unix, not(target_os = "linux")))]
@@ -431,10 +427,10 @@ impl ContainerExecutor {
                     id
                 )));
             }
-            return Err(TavikError::Execution(format!(
+            Err(TavikError::Execution(format!(
                 "Container '{}' supervisor control channel unavailable",
                 id
-            )));
+            )))
         }
 
         #[cfg(all(unix, not(target_os = "linux")))]
@@ -465,16 +461,51 @@ impl ContainerExecutor {
     pub fn delete(&self, id: &str, force: bool) -> Result<()> {
         let state = self.load_state(id)?;
 
-        if state.status == ContainerStatus::Running && !force {
+        let is_active =
+            state.status == ContainerStatus::Running || state.status == ContainerStatus::Starting;
+
+        if is_active && !force {
             return Err(TavikError::InvalidState(format!(
-                "Cannot delete running container '{}' without force flag",
-                id
+                "Cannot delete container '{}' with status '{}' without force flag",
+                id, state.status
             )));
         }
 
-        if state.status == ContainerStatus::Running && force {
-            if let Some(pid) = state.pid {
-                let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        if is_active && force {
+            #[cfg(target_os = "linux")]
+            {
+                let control_sock = self.container_dir(id).join("control.sock");
+                if !control_sock.exists() {
+                    let cur_state = self.load_state(id)?;
+                    if cur_state.status != ContainerStatus::Stopped {
+                        return Err(TavikError::Execution(format!(
+                            "Cannot force delete active container '{}': supervisor control socket is unreachable at {:?}",
+                            id, control_sock
+                        )));
+                    }
+                } else {
+                    crate::init::send_control_command(&control_sock, "CANCEL").map_err(|e| {
+                        TavikError::Execution(format!(
+                            "Failed to force stop container '{}' via supervisor during delete: {}",
+                            id, e
+                        ))
+                    })?;
+
+                    let final_state = self.load_state(id)?;
+                    if final_state.status != ContainerStatus::Stopped {
+                        return Err(TavikError::Execution(format!(
+                            "Container '{}' remained in status '{}' after forced termination during delete",
+                            id, final_state.status
+                        )));
+                    }
+                }
+            }
+
+            #[cfg(all(unix, not(target_os = "linux")))]
+            {
+                if let Some(pid) = state.pid {
+                    let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                }
             }
         }
 
@@ -622,13 +653,56 @@ impl ContainerExecutor {
             events: libc::POLLIN | libc::POLLHUP,
             revents: 0,
         };
-        // Wait up to 15 seconds for startup handshake
-        let poll_res = unsafe { libc::poll(&mut pfd, 1, 15000) };
-        if poll_res < 0 {
-            let err = std::io::Error::last_os_error();
-            unsafe { libc::close(exec_read_fd) };
-            return Err(TavikError::Io(format!("poll failed on exec.fifo: {}", err)));
+        // Wait up to 15 seconds for startup handshake, retrying on EINTR
+        let timeout = std::time::Duration::from_secs(15);
+        let start_time = std::time::Instant::now();
+        let mut poll_res = 0;
+        let mut poll_err = None;
+
+        while start_time.elapsed() < timeout {
+            let rem_ms = (timeout.saturating_sub(start_time.elapsed()).as_millis() as i32).max(1);
+            let pret = unsafe { libc::poll(&mut pfd, 1, rem_ms) };
+            if pret < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue; // Retry startup poll on EINTR
+                }
+                poll_res = pret;
+                poll_err = Some(err);
+                break;
+            }
+            if pret == 0 {
+                poll_res = 0;
+                break;
+            }
+            poll_res = pret;
+            break;
         }
+
+        if poll_res < 0 {
+            unsafe { libc::close(exec_read_fd) };
+            let orig_err = TavikError::Io(format!(
+                "poll failed on exec.fifo: {}",
+                poll_err.unwrap_or_else(std::io::Error::last_os_error)
+            ));
+            let control_sock = container_dir.join("control.sock");
+            if !control_sock.exists() {
+                return Err(TavikError::Execution(format!(
+                    "{}; additionally, mandatory startup cancellation failed: supervisor control socket missing at {:?}",
+                    orig_err, control_sock
+                )));
+            }
+            match crate::init::send_control_command(&control_sock, "CANCEL") {
+                Ok(_) => return Err(orig_err),
+                Err(cancel_err) => {
+                    return Err(TavikError::Execution(format!(
+                        "{}; additionally, mandatory startup cancellation failed: {}",
+                        orig_err, cancel_err
+                    )));
+                }
+            }
+        }
+
         if poll_res == 0 {
             unsafe { libc::close(exec_read_fd) };
             let orig_err = TavikError::Execution(format!(
@@ -636,16 +710,21 @@ impl ContainerExecutor {
                 id
             ));
             let control_sock = container_dir.join("control.sock");
-            if control_sock.exists() {
-                if let Err(cancel_err) = crate::init::send_control_command(&control_sock, "CANCEL")
-                {
-                    warn!(
-                        "Failed to send CANCEL to supervisor for container '{}': {}",
-                        id, cancel_err
-                    );
+            if !control_sock.exists() {
+                return Err(TavikError::Execution(format!(
+                    "{}; mandatory startup cancellation failed: supervisor control socket missing at {:?}",
+                    orig_err, control_sock
+                )));
+            }
+            match crate::init::send_control_command(&control_sock, "CANCEL") {
+                Ok(_) => return Err(orig_err),
+                Err(cancel_err) => {
+                    return Err(TavikError::Execution(format!(
+                        "{}; mandatory startup cancellation failed: {}",
+                        orig_err, cancel_err
+                    )));
                 }
             }
-            return Err(orig_err);
         }
 
         let mut err_buf = Vec::new();
@@ -678,6 +757,15 @@ impl ContainerExecutor {
 
         if !err_buf.is_empty() {
             let err_msg = String::from_utf8_lossy(&err_buf);
+            let wait_start = std::time::Instant::now();
+            while wait_start.elapsed() < std::time::Duration::from_secs(1) {
+                if let Ok(st) = self.load_state(id) {
+                    if st.status == ContainerStatus::Stopped {
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
             return Err(TavikError::Execution(format!(
                 "Container '{}' failed during startup: {}",
                 id, err_msg

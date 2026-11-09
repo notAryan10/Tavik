@@ -650,8 +650,300 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
     unsafe { libc::close(trampoline_pipe[1]) };
 
     // --- SUPERVISORY LOOP ---
-    // The supervisor monitors control requests and waits for child termination via pidfd
-    let mut child_reaped = false;
+    supervise_container_process(
+        id,
+        child_pid,
+        child_pidfd,
+        &container_dir,
+        owns_cgroup,
+        control_listener_fd,
+    );
+}
+
+#[cfg(target_os = "linux")]
+pub fn terminate_child_with_escalation(
+    child_pid: i32,
+    child_pidfd: i32,
+    sig: i32,
+    timeout: std::time::Duration,
+    child_reaped: &mut bool,
+) -> std::result::Result<(), String> {
+    // 1. Send signal
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            child_pidfd,
+            sig,
+            std::ptr::null::<libc::c_void>(),
+            0,
+        )
+    };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            // Treat ESRCH as already terminated only after confirming process state with waitpid(WNOHANG)
+            let mut status = 0;
+            let wres = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
+            if wres == child_pid
+                || (wres < 0
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
+            {
+                *child_reaped = true;
+                return Ok(());
+            } else {
+                return Err(format!(
+                    "pidfd_send_signal returned ESRCH but waitpid(WNOHANG) could not confirm termination of PID {}: {}",
+                    child_pid, err
+                ));
+            }
+        } else {
+            return Err(format!(
+                "Failed to send signal {} to child PID {}: {}",
+                sig, child_pid, err
+            ));
+        }
+    }
+
+    // 2. Poll child_pidfd for termination within timeout
+    let mut pfd = libc::pollfd {
+        fd: child_pidfd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let start_time = std::time::Instant::now();
+    let mut terminated = false;
+
+    while start_time.elapsed() < timeout {
+        let rem_ms = (timeout.saturating_sub(start_time.elapsed()).as_millis() as i32).max(1);
+        let pret = unsafe { libc::poll(&mut pfd, 1, rem_ms) };
+        if pret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue; // Retry poll on EINTR
+            }
+            return Err(format!(
+                "Poll failed on child pidfd during signal escalation: {}",
+                err
+            ));
+        }
+        if pret == 0 {
+            break; // Timeout expired
+        }
+        if (pfd.revents & libc::POLLIN) != 0 {
+            terminated = true;
+            break;
+        }
+    }
+
+    // 3. Escalate to SIGKILL if not terminated within timeout
+    if !terminated {
+        let kret = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                child_pidfd,
+                libc::SIGKILL,
+                std::ptr::null::<libc::c_void>(),
+                0,
+            )
+        };
+        if kret != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                let mut status = 0;
+                let wres = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
+                if wres == child_pid
+                    || (wres < 0
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
+                {
+                    *child_reaped = true;
+                    return Ok(());
+                }
+            }
+            // Do not block indefinitely after unsuccessful SIGKILL delivery
+            return Err(format!(
+                "Failed to send SIGKILL to child PID {}: {}",
+                child_pid, err
+            ));
+        }
+
+        let kill_start = std::time::Instant::now();
+        let kill_timeout = std::time::Duration::from_secs(2);
+        let mut kill_terminated = false;
+
+        while kill_start.elapsed() < kill_timeout {
+            let rem_ms = (kill_timeout
+                .saturating_sub(kill_start.elapsed())
+                .as_millis() as i32)
+                .max(1);
+            let pret = unsafe { libc::poll(&mut pfd, 1, rem_ms) };
+            if pret < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue; // Retry poll on EINTR
+                }
+                return Err(format!("Poll failed on child pidfd after SIGKILL: {}", err));
+            }
+            if pret == 0 {
+                break;
+            }
+            if (pfd.revents & libc::POLLIN) != 0 {
+                kill_terminated = true;
+                break;
+            }
+        }
+
+        if !kill_terminated {
+            return Err(format!(
+                "Child PID {} failed to terminate within 2s after SIGKILL",
+                child_pid
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub fn run_supervisor_finalization(
+    id: &str,
+    child_pid: i32,
+    container_dir: &Path,
+    owns_cgroup: bool,
+    start_fifo_path: &Path,
+    exec_fifo_path: &Path,
+    child_reaped: bool,
+) -> std::result::Result<(), String> {
+    // 1. Enforce child reaping via waitpid
+    if !child_reaped {
+        let mut status = 0;
+        loop {
+            let res = unsafe { libc::waitpid(child_pid, &mut status, 0) };
+            if res < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(format!(
+                    "Supervisor failed to reap child PID {}: {}",
+                    child_pid, err
+                ));
+            }
+            if res == child_pid {
+                break;
+            } else {
+                return Err(format!(
+                    "waitpid returned unexpected PID {} (expected {})",
+                    res, child_pid
+                ));
+            }
+        }
+    }
+
+    // 2. Persist Stopped state to state.json under StateLock
+    let state_file = container_dir.join("state.json");
+    let lock_path = container_dir.join("state.lock");
+
+    let _lock = crate::executor::StateLock::acquire(&lock_path)
+        .map_err(|e| format!("Failed to acquire state lock: {}", e))?;
+
+    let content =
+        fs::read_to_string(&state_file).map_err(|e| format!("Failed to read state file: {}", e))?;
+
+    let mut st = serde_json::from_str::<ContainerState>(&content)
+        .map_err(|e| format!("Failed to parse state JSON: {}", e))?;
+
+    st.status = ContainerStatus::Stopped;
+    let tmp_file = container_dir.join("state.json.tmp");
+    let json = serde_json::to_string_pretty(&st)
+        .map_err(|e| format!("Failed to serialize state JSON: {}", e))?;
+
+    fs::write(&tmp_file, json).map_err(|e| format!("Failed to write tmp state file: {}", e))?;
+
+    fs::rename(&tmp_file, &state_file)
+        .map_err(|e| format!("Failed to replace state file: {}", e))?;
+
+    // 3. Destroy container cgroup if owned by this supervisor
+    if owns_cgroup {
+        let mgr = tavik_cgroups::CgroupManager::new()
+            .map_err(|e| format!("Failed to initialize cgroup manager: {}", e))?;
+        mgr.destroy_container_cgroup(id)
+            .map_err(|e| format!("Failed to destroy cgroup for container '{}': {}", id, e))?;
+    }
+
+    // 4. Remove FIFO files
+    let _ = fs::remove_file(start_fifo_path);
+    let _ = fs::remove_file(exec_fifo_path);
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+pub fn finalize_supervisor(
+    id: &str,
+    child_pid: i32,
+    child_pidfd: i32,
+    control_listener_fd: i32,
+    container_dir: &Path,
+    owns_cgroup: bool,
+    start_fifo_path: &Path,
+    exec_fifo_path: &Path,
+    control_sock_path: &Path,
+    child_reaped: bool,
+    client_fd: Option<i32>,
+) -> ! {
+    match run_supervisor_finalization(
+        id,
+        child_pid,
+        container_dir,
+        owns_cgroup,
+        start_fifo_path,
+        exec_fifo_path,
+        child_reaped,
+    ) {
+        Ok(()) => {
+            if let Some(cfd) = client_fd {
+                let _ = unsafe { libc::write(cfd, b"OK\n".as_ptr() as _, 3) };
+                unsafe { libc::close(cfd) };
+            }
+            unsafe {
+                libc::close(child_pidfd);
+                libc::close(control_listener_fd);
+            }
+            let _ = fs::remove_file(control_sock_path);
+            unsafe { libc::_exit(0) };
+        }
+        Err(err_msg) => {
+            eprintln!(
+                "CRITICAL: Supervisor finalization failed for container '{}': {}",
+                id, err_msg
+            );
+            if let Some(cfd) = client_fd {
+                let resp = format!("ERR {}\n", err_msg);
+                let _ = unsafe { libc::write(cfd, resp.as_ptr() as _, resp.len()) };
+                unsafe { libc::close(cfd) };
+            }
+            unsafe {
+                libc::close(child_pidfd);
+                libc::close(control_listener_fd);
+                libc::_exit(1);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn supervise_container_process(
+    id: &str,
+    child_pid: i32,
+    child_pidfd: i32,
+    container_dir: &Path,
+    owns_cgroup: bool,
+    control_listener_fd: i32,
+) -> ! {
+    let start_fifo_path = container_dir.join("start.fifo");
+    let exec_fifo_path = container_dir.join("exec.fifo");
+    let control_sock_path = container_dir.join("control.sock");
 
     loop {
         let mut pfds = [
@@ -712,18 +1004,50 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
                                     0,
                                 )
                             };
-                            if ret == 0
-                                || std::io::Error::last_os_error().raw_os_error()
-                                    == Some(libc::ESRCH)
-                            {
+                            if ret == 0 {
                                 let _ = unsafe { libc::write(client_fd, b"OK\n".as_ptr() as _, 3) };
                             } else {
-                                let err_msg = format!("ERR {}\n", std::io::Error::last_os_error());
-                                let _ = unsafe {
-                                    libc::write(client_fd, err_msg.as_ptr() as _, err_msg.len())
-                                };
+                                let err = std::io::Error::last_os_error();
+                                if err.raw_os_error() == Some(libc::ESRCH) {
+                                    let mut status = 0;
+                                    let wres = unsafe {
+                                        libc::waitpid(child_pid, &mut status, libc::WNOHANG)
+                                    };
+                                    if wres == child_pid
+                                        || (wres < 0
+                                            && std::io::Error::last_os_error().raw_os_error()
+                                                == Some(libc::ECHILD))
+                                    {
+                                        let _ = unsafe {
+                                            libc::write(client_fd, b"OK\n".as_ptr() as _, 3)
+                                        };
+                                    } else {
+                                        let err_msg = format!(
+                                            "ERR ESRCH but child PID {} not reaped\n",
+                                            child_pid
+                                        );
+                                        let _ = unsafe {
+                                            libc::write(
+                                                client_fd,
+                                                err_msg.as_ptr() as _,
+                                                err_msg.len(),
+                                            )
+                                        };
+                                    }
+                                } else {
+                                    let err_msg = format!("ERR {}\n", err);
+                                    let _ = unsafe {
+                                        libc::write(client_fd, err_msg.as_ptr() as _, err_msg.len())
+                                    };
+                                }
                             }
+                        } else {
+                            let err_msg = "ERR Invalid signal number\n";
+                            let _ = unsafe {
+                                libc::write(client_fd, err_msg.as_ptr() as _, err_msg.len())
+                            };
                         }
+                        unsafe { libc::close(client_fd) };
                     } else if cmd_str.starts_with("STOP ") {
                         let parts: Vec<&str> = cmd_str.split_whitespace().collect();
                         let sig = parts
@@ -734,205 +1058,115 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
                             .get(2)
                             .and_then(|s| s.parse::<i32>().ok())
                             .unwrap_or(10000);
+                        let timeout = std::time::Duration::from_millis(timeout_ms as u64);
 
-                        let _ = unsafe {
-                            libc::syscall(
-                                libc::SYS_pidfd_send_signal,
-                                child_pidfd,
-                                sig,
-                                std::ptr::null::<libc::c_void>(),
-                                0,
-                            )
-                        };
-
-                        let mut stop_pfd = libc::pollfd {
-                            fd: child_pidfd,
-                            events: libc::POLLIN,
-                            revents: 0,
-                        };
-                        let start_time = std::time::Instant::now();
-                        let mut terminated = false;
-                        let timeout_dur = std::time::Duration::from_millis(timeout_ms as u64);
-
-                        while start_time.elapsed() < timeout_dur {
-                            let rem_ms = (timeout_dur
-                                .saturating_sub(start_time.elapsed())
-                                .as_millis() as i32)
-                                .max(1);
-                            let pret = unsafe { libc::poll(&mut stop_pfd, 1, rem_ms) };
-                            if pret < 0 {
-                                let err = std::io::Error::last_os_error();
-                                if err.raw_os_error() == Some(libc::EINTR) {
-                                    continue;
-                                }
-                                break;
-                            }
-                            if pret > 0 && (stop_pfd.revents & libc::POLLIN != 0) {
-                                terminated = true;
-                                break;
-                            }
-                        }
-
-                        if !terminated {
-                            let _ = unsafe {
-                                libc::syscall(
-                                    libc::SYS_pidfd_send_signal,
+                        let mut child_reaped = false;
+                        match terminate_child_with_escalation(
+                            child_pid,
+                            child_pidfd,
+                            sig,
+                            timeout,
+                            &mut child_reaped,
+                        ) {
+                            Ok(()) => {
+                                finalize_supervisor(
+                                    id,
+                                    child_pid,
                                     child_pidfd,
-                                    libc::SIGKILL,
-                                    std::ptr::null::<libc::c_void>(),
-                                    0,
-                                )
-                            };
-                            let mut kill_pfd = libc::pollfd {
-                                fd: child_pidfd,
-                                events: libc::POLLIN,
-                                revents: 0,
-                            };
-                            let _ = unsafe { libc::poll(&mut kill_pfd, 1, 2000) };
-                        }
-
-                        let mut status = 0;
-                        loop {
-                            let wres = unsafe { libc::waitpid(child_pid, &mut status, 0) };
-                            if wres < 0 {
-                                let werr = std::io::Error::last_os_error();
-                                if werr.raw_os_error() == Some(libc::EINTR) {
-                                    continue;
-                                }
-                                eprintln!("Supervisor waitpid after STOP failed: {}", werr);
-                                break;
+                                    control_listener_fd,
+                                    container_dir,
+                                    owns_cgroup,
+                                    &start_fifo_path,
+                                    &exec_fifo_path,
+                                    &control_sock_path,
+                                    child_reaped,
+                                    Some(client_fd),
+                                );
                             }
-                            if wres == child_pid {
-                                child_reaped = true;
-                                break;
+                            Err(e) => {
+                                let err_msg = format!("ERR {}\n", e);
+                                let _ = unsafe {
+                                    libc::write(client_fd, err_msg.as_ptr() as _, err_msg.len())
+                                };
+                                unsafe { libc::close(client_fd) };
                             }
                         }
-
-                        let _ = unsafe { libc::write(client_fd, b"OK\n".as_ptr() as _, 3) };
-                        unsafe { libc::close(client_fd) };
-                        break;
                     } else if cmd_str == "CANCEL" {
-                        let _ = unsafe {
-                            libc::syscall(
-                                libc::SYS_pidfd_send_signal,
-                                child_pidfd,
-                                libc::SIGKILL,
-                                std::ptr::null::<libc::c_void>(),
-                                0,
-                            )
-                        };
-                        let mut cancel_pfd = libc::pollfd {
-                            fd: child_pidfd,
-                            events: libc::POLLIN,
-                            revents: 0,
-                        };
-                        let _ = unsafe { libc::poll(&mut cancel_pfd, 1, 2000) };
-
-                        let mut status = 0;
-                        loop {
-                            let wres = unsafe { libc::waitpid(child_pid, &mut status, 0) };
-                            if wres < 0 {
-                                let werr = std::io::Error::last_os_error();
-                                if werr.raw_os_error() == Some(libc::EINTR) {
-                                    continue;
-                                }
-                                eprintln!("Supervisor waitpid after CANCEL failed: {}", werr);
-                                break;
+                        let mut child_reaped = false;
+                        match terminate_child_with_escalation(
+                            child_pid,
+                            child_pidfd,
+                            libc::SIGKILL,
+                            std::time::Duration::from_millis(50),
+                            &mut child_reaped,
+                        ) {
+                            Ok(()) => {
+                                finalize_supervisor(
+                                    id,
+                                    child_pid,
+                                    child_pidfd,
+                                    control_listener_fd,
+                                    container_dir,
+                                    owns_cgroup,
+                                    &start_fifo_path,
+                                    &exec_fifo_path,
+                                    &control_sock_path,
+                                    child_reaped,
+                                    Some(client_fd),
+                                );
                             }
-                            if wres == child_pid {
-                                child_reaped = true;
-                                break;
+                            Err(e) => {
+                                let err_msg = format!("ERR {}\n", e);
+                                let _ = unsafe {
+                                    libc::write(client_fd, err_msg.as_ptr() as _, err_msg.len())
+                                };
+                                unsafe { libc::close(client_fd) };
                             }
                         }
-
-                        let _ = unsafe { libc::write(client_fd, b"OK\n".as_ptr() as _, 3) };
+                    } else {
+                        let err_msg = format!("ERR Unknown control command: {}\n", cmd_str);
+                        let _ =
+                            unsafe { libc::write(client_fd, err_msg.as_ptr() as _, err_msg.len()) };
                         unsafe { libc::close(client_fd) };
-                        break;
                     }
+                } else {
+                    unsafe { libc::close(client_fd) };
                 }
-                unsafe { libc::close(client_fd) };
             }
         }
 
         // 2. Check for child termination
         if (pfds[1].revents & libc::POLLIN) != 0 {
-            let mut status = 0;
-            loop {
-                let res = unsafe { libc::waitpid(child_pid, &mut status, 0) };
-                if res < 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.raw_os_error() == Some(libc::EINTR) {
-                        continue;
-                    }
-                    eprintln!(
-                        "CRITICAL: Supervisor failed to reap child PID {}: {}",
-                        child_pid, err
-                    );
-                    break;
-                }
-                if res == child_pid {
-                    child_reaped = true;
-                    break;
-                }
-            }
-            break;
+            finalize_supervisor(
+                id,
+                child_pid,
+                child_pidfd,
+                control_listener_fd,
+                container_dir,
+                owns_cgroup,
+                &start_fifo_path,
+                &exec_fifo_path,
+                &control_sock_path,
+                false,
+                None,
+            );
         }
     }
 
-    unsafe {
-        libc::close(child_pidfd);
-        libc::close(control_listener_fd);
-    }
-
-    if child_reaped {
-        // Confirmed termination: transition container state to Stopped with StateLock
-        let lock_path = container_dir.join("state.lock");
-        if let Ok(_lock) = crate::executor::StateLock::acquire(&lock_path) {
-            if let Ok(content) = fs::read_to_string(&state_file) {
-                if let Ok(mut st) = serde_json::from_str::<ContainerState>(&content) {
-                    st.status = ContainerStatus::Stopped;
-                    let tmp_file = container_dir.join("state.json.tmp");
-                    if let Ok(json) = serde_json::to_string_pretty(&st) {
-                        if fs::write(&tmp_file, json).is_ok() {
-                            let _ = fs::rename(&tmp_file, &state_file);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Destroy container cgroup on exit ONLY if owned by this supervisor
-        if owns_cgroup {
-            match tavik_cgroups::CgroupManager::new() {
-                Ok(mgr) => {
-                    if let Err(e) = mgr.destroy_container_cgroup(id) {
-                        eprintln!(
-                            "Warning: failed to destroy cgroup for container '{}': {}",
-                            id, e
-                        );
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Warning: failed to initialize cgroup manager for cleanup of '{}': {}",
-                        id, e
-                    );
-                }
-            }
-        }
-
-        let _ = fs::remove_file(&start_fifo_path);
-        let _ = fs::remove_file(&exec_fifo_path);
-        let _ = fs::remove_file(&control_sock_path);
-
-        unsafe { libc::_exit(0) };
-    } else {
-        eprintln!(
-            "CRITICAL: Supervisor for container '{}' exiting without confirming child PID {} reaped; resources preserved for safety",
-            id, child_pid
-        );
-        unsafe { libc::_exit(1) };
-    }
+    // In case supervisor event loop breaks unexpectedly, run finalization
+    finalize_supervisor(
+        id,
+        child_pid,
+        child_pidfd,
+        control_listener_fd,
+        container_dir,
+        owns_cgroup,
+        &start_fifo_path,
+        &exec_fifo_path,
+        &control_sock_path,
+        false,
+        None,
+    );
 }
 
 #[cfg(target_os = "linux")]

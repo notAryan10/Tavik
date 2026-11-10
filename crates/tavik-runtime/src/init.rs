@@ -168,7 +168,7 @@ fn create_control_listener(sock_path: &Path) -> Result<i32> {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn send_control_command(sock_path: &Path, cmd: &str) -> Result<String> {
+pub fn send_control_command(sock_path: &Path, cmd: &str) -> Result<String> {
     use std::os::unix::ffi::OsStrExt;
 
     let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
@@ -249,17 +249,119 @@ pub(crate) fn send_control_command(sock_path: &Path, cmd: &str) -> Result<String
         if resp.contains(&b'\n') {
             break;
         }
+        if resp.len() > 4096 {
+            unsafe { libc::close(fd) };
+            return Err(TavikError::Execution(
+                "Control socket response exceeded maximum length (4096 bytes)".to_string(),
+            ));
+        }
     }
     unsafe { libc::close(fd) };
 
-    let s = String::from_utf8_lossy(&resp).trim().to_string();
-    if s.starts_with("ERR") {
+    parse_control_response(&resp)
+}
+
+#[cfg(target_os = "linux")]
+pub fn parse_control_response(resp: &[u8]) -> Result<String> {
+    if resp.is_empty() {
+        return Err(TavikError::Execution(
+            "Control socket returned empty response (peer closed connection without response)"
+                .to_string(),
+        ));
+    }
+
+    let newline_idx = resp.iter().position(|&b| b == b'\n').ok_or_else(|| {
+        TavikError::Execution(format!(
+            "Control socket response incomplete (missing newline delimiter): {:?}",
+            String::from_utf8_lossy(resp)
+        ))
+    })?;
+
+    let line = String::from_utf8_lossy(&resp[..newline_idx])
+        .trim_end()
+        .to_string();
+
+    if line.starts_with("ERR") {
         return Err(TavikError::Execution(format!(
             "Supervisor control error: {}",
-            s
+            line
         )));
     }
-    Ok(s)
+
+    if line == "OK" || line.starts_with("OK ") {
+        return Ok(line);
+    }
+
+    Err(TavikError::Execution(format!(
+        "Control socket returned malformed response (expected 'OK'): {:?}",
+        line
+    )))
+}
+
+#[cfg(target_os = "linux")]
+pub fn read_control_command(client_fd: i32) -> std::io::Result<Option<String>> {
+    let mut cmd_buf = Vec::new();
+    let mut buf = [0u8; 64];
+    loop {
+        let n = unsafe { libc::read(client_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(err);
+        }
+        if n == 0 {
+            if cmd_buf.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        cmd_buf.extend_from_slice(&buf[..n as usize]);
+        if cmd_buf.contains(&b'\n') {
+            break;
+        }
+        if cmd_buf.len() > 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Control command exceeds maximum length (1024 bytes)",
+            ));
+        }
+    }
+
+    if let Some(pos) = cmd_buf.iter().position(|&b| b == b'\n') {
+        let cmd = String::from_utf8_lossy(&cmd_buf[..pos]).trim().to_string();
+        Ok(Some(cmd))
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "Control command missing newline delimiter",
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn write_control_response(client_fd: i32, resp: &str) -> std::io::Result<()> {
+    let bytes = resp.as_bytes();
+    let mut written = 0;
+    while written < bytes.len() {
+        let n = unsafe {
+            libc::write(
+                client_fd,
+                bytes.as_ptr().add(written) as *const libc::c_void,
+                bytes.len() - written,
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(err);
+        }
+        written += n as usize;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -607,6 +709,8 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
         unsafe { libc::_exit(1) };
     }
 
+    let owns_cgroup = cgroup_guard.is_some();
+
     // 12. Record host PID and persist state as Created (FAIL-CLOSED)
     let pid_write_res = fs::write(&pid_file, child_pid.to_string());
     let state_write_res = (|| -> Result<()> {
@@ -616,6 +720,13 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
         let mut updated_state = state;
         updated_state.status = ContainerStatus::Created;
         updated_state.pid = Some(child_pid as u32);
+        if owns_cgroup {
+            updated_state
+                .annotations
+                .insert("io.tavik.cgroup.owned".to_string(), "true".to_string());
+            let cgroup_owner_file = container_dir.join("cgroup.owner");
+            fs::write(&cgroup_owner_file, b"1\n")?;
+        }
         let tmp_file = container_dir.join("state.json.tmp");
         let json = serde_json::to_string_pretty(&updated_state)?;
         fs::write(&tmp_file, json)?;
@@ -624,6 +735,7 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
     })();
 
     if let Err(e) = state_write_res {
+        let _ = fs::remove_file(container_dir.join("cgroup.owner"));
         unsafe {
             libc::kill(child_pid, libc::SIGKILL);
             let mut status = 0;
@@ -637,8 +749,6 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
         drop(cgroup_guard);
         unsafe { libc::_exit(1) };
     }
-
-    let owns_cgroup = cgroup_guard.is_some();
 
     // Ownership of cgroup transferred to running container lifecycle; disarm guard
     if let Some(mut guard) = cgroup_guard {
@@ -868,11 +978,30 @@ pub fn run_supervisor_finalization(
             .map_err(|e| format!("Failed to initialize cgroup manager: {}", e))?;
         mgr.destroy_container_cgroup(id)
             .map_err(|e| format!("Failed to destroy cgroup for container '{}': {}", id, e))?;
+        let _ = fs::remove_file(container_dir.join("cgroup.owner"));
     }
 
     // 4. Remove FIFO files
-    let _ = fs::remove_file(start_fifo_path);
-    let _ = fs::remove_file(exec_fifo_path);
+    if start_fifo_path.exists() {
+        if let Err(e) = fs::remove_file(start_fifo_path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(format!(
+                    "Failed to remove start FIFO at {:?}: {}",
+                    start_fifo_path, e
+                ));
+            }
+        }
+    }
+    if exec_fifo_path.exists() {
+        if let Err(e) = fs::remove_file(exec_fifo_path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(format!(
+                    "Failed to remove exec FIFO at {:?}: {}",
+                    exec_fifo_path, e
+                ));
+            }
+        }
+    }
 
     Ok(())
 }
@@ -903,7 +1032,7 @@ pub fn finalize_supervisor(
     ) {
         Ok(()) => {
             if let Some(cfd) = client_fd {
-                let _ = unsafe { libc::write(cfd, b"OK\n".as_ptr() as _, 3) };
+                let _ = write_control_response(cfd, "OK\n");
                 unsafe { libc::close(cfd) };
             }
             unsafe {
@@ -920,7 +1049,7 @@ pub fn finalize_supervisor(
             );
             if let Some(cfd) = client_fd {
                 let resp = format!("ERR {}\n", err_msg);
-                let _ = unsafe { libc::write(cfd, resp.as_ptr() as _, resp.len()) };
+                let _ = write_control_response(cfd, &resp);
                 unsafe { libc::close(cfd) };
             }
             unsafe {
@@ -980,157 +1109,139 @@ fn supervise_container_process(
                 )
             };
             if client_fd >= 0 {
-                let mut cmd_buf = [0u8; 128];
-                let n = unsafe {
-                    libc::read(
-                        client_fd,
-                        cmd_buf.as_mut_ptr() as *mut libc::c_void,
-                        cmd_buf.len() - 1,
-                    )
-                };
-                if n > 0 {
-                    let cmd_str = String::from_utf8_lossy(&cmd_buf[..n as usize])
-                        .trim()
-                        .to_string();
-                    if cmd_str.starts_with("KILL ") {
-                        let sig_str = cmd_str.trim_start_matches("KILL ").trim();
-                        if let Ok(sig) = sig_str.parse::<i32>() {
-                            let ret = unsafe {
-                                libc::syscall(
-                                    libc::SYS_pidfd_send_signal,
-                                    child_pidfd,
-                                    sig,
-                                    std::ptr::null::<libc::c_void>(),
-                                    0,
-                                )
-                            };
-                            if ret == 0 {
-                                let _ = unsafe { libc::write(client_fd, b"OK\n".as_ptr() as _, 3) };
-                            } else {
-                                let err = std::io::Error::last_os_error();
-                                if err.raw_os_error() == Some(libc::ESRCH) {
-                                    let mut status = 0;
-                                    let wres = unsafe {
-                                        libc::waitpid(child_pid, &mut status, libc::WNOHANG)
-                                    };
-                                    if wres == child_pid
-                                        || (wres < 0
-                                            && std::io::Error::last_os_error().raw_os_error()
-                                                == Some(libc::ECHILD))
-                                    {
-                                        let _ = unsafe {
-                                            libc::write(client_fd, b"OK\n".as_ptr() as _, 3)
-                                        };
-                                    } else {
-                                        let err_msg = format!(
-                                            "ERR ESRCH but child PID {} not reaped\n",
-                                            child_pid
-                                        );
-                                        let _ = unsafe {
-                                            libc::write(
-                                                client_fd,
-                                                err_msg.as_ptr() as _,
-                                                err_msg.len(),
-                                            )
-                                        };
-                                    }
+                match read_control_command(client_fd) {
+                    Ok(Some(cmd_str)) => {
+                        if cmd_str.starts_with("KILL ") {
+                            let sig_str = cmd_str.trim_start_matches("KILL ").trim();
+                            if let Ok(sig) = sig_str.parse::<i32>() {
+                                let ret = unsafe {
+                                    libc::syscall(
+                                        libc::SYS_pidfd_send_signal,
+                                        child_pidfd,
+                                        sig,
+                                        std::ptr::null::<libc::c_void>(),
+                                        0,
+                                    )
+                                };
+                                if ret == 0 {
+                                    let _ = write_control_response(client_fd, "OK\n");
                                 } else {
-                                    let err_msg = format!("ERR {}\n", err);
-                                    let _ = unsafe {
-                                        libc::write(client_fd, err_msg.as_ptr() as _, err_msg.len())
-                                    };
+                                    let err = std::io::Error::last_os_error();
+                                    if err.raw_os_error() == Some(libc::ESRCH) {
+                                        let mut status = 0;
+                                        let wres = unsafe {
+                                            libc::waitpid(child_pid, &mut status, libc::WNOHANG)
+                                        };
+                                        if wres == child_pid
+                                            || (wres < 0
+                                                && std::io::Error::last_os_error().raw_os_error()
+                                                    == Some(libc::ECHILD))
+                                        {
+                                            let _ = write_control_response(client_fd, "OK\n");
+                                        } else {
+                                            let err_msg = format!(
+                                                "ERR ESRCH but child PID {} not reaped\n",
+                                                child_pid
+                                            );
+                                            let _ = write_control_response(client_fd, &err_msg);
+                                        }
+                                    } else {
+                                        let err_msg = format!("ERR {}\n", err);
+                                        let _ = write_control_response(client_fd, &err_msg);
+                                    }
+                                }
+                            } else {
+                                let _ = write_control_response(
+                                    client_fd,
+                                    "ERR Invalid signal number\n",
+                                );
+                            }
+                            unsafe { libc::close(client_fd) };
+                        } else if cmd_str.starts_with("STOP ") {
+                            let parts: Vec<&str> = cmd_str.split_whitespace().collect();
+                            let sig = parts
+                                .get(1)
+                                .and_then(|s| s.parse::<i32>().ok())
+                                .unwrap_or(libc::SIGTERM);
+                            let timeout_ms = parts
+                                .get(2)
+                                .and_then(|s| s.parse::<i32>().ok())
+                                .unwrap_or(10000);
+                            let timeout = std::time::Duration::from_millis(timeout_ms as u64);
+
+                            let mut child_reaped = false;
+                            match terminate_child_with_escalation(
+                                child_pid,
+                                child_pidfd,
+                                sig,
+                                timeout,
+                                &mut child_reaped,
+                            ) {
+                                Ok(()) => {
+                                    finalize_supervisor(
+                                        id,
+                                        child_pid,
+                                        child_pidfd,
+                                        control_listener_fd,
+                                        container_dir,
+                                        owns_cgroup,
+                                        &start_fifo_path,
+                                        &exec_fifo_path,
+                                        &control_sock_path,
+                                        child_reaped,
+                                        Some(client_fd),
+                                    );
+                                }
+                                Err(e) => {
+                                    let err_msg = format!("ERR {}\n", e);
+                                    let _ = write_control_response(client_fd, &err_msg);
+                                    unsafe { libc::close(client_fd) };
+                                }
+                            }
+                        } else if cmd_str == "CANCEL" {
+                            let mut child_reaped = false;
+                            match terminate_child_with_escalation(
+                                child_pid,
+                                child_pidfd,
+                                libc::SIGKILL,
+                                std::time::Duration::from_millis(50),
+                                &mut child_reaped,
+                            ) {
+                                Ok(()) => {
+                                    finalize_supervisor(
+                                        id,
+                                        child_pid,
+                                        child_pidfd,
+                                        control_listener_fd,
+                                        container_dir,
+                                        owns_cgroup,
+                                        &start_fifo_path,
+                                        &exec_fifo_path,
+                                        &control_sock_path,
+                                        child_reaped,
+                                        Some(client_fd),
+                                    );
+                                }
+                                Err(e) => {
+                                    let err_msg = format!("ERR {}\n", e);
+                                    let _ = write_control_response(client_fd, &err_msg);
+                                    unsafe { libc::close(client_fd) };
                                 }
                             }
                         } else {
-                            let err_msg = "ERR Invalid signal number\n";
-                            let _ = unsafe {
-                                libc::write(client_fd, err_msg.as_ptr() as _, err_msg.len())
-                            };
+                            let err_msg = format!("ERR Unknown control command: {}\n", cmd_str);
+                            let _ = write_control_response(client_fd, &err_msg);
+                            unsafe { libc::close(client_fd) };
                         }
-                        unsafe { libc::close(client_fd) };
-                    } else if cmd_str.starts_with("STOP ") {
-                        let parts: Vec<&str> = cmd_str.split_whitespace().collect();
-                        let sig = parts
-                            .get(1)
-                            .and_then(|s| s.parse::<i32>().ok())
-                            .unwrap_or(libc::SIGTERM);
-                        let timeout_ms = parts
-                            .get(2)
-                            .and_then(|s| s.parse::<i32>().ok())
-                            .unwrap_or(10000);
-                        let timeout = std::time::Duration::from_millis(timeout_ms as u64);
-
-                        let mut child_reaped = false;
-                        match terminate_child_with_escalation(
-                            child_pid,
-                            child_pidfd,
-                            sig,
-                            timeout,
-                            &mut child_reaped,
-                        ) {
-                            Ok(()) => {
-                                finalize_supervisor(
-                                    id,
-                                    child_pid,
-                                    child_pidfd,
-                                    control_listener_fd,
-                                    container_dir,
-                                    owns_cgroup,
-                                    &start_fifo_path,
-                                    &exec_fifo_path,
-                                    &control_sock_path,
-                                    child_reaped,
-                                    Some(client_fd),
-                                );
-                            }
-                            Err(e) => {
-                                let err_msg = format!("ERR {}\n", e);
-                                let _ = unsafe {
-                                    libc::write(client_fd, err_msg.as_ptr() as _, err_msg.len())
-                                };
-                                unsafe { libc::close(client_fd) };
-                            }
-                        }
-                    } else if cmd_str == "CANCEL" {
-                        let mut child_reaped = false;
-                        match terminate_child_with_escalation(
-                            child_pid,
-                            child_pidfd,
-                            libc::SIGKILL,
-                            std::time::Duration::from_millis(50),
-                            &mut child_reaped,
-                        ) {
-                            Ok(()) => {
-                                finalize_supervisor(
-                                    id,
-                                    child_pid,
-                                    child_pidfd,
-                                    control_listener_fd,
-                                    container_dir,
-                                    owns_cgroup,
-                                    &start_fifo_path,
-                                    &exec_fifo_path,
-                                    &control_sock_path,
-                                    child_reaped,
-                                    Some(client_fd),
-                                );
-                            }
-                            Err(e) => {
-                                let err_msg = format!("ERR {}\n", e);
-                                let _ = unsafe {
-                                    libc::write(client_fd, err_msg.as_ptr() as _, err_msg.len())
-                                };
-                                unsafe { libc::close(client_fd) };
-                            }
-                        }
-                    } else {
-                        let err_msg = format!("ERR Unknown control command: {}\n", cmd_str);
-                        let _ =
-                            unsafe { libc::write(client_fd, err_msg.as_ptr() as _, err_msg.len()) };
+                    }
+                    Ok(None) => {
                         unsafe { libc::close(client_fd) };
                     }
-                } else {
-                    unsafe { libc::close(client_fd) };
+                    Err(e) => {
+                        let err_msg = format!("ERR Malformed command: {}\n", e);
+                        let _ = write_control_response(client_fd, &err_msg);
+                        unsafe { libc::close(client_fd) };
+                    }
                 }
             }
         }

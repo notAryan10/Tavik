@@ -2256,3 +2256,323 @@ fn test_linux_force_delete_running_container() {
         assert!(executor.load_state(id).is_err());
     }
 }
+
+#[test]
+fn test_strict_supervisor_control_protocol() {
+    #[cfg(target_os = "linux")]
+    {
+        use tavik_runtime::init::parse_control_response;
+
+        // 1. Explicit OK\n response is accepted
+        assert_eq!(parse_control_response(b"OK\n").unwrap(), "OK");
+        assert_eq!(
+            parse_control_response(b"OK success\n").unwrap(),
+            "OK success"
+        );
+
+        // 2. Empty EOF returns error
+        let empty_err = parse_control_response(b"").unwrap_err();
+        match empty_err {
+            tavik_common::error::TavikError::Execution(msg) => {
+                assert!(msg.contains("empty response"), "msg was: {}", msg);
+            }
+            other => panic!(
+                "Expected Execution error for empty response, got: {:?}",
+                other
+            ),
+        }
+
+        // 3. Incomplete response (no newline) returns error
+        let incomplete_err = parse_control_response(b"OK").unwrap_err();
+        match incomplete_err {
+            tavik_common::error::TavikError::Execution(msg) => {
+                assert!(msg.contains("incomplete"), "msg was: {}", msg);
+            }
+            other => panic!(
+                "Expected Execution error for incomplete response, got: {:?}",
+                other
+            ),
+        }
+
+        // 4. Malformed responses return error
+        let malformed_err1 = parse_control_response(b"UNKNOWN\n").unwrap_err();
+        match malformed_err1 {
+            tavik_common::error::TavikError::Execution(msg) => {
+                assert!(msg.contains("malformed response"), "msg was: {}", msg);
+            }
+            other => panic!(
+                "Expected Execution error for malformed response, got: {:?}",
+                other
+            ),
+        }
+
+        let malformed_err2 = parse_control_response(b"SUCCESS\n").unwrap_err();
+        assert!(malformed_err2.to_string().contains("malformed response"));
+
+        // 5. ERR responses preserve error message
+        let err_resp = parse_control_response(b"ERR failed to reap child\n").unwrap_err();
+        match err_resp {
+            tavik_common::error::TavikError::Execution(msg) => {
+                assert!(
+                    msg.contains("Supervisor control error: ERR failed to reap child"),
+                    "msg was: {}",
+                    msg
+                );
+            }
+            other => panic!(
+                "Expected Execution error for ERR response, got: {:?}",
+                other
+            ),
+        }
+    }
+}
+
+#[test]
+fn test_durable_cgroup_ownership_and_deletion_safety() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let bundle_dir = temp.path().join("bundle");
+    let rootfs = bundle_dir.join("rootfs");
+    fs::create_dir_all(&rootfs).unwrap();
+
+    let mut spec = Spec::default_linux();
+    if let Some(linux) = &mut spec.linux {
+        // Spec with resource limits (owned cgroup)
+        linux.resources = Some(tavik_cgroups::CgroupResources {
+            memory: Some(tavik_cgroups::MemoryResources {
+                limit: Some(1024 * 1024 * 64),
+                high: None,
+                swap: None,
+            }),
+            cpu: None,
+            pids: None,
+        });
+    }
+    fs::write(
+        bundle_dir.join("config.json"),
+        serde_json::to_string_pretty(&spec).unwrap(),
+    )
+    .unwrap();
+
+    let executor = ContainerExecutor::new(state_dir.clone()).unwrap();
+    let container_id = "test-cgroup-durable-ownership";
+    let state = executor.create(container_id, &bundle_dir).unwrap();
+    assert_eq!(state.status, ContainerStatus::Created);
+
+    // 1. Manually mark cgroup.owner and annotation
+    let cont_dir = state_dir.join(container_id);
+    fs::write(cont_dir.join("cgroup.owner"), b"1\n").unwrap();
+    let mut updated_state = state.clone();
+    updated_state
+        .annotations
+        .insert("io.tavik.cgroup.owned".to_string(), "true".to_string());
+    fs::write(
+        cont_dir.join("state.json"),
+        serde_json::to_string_pretty(&updated_state).unwrap(),
+    )
+    .unwrap();
+
+    // Verify cgroup ownership is recognized
+    assert!(executor.has_cgroup_ownership(container_id, &updated_state));
+
+    // 2. Remove the original OCI bundle entirely!
+    fs::remove_dir_all(&bundle_dir).unwrap();
+    assert!(!bundle_dir.exists());
+
+    // 3. Verify cgroup ownership is STILL recognized even with missing/unreadable bundle!
+    let reloaded_state = executor.load_state(container_id).unwrap();
+    assert!(executor.has_cgroup_ownership(container_id, &reloaded_state));
+
+    // 4. Delete container: successfully deletes and cleans up cgroup even without bundle
+    let del_res = executor.delete(container_id, false);
+    assert!(del_res.is_ok(), "delete failed: {:?}", del_res);
+    assert!(!cont_dir.exists());
+}
+
+#[test]
+fn test_finalization_error_handling_and_recovery() {
+    #[cfg(target_os = "linux")]
+    {
+        let temp = tempdir().unwrap();
+        let container_dir = temp.path().join("container");
+        fs::create_dir_all(&container_dir).unwrap();
+
+        let state_file = container_dir.join("state.json");
+        let start_fifo = container_dir.join("start.fifo");
+        let exec_fifo = container_dir.join("exec.fifo");
+        fs::write(&start_fifo, b"").unwrap();
+        fs::write(&exec_fifo, b"").unwrap();
+
+        let initial_state = ContainerState {
+            id: "test-finalization-err-cont".to_string(),
+            status: ContainerStatus::Running,
+            pid: Some(12345),
+            bundle: temp.path().to_path_buf(),
+        };
+        fs::write(
+            &state_file,
+            serde_json::to_string_pretty(&initial_state).unwrap(),
+        )
+        .unwrap();
+
+        // 1. If start_fifo cannot be removed (e.g. replaced with a non-empty directory):
+        fs::remove_file(&start_fifo).unwrap();
+        fs::create_dir(&start_fifo).unwrap();
+        fs::write(start_fifo.join("blocking_file"), b"blocking").unwrap();
+
+        let fail_res = tavik_runtime::init::run_supervisor_finalization(
+            "test-finalization-err-cont",
+            12345,
+            &container_dir,
+            false,
+            &start_fifo,
+            &exec_fifo,
+            true, // child_reaped confirmed
+        );
+        assert!(fail_res.is_err());
+        let err_str = fail_res.unwrap_err();
+        assert!(err_str.contains("Failed to remove start FIFO"));
+
+        // 2. Recovery attempt: fix the obstacle and rerun finalization
+        fs::remove_dir_all(&start_fifo).unwrap();
+        fs::write(&start_fifo, b"").unwrap();
+
+        let recovery_res = tavik_runtime::init::run_supervisor_finalization(
+            "test-finalization-err-cont",
+            12345,
+            &container_dir,
+            false,
+            &start_fifo,
+            &exec_fifo,
+            true, // child_reaped confirmed
+        );
+        assert!(
+            recovery_res.is_ok(),
+            "Recovery attempt must succeed: {:?}",
+            recovery_res
+        );
+        assert!(!start_fifo.exists());
+        assert!(!exec_fifo.exists());
+    }
+}
+
+#[test]
+fn test_signal_escalation_esrch_and_pidfd_exit() {
+    #[cfg(target_os = "linux")]
+    {
+        // 1. Fork a child that terminates immediately
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            unsafe { libc::_exit(0) };
+        }
+
+        // 2. Open pidfd for the child while it is running / zombie
+        let child_pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child, 0) } as i32;
+
+        // 3. Reap child completely
+        let mut status = 0;
+        let wres = unsafe { libc::waitpid(child, &mut status, 0) };
+        assert_eq!(wres, child);
+
+        // 4. Now process is dead. Calling terminate_child_with_escalation must:
+        //    - see ESRCH from pidfd_send_signal (or invalid fd if pidfd closed)
+        //    - verify termination via waitpid(WNOHANG) returning ECHILD
+        //    - confirm child_reaped = true without hanging!
+        if child_pidfd >= 0 {
+            let mut child_reaped = false;
+            let res = tavik_runtime::init::terminate_child_with_escalation(
+                child,
+                child_pidfd,
+                libc::SIGTERM,
+                Duration::from_millis(100),
+                &mut child_reaped,
+            );
+            unsafe { libc::close(child_pidfd) };
+            assert!(res.is_ok());
+            assert!(
+                child_reaped,
+                "Child must be marked reaped on confirmed ESRCH/ECHILD"
+            );
+        }
+
+        // 5. Verify signalling failures do not cause false Stopped states
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let executor = ContainerExecutor::new(state_dir.clone()).unwrap();
+        let cont_id = "test-signal-failure-no-stopped";
+        let cont_dir = state_dir.join(cont_id);
+        fs::create_dir_all(&cont_dir).unwrap();
+
+        let initial_state = ContainerState {
+            id: cont_id.to_string(),
+            status: ContainerStatus::Running,
+            pid: Some(999999),
+            bundle: temp.path().to_path_buf(),
+        };
+        fs::write(
+            cont_dir.join("state.json"),
+            serde_json::to_string_pretty(&initial_state).unwrap(),
+        )
+        .unwrap();
+
+        // Control channel is unavailable; kill() must fail and state must remain Running
+        let kill_res = executor.kill(cont_id, libc::SIGTERM);
+        assert!(kill_res.is_err());
+        let current_state = executor.load_state(cont_id).unwrap();
+        assert_eq!(
+            current_state.status,
+            ContainerStatus::Running,
+            "Signalling failure must not cause false Stopped state"
+        );
+    }
+}
+
+#[test]
+fn test_linux_startup_cancellation_on_invalid_exec() {
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping rootful startup abort test (requires root)");
+            return;
+        }
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let bundle_dir = temp.path().join("bundle");
+        let rootfs = bundle_dir.join("rootfs");
+        let bin_dir = rootfs.join("bin");
+        let dev_dir = rootfs.join("dev");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&dev_dir).unwrap();
+        let _ = fs::File::create(dev_dir.join("null"));
+
+        // Point args to a non-existent binary to trigger execve failure
+        let mut spec = Spec::default_linux();
+        if let Some(proc) = &mut spec.process {
+            proc.args = vec!["/bin/nonexistent_binary_xyz".to_string()];
+        }
+        fs::write(
+            bundle_dir.join("config.json"),
+            serde_json::to_string_pretty(&spec).unwrap(),
+        )
+        .unwrap();
+
+        let executor = ContainerExecutor::new(state_dir).unwrap();
+        let id = "test-startup-abort-invalid-exec";
+        let state = executor.create(id, &bundle_dir).unwrap();
+        assert_eq!(state.status, ContainerStatus::Created);
+
+        // start must fail and trigger cancellation
+        let start_res = executor.start(id);
+        assert!(start_res.is_err());
+
+        // Verify container state is confirmed Stopped after abort
+        let final_state = executor.load_state(id).unwrap();
+        assert_eq!(final_state.status, ContainerStatus::Stopped);
+
+        // Delete container safely
+        let del_res = executor.delete(id, false);
+        assert!(del_res.is_ok());
+    }
+}

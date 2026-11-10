@@ -457,9 +457,46 @@ impl ContainerExecutor {
         }
     }
 
+    /// Checks whether the container owns a dedicated cgroup, persisting independently of the OCI bundle.
+    pub fn has_cgroup_ownership(&self, id: &str, state: &ContainerState) -> bool {
+        let container_dir = self.container_dir(id);
+        let marker = container_dir.join("cgroup.owner");
+        if marker.exists() {
+            return true;
+        }
+        if state
+            .annotations
+            .get("io.tavik.cgroup.owned")
+            .map(|v| v == "true")
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        // Fallback for backwards compatibility if bundle is accessible
+        Spec::load_from_bundle(&state.bundle)
+            .ok()
+            .and_then(|s| s.linux)
+            .and_then(|l| l.resources)
+            .is_some()
+    }
+
     /// Deletes a stopped container and its state directory (`delete` command).
     pub fn delete(&self, id: &str, force: bool) -> Result<()> {
-        let state = self.load_state(id)?;
+        let container_dir = self.container_dir(id);
+        if !container_dir.exists() {
+            return Err(TavikError::NotFound(format!(
+                "Container '{}' not found",
+                id
+            )));
+        }
+
+        let lock_path = container_dir.join("state.lock");
+
+        // 1. Initial state inspection under StateLock
+        let state = {
+            let _lock = StateLock::acquire(&lock_path)?;
+            self.load_state(id)?
+        };
 
         let is_active =
             state.status == ContainerStatus::Running || state.status == ContainerStatus::Starting;
@@ -474,7 +511,7 @@ impl ContainerExecutor {
         if is_active && force {
             #[cfg(target_os = "linux")]
             {
-                let control_sock = self.container_dir(id).join("control.sock");
+                let control_sock = container_dir.join("control.sock");
                 if !control_sock.exists() {
                     let cur_state = self.load_state(id)?;
                     if cur_state.status != ContainerStatus::Stopped {
@@ -484,12 +521,20 @@ impl ContainerExecutor {
                         )));
                     }
                 } else {
-                    crate::init::send_control_command(&control_sock, "CANCEL").map_err(|e| {
-                        TavikError::Execution(format!(
+                    let resp = crate::init::send_control_command(&control_sock, "CANCEL").map_err(
+                        |e| {
+                            TavikError::Execution(format!(
                             "Failed to force stop container '{}' via supervisor during delete: {}",
                             id, e
                         ))
-                    })?;
+                        },
+                    )?;
+                    if resp != "OK" && !resp.starts_with("OK ") {
+                        return Err(TavikError::Execution(format!(
+                            "Supervisor returned non-OK response during forced delete cancellation: {:?}",
+                            resp
+                        )));
+                    }
 
                     let final_state = self.load_state(id)?;
                     if final_state.status != ContainerStatus::Stopped {
@@ -509,27 +554,41 @@ impl ContainerExecutor {
             }
         }
 
+        // 2. Final deletion under StateLock
+        let _lock = StateLock::acquire(&lock_path)?;
+        let final_state = self.load_state(id)?;
+        if final_state.status != ContainerStatus::Stopped
+            && final_state.status != ContainerStatus::Created
+        {
+            return Err(TavikError::InvalidState(format!(
+                "Cannot delete container '{}' with status '{}' without force flag",
+                id, final_state.status
+            )));
+        }
+
         #[cfg(target_os = "linux")]
         {
-            let owns_cgroup = Spec::load_from_bundle(&state.bundle)
-                .ok()
-                .and_then(|s| s.linux)
-                .and_then(|l| l.resources)
-                .is_some();
-
+            let owns_cgroup = self.has_cgroup_ownership(id, &final_state);
             if owns_cgroup {
-                if let Ok(cgroup_mgr) = tavik_cgroups::CgroupManager::new() {
-                    if let Err(e) = cgroup_mgr.destroy_container_cgroup(id) {
-                        warn!(
-                            "Failed to destroy cgroup for container '{}' on delete: {}",
-                            id, e
-                        );
-                    }
-                }
+                let cgroup_mgr = tavik_cgroups::CgroupManager::new().map_err(|e| {
+                    TavikError::Execution(format!(
+                        "Failed to initialize cgroup manager during deletion of '{}': {}",
+                        id, e
+                    ))
+                })?;
+
+                cgroup_mgr.destroy_container_cgroup(id).map_err(|e| {
+                    TavikError::Execution(format!(
+                        "Failed to destroy cgroup for container '{}' on delete: {}",
+                        id, e
+                    ))
+                })?;
+
+                // After cgroup is successfully destroyed, remove cgroup.owner marker
+                let _ = fs::remove_file(container_dir.join("cgroup.owner"));
             }
         }
 
-        let container_dir = self.container_dir(id);
         if container_dir.exists() {
             fs::remove_dir_all(&container_dir)?;
         }
@@ -599,6 +658,57 @@ impl ContainerExecutor {
     }
 
     #[cfg(target_os = "linux")]
+    fn abort_startup_and_cancel(&self, id: &str, orig_err: TavikError) -> Result<()> {
+        let container_dir = self.container_dir(id);
+        let control_sock = container_dir.join("control.sock");
+
+        if !control_sock.exists() {
+            if let Ok(st) = self.load_state(id) {
+                if st.status == ContainerStatus::Stopped {
+                    return Err(orig_err);
+                }
+            }
+            return Err(TavikError::Execution(format!(
+                "{}; additionally, mandatory startup cancellation failed: supervisor control socket missing at {:?}",
+                orig_err, control_sock
+            )));
+        }
+
+        match crate::init::send_control_command(&control_sock, "CANCEL") {
+            Ok(resp) => {
+                if resp != "OK" && !resp.starts_with("OK ") {
+                    return Err(TavikError::Execution(format!(
+                        "{}; additionally, mandatory startup cancellation failed: supervisor returned unexpected response {:?}",
+                        orig_err, resp
+                    )));
+                }
+            }
+            Err(cancel_err) => {
+                return Err(TavikError::Execution(format!(
+                    "{}; additionally, mandatory startup cancellation failed: {}",
+                    orig_err, cancel_err
+                )));
+            }
+        }
+
+        let final_state = self.load_state(id).map_err(|e| {
+            TavikError::Execution(format!(
+                "{}; additionally, failed to reload container state after cancellation: {}",
+                orig_err, e
+            ))
+        })?;
+
+        if final_state.status != ContainerStatus::Stopped {
+            return Err(TavikError::Execution(format!(
+                "{}; additionally, mandatory startup cancellation failed: container status is '{}' (expected 'stopped')",
+                orig_err, final_state.status
+            )));
+        }
+
+        Err(orig_err)
+    }
+
+    #[cfg(target_os = "linux")]
     fn platform_start(&self, id: &str, _state: &ContainerState) -> Result<()> {
         use std::io::Write;
 
@@ -607,10 +717,11 @@ impl ContainerExecutor {
         let exec_fifo = container_dir.join("exec.fifo");
 
         if !start_fifo.exists() {
-            return Err(TavikError::InvalidState(format!(
+            let orig_err = TavikError::InvalidState(format!(
                 "Container '{}' start FIFO not found at {:?}",
                 id, start_fifo
-            )));
+            ));
+            return self.abort_startup_and_cancel(id, orig_err);
         }
 
         // 1. Open exec.fifo for reading BEFORE triggering start signal
@@ -618,11 +729,12 @@ impl ContainerExecutor {
         let exec_read_fd =
             unsafe { libc::open(exec_fifo_c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         if exec_read_fd < 0 {
-            return Err(TavikError::Io(format!(
+            let orig_err = TavikError::Io(format!(
                 "Failed to open exec FIFO at {:?}: {}",
                 exec_fifo,
                 std::io::Error::last_os_error()
-            )));
+            ));
+            return self.abort_startup_and_cancel(id, orig_err);
         }
 
         // 2. Open start FIFO and write start signal
@@ -630,19 +742,19 @@ impl ContainerExecutor {
             Ok(f) => f,
             Err(e) => {
                 unsafe { libc::close(exec_read_fd) };
-                return Err(TavikError::Io(format!(
-                    "Failed to open container start FIFO: {}",
-                    e
-                )));
+                let orig_err =
+                    TavikError::Io(format!("Failed to open container start FIFO: {}", e));
+                return self.abort_startup_and_cancel(id, orig_err);
             }
         };
 
         if let Err(e) = file.write_all(b"1") {
             unsafe { libc::close(exec_read_fd) };
-            return Err(TavikError::Io(format!(
+            let orig_err = TavikError::Io(format!(
                 "Failed to write start signal to container FIFO: {}",
                 e
-            )));
+            ));
+            return self.abort_startup_and_cancel(id, orig_err);
         }
 
         // 3. Read execution status from exec.fifo
@@ -685,22 +797,7 @@ impl ContainerExecutor {
                 "poll failed on exec.fifo: {}",
                 poll_err.unwrap_or_else(std::io::Error::last_os_error)
             ));
-            let control_sock = container_dir.join("control.sock");
-            if !control_sock.exists() {
-                return Err(TavikError::Execution(format!(
-                    "{}; additionally, mandatory startup cancellation failed: supervisor control socket missing at {:?}",
-                    orig_err, control_sock
-                )));
-            }
-            match crate::init::send_control_command(&control_sock, "CANCEL") {
-                Ok(_) => return Err(orig_err),
-                Err(cancel_err) => {
-                    return Err(TavikError::Execution(format!(
-                        "{}; additionally, mandatory startup cancellation failed: {}",
-                        orig_err, cancel_err
-                    )));
-                }
-            }
+            return self.abort_startup_and_cancel(id, orig_err);
         }
 
         if poll_res == 0 {
@@ -709,22 +806,7 @@ impl ContainerExecutor {
                 "Container '{}' startup timed out waiting for exec status",
                 id
             ));
-            let control_sock = container_dir.join("control.sock");
-            if !control_sock.exists() {
-                return Err(TavikError::Execution(format!(
-                    "{}; mandatory startup cancellation failed: supervisor control socket missing at {:?}",
-                    orig_err, control_sock
-                )));
-            }
-            match crate::init::send_control_command(&control_sock, "CANCEL") {
-                Ok(_) => return Err(orig_err),
-                Err(cancel_err) => {
-                    return Err(TavikError::Execution(format!(
-                        "{}; mandatory startup cancellation failed: {}",
-                        orig_err, cancel_err
-                    )));
-                }
-            }
+            return self.abort_startup_and_cancel(id, orig_err);
         }
 
         let mut err_buf = Vec::new();
@@ -739,14 +821,12 @@ impl ContainerExecutor {
             };
             if n < 0 {
                 let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue; // Retry read on EINTR
                 }
                 unsafe { libc::close(exec_read_fd) };
-                return Err(TavikError::Io(format!(
-                    "Failed to read from exec.fifo: {}",
-                    err
-                )));
+                let orig_err = TavikError::Io(format!("Failed to read from exec.fifo: {}", err));
+                return self.abort_startup_and_cancel(id, orig_err);
             }
             if n == 0 {
                 break; // EOF: kernel closed fd on successful execve!
@@ -757,19 +837,11 @@ impl ContainerExecutor {
 
         if !err_buf.is_empty() {
             let err_msg = String::from_utf8_lossy(&err_buf);
-            let wait_start = std::time::Instant::now();
-            while wait_start.elapsed() < std::time::Duration::from_secs(1) {
-                if let Ok(st) = self.load_state(id) {
-                    if st.status == ContainerStatus::Stopped {
-                        break;
-                    }
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            return Err(TavikError::Execution(format!(
+            let orig_err = TavikError::Execution(format!(
                 "Container '{}' failed during startup: {}",
                 id, err_msg
-            )));
+            ));
+            return self.abort_startup_and_cancel(id, orig_err);
         }
 
         Ok(())

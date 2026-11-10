@@ -16,7 +16,7 @@ use tavik_image::ImageError;
 use tavik_runtime::spec::{ContainerState, LinuxCapabilities, Process, Root, Spec, User};
 use tavik_runtime::ContainerExecutor;
 use tavik_store::{ContentStore, ImageRecord, StoreError};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ImageServiceError {
@@ -447,7 +447,12 @@ impl ImageService {
         let running_state = match executor.start(container_id) {
             Ok(s) => s,
             Err(e) => {
-                let _ = executor.delete(container_id, true);
+                if let Err(del_err) = executor.delete(container_id, true) {
+                    warn!(
+                        "Failed to delete container '{}' after start failure: {}",
+                        container_id, del_err
+                    );
+                }
                 return Err(ImageServiceError::Runtime(e));
             }
         };

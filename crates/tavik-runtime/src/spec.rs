@@ -29,6 +29,12 @@ pub enum ContainerStatus {
     Created,
     Starting,
     Running,
+    #[serde(
+        rename = "cleanup_pending",
+        alias = "cleanup-pending",
+        alias = "cleanuppending"
+    )]
+    CleanupPending,
     Stopped,
 }
 
@@ -39,6 +45,7 @@ impl std::fmt::Display for ContainerStatus {
             Self::Created => write!(f, "created"),
             Self::Starting => write!(f, "starting"),
             Self::Running => write!(f, "running"),
+            Self::CleanupPending => write!(f, "cleanup_pending"),
             Self::Stopped => write!(f, "stopped"),
         }
     }

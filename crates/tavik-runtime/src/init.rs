@@ -31,6 +31,31 @@ impl CgroupGuard {
     pub fn manager(&self) -> &tavik_cgroups::CgroupManager {
         &self.mgr
     }
+
+    pub fn cleanup(&mut self, container_dir: &Path) -> std::result::Result<(), String> {
+        if !self.active {
+            return Ok(());
+        }
+
+        if container_dir.join(".simulate_cgroup_destroy_fail").exists() {
+            return Err("Simulated cgroup destruction failure".to_string());
+        }
+
+        match self.mgr.destroy_container_cgroup(&self.container_id) {
+            Ok(()) => {
+                self.active = false;
+                let _ = fs::remove_file(container_dir.join("cgroup.owner"));
+                Ok(())
+            }
+            Err(e) => {
+                // If cleanup fails, preserve cgroup.owner and return observable error
+                Err(format!(
+                    "Explicit cgroup cleanup failed for container '{}': {}",
+                    self.container_id, e
+                ))
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -39,7 +64,7 @@ impl Drop for CgroupGuard {
         if self.active {
             if let Err(e) = self.mgr.destroy_container_cgroup(&self.container_id) {
                 eprintln!(
-                    "CgroupGuard cleanup failed for container '{}': {}",
+                    "CgroupGuard fallback cleanup failed for container '{}': {}",
                     self.container_id, e
                 );
             }
@@ -544,19 +569,48 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
                     libc::_exit(1);
                 };
             }
-            let guard = CgroupGuard::new(mgr, id.to_string());
-            if let Some(resources) = &linux.resources {
-                if let Err(e) = guard.manager().apply_resources(id, resources) {
-                    let msg = format!("Failed to apply cgroup resources: {}", e);
-                    let _ =
-                        unsafe { libc::write(trampoline_pipe[1], msg.as_ptr() as _, msg.len()) };
-                    drop(guard);
-                    unsafe {
-                        libc::close(control_listener_fd);
-                        let _ = fs::remove_file(&control_sock_path);
-                        libc::_exit(1);
-                    };
+            // Persist cgroup ownership immediately upon creation before any subsequent operation
+            let cgroup_owner_file = container_dir.join("cgroup.owner");
+            let _ = fs::write(&cgroup_owner_file, b"1\n");
+            let mut init_state = state.clone();
+            init_state
+                .annotations
+                .insert("io.tavik.cgroup.owned".to_string(), "true".to_string());
+            if let Ok(json) = serde_json::to_string_pretty(&init_state) {
+                let tmp = container_dir.join("state.json.tmp");
+                if fs::write(&tmp, json).is_ok() {
+                    let _ = fs::rename(&tmp, &state_file);
                 }
+            }
+
+            let mut guard = CgroupGuard::new(mgr, id.to_string());
+            let simulate_apply_fail = container_dir
+                .join(".simulate_apply_resources_fail")
+                .exists();
+            let apply_res = if simulate_apply_fail {
+                Err(TavikError::Execution(
+                    "Simulated resource application failure".to_string(),
+                ))
+            } else if let Some(resources) = &linux.resources {
+                guard.manager().apply_resources(id, resources)
+            } else {
+                Ok(())
+            };
+
+            if let Err(e) = apply_res {
+                let msg = format!("Failed to apply cgroup resources: {}", e);
+                let mut full_msg = msg;
+                if let Err(cleanup_err) = guard.cleanup(&container_dir) {
+                    full_msg = format!("{}; furthermore, {}", full_msg, cleanup_err);
+                }
+                let _ = unsafe {
+                    libc::write(trampoline_pipe[1], full_msg.as_ptr() as _, full_msg.len())
+                };
+                unsafe {
+                    libc::close(control_listener_fd);
+                    let _ = fs::remove_file(&control_sock_path);
+                    libc::_exit(1);
+                };
             }
             Some(guard)
         } else {
@@ -567,14 +621,19 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
     };
 
     // 7. Unshare PID namespace
-    // Calling unshare(CLONE_NEWPID) puts the NEXT child into the new PID namespace!
-    if unsafe { libc::unshare(libc::CLONE_NEWPID) } != 0 {
+    let simulate_unshare_fail = container_dir.join(".simulate_unshare_fail").exists();
+    if simulate_unshare_fail || unsafe { libc::unshare(libc::CLONE_NEWPID) } != 0 {
         let msg = format!(
             "Failed to unshare PID namespace in supervisor: {}",
             std::io::Error::last_os_error()
         );
-        let _ = unsafe { libc::write(trampoline_pipe[1], msg.as_ptr() as _, msg.len()) };
-        drop(cgroup_guard);
+        let mut full_msg = msg;
+        if let Some(mut guard) = cgroup_guard {
+            if let Err(cleanup_err) = guard.cleanup(&container_dir) {
+                full_msg = format!("{}; furthermore, {}", full_msg, cleanup_err);
+            }
+        }
+        let _ = unsafe { libc::write(trampoline_pipe[1], full_msg.as_ptr() as _, full_msg.len()) };
         unsafe {
             libc::close(control_listener_fd);
             let _ = fs::remove_file(&control_sock_path);
@@ -589,8 +648,13 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
             "Failed to create ready pipe: {}",
             std::io::Error::last_os_error()
         );
-        let _ = unsafe { libc::write(trampoline_pipe[1], msg.as_ptr() as _, msg.len()) };
-        drop(cgroup_guard);
+        let mut full_msg = msg;
+        if let Some(mut guard) = cgroup_guard {
+            if let Err(cleanup_err) = guard.cleanup(&container_dir) {
+                full_msg = format!("{}; furthermore, {}", full_msg, cleanup_err);
+            }
+        }
+        let _ = unsafe { libc::write(trampoline_pipe[1], full_msg.as_ptr() as _, full_msg.len()) };
         unsafe {
             libc::close(control_listener_fd);
             let _ = fs::remove_file(&control_sock_path);
@@ -599,14 +663,24 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
     }
 
     // 9. Fork container init process (this child is PID 1 in the new PID namespace!)
-    let child_pid = unsafe { libc::fork() };
+    let simulate_child_setup_fail = container_dir.join(".simulate_child_setup_fail").exists();
+    let child_pid = if simulate_child_setup_fail {
+        -1
+    } else {
+        unsafe { libc::fork() }
+    };
     if child_pid < 0 {
         let msg = format!(
             "Failed to fork container init child: {}",
             std::io::Error::last_os_error()
         );
-        let _ = unsafe { libc::write(trampoline_pipe[1], msg.as_ptr() as _, msg.len()) };
-        drop(cgroup_guard);
+        let mut full_msg = msg;
+        if let Some(mut guard) = cgroup_guard {
+            if let Err(cleanup_err) = guard.cleanup(&container_dir) {
+                full_msg = format!("{}; furthermore, {}", full_msg, cleanup_err);
+            }
+        }
+        let _ = unsafe { libc::write(trampoline_pipe[1], full_msg.as_ptr() as _, full_msg.len()) };
         unsafe {
             libc::close(control_listener_fd);
             let _ = fs::remove_file(&control_sock_path);
@@ -650,15 +724,28 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
             libc::waitpid(child_pid, &mut status, 0);
             libc::close(control_listener_fd);
             let _ = fs::remove_file(&control_sock_path);
-            let _ = libc::write(trampoline_pipe[1], msg.as_ptr() as _, msg.len());
         }
-        drop(cgroup_guard);
+        let mut full_msg = msg;
+        if let Some(mut guard) = cgroup_guard {
+            if let Err(cleanup_err) = guard.cleanup(&container_dir) {
+                full_msg = format!("{}; furthermore, {}", full_msg, cleanup_err);
+            }
+        }
+        let _ = unsafe { libc::write(trampoline_pipe[1], full_msg.as_ptr() as _, full_msg.len()) };
         unsafe { libc::_exit(1) };
     }
 
     // 10. Enroll child PID into cgroups v2 container group (FAIL-CLOSED)
+    let simulate_enroll_fail = container_dir.join(".simulate_enroll_fail").exists();
     if let Some(guard) = &cgroup_guard {
-        if let Err(e) = guard.manager().add_process(id, child_pid as u32) {
+        let enroll_res = if simulate_enroll_fail {
+            Err(TavikError::Execution(
+                "Simulated cgroup enrollment failure".to_string(),
+            ))
+        } else {
+            guard.manager().add_process(id, child_pid as u32)
+        };
+        if let Err(e) = enroll_res {
             unsafe {
                 libc::kill(child_pid, libc::SIGKILL);
                 let mut status = 0;
@@ -668,8 +755,14 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
                 let _ = fs::remove_file(&control_sock_path);
             }
             let msg = format!("Failed to enroll child PID {} in cgroup: {}", child_pid, e);
-            let _ = unsafe { libc::write(trampoline_pipe[1], msg.as_ptr() as _, msg.len()) };
-            drop(cgroup_guard);
+            let mut full_msg = msg;
+            if let Some(mut g) = cgroup_guard {
+                if let Err(cleanup_err) = g.cleanup(&container_dir) {
+                    full_msg = format!("{}; furthermore, {}", full_msg, cleanup_err);
+                }
+            }
+            let _ =
+                unsafe { libc::write(trampoline_pipe[1], full_msg.as_ptr() as _, full_msg.len()) };
             unsafe { libc::_exit(1) };
         }
     }
@@ -704,16 +797,27 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
         } else {
             "Container init child exited prematurely without signaling readiness".to_string()
         };
-        let _ = unsafe { libc::write(trampoline_pipe[1], err_msg.as_ptr() as _, err_msg.len()) };
-        drop(cgroup_guard);
+        let mut full_msg = err_msg;
+        if let Some(mut guard) = cgroup_guard {
+            if let Err(cleanup_err) = guard.cleanup(&container_dir) {
+                full_msg = format!("{}; furthermore, {}", full_msg, cleanup_err);
+            }
+        }
+        let _ = unsafe { libc::write(trampoline_pipe[1], full_msg.as_ptr() as _, full_msg.len()) };
         unsafe { libc::_exit(1) };
     }
 
     let owns_cgroup = cgroup_guard.is_some();
 
     // 12. Record host PID and persist state as Created (FAIL-CLOSED)
+    let simulate_persist_fail = container_dir.join(".simulate_state_persist_fail").exists();
     let pid_write_res = fs::write(&pid_file, child_pid.to_string());
     let state_write_res = (|| -> Result<()> {
+        if simulate_persist_fail {
+            return Err(TavikError::Io(
+                "Simulated state persistence failure".to_string(),
+            ));
+        }
         pid_write_res.map_err(|e| TavikError::Io(format!("Failed to write pid file: {}", e)))?;
         let lock_path = container_dir.join("state.lock");
         let _lock = crate::executor::StateLock::acquire(&lock_path)?;
@@ -735,7 +839,6 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
     })();
 
     if let Err(e) = state_write_res {
-        let _ = fs::remove_file(container_dir.join("cgroup.owner"));
         unsafe {
             libc::kill(child_pid, libc::SIGKILL);
             let mut status = 0;
@@ -745,8 +848,13 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
             let _ = fs::remove_file(&control_sock_path);
         }
         let msg = format!("Failed to persist Created container state: {}", e);
-        let _ = unsafe { libc::write(trampoline_pipe[1], msg.as_ptr() as _, msg.len()) };
-        drop(cgroup_guard);
+        let mut full_msg = msg;
+        if let Some(mut guard) = cgroup_guard {
+            if let Err(cleanup_err) = guard.cleanup(&container_dir) {
+                full_msg = format!("{}; furthermore, {}", full_msg, cleanup_err);
+            }
+        }
+        let _ = unsafe { libc::write(trampoline_pipe[1], full_msg.as_ptr() as _, full_msg.len()) };
         unsafe { libc::_exit(1) };
     }
 
@@ -923,7 +1031,31 @@ pub fn run_supervisor_finalization(
     exec_fifo_path: &Path,
     child_reaped: bool,
 ) -> std::result::Result<(), String> {
-    // 1. Enforce child reaping via waitpid
+    let state_file = container_dir.join("state.json");
+    let lock_path = container_dir.join("state.lock");
+
+    // 1. Mark state as CleanupPending under StateLock so incomplete cleanup is observable
+    {
+        if let Ok(_lock) = crate::executor::StateLock::acquire(&lock_path) {
+            if state_file.exists() {
+                if let Ok(content) = fs::read_to_string(&state_file) {
+                    if let Ok(mut st) = serde_json::from_str::<ContainerState>(&content) {
+                        if st.status != ContainerStatus::Stopped {
+                            st.status = ContainerStatus::CleanupPending;
+                            let tmp = container_dir.join("state.json.tmp");
+                            if let Ok(json) = serde_json::to_string_pretty(&st) {
+                                if fs::write(&tmp, json).is_ok() {
+                                    let _ = fs::rename(&tmp, &state_file);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Enforce child reaping via waitpid
     if !child_reaped {
         let mut status = 0;
         loop {
@@ -949,31 +1081,12 @@ pub fn run_supervisor_finalization(
         }
     }
 
-    // 2. Persist Stopped state to state.json under StateLock
-    let state_file = container_dir.join("state.json");
-    let lock_path = container_dir.join("state.lock");
-
-    let _lock = crate::executor::StateLock::acquire(&lock_path)
-        .map_err(|e| format!("Failed to acquire state lock: {}", e))?;
-
-    let content =
-        fs::read_to_string(&state_file).map_err(|e| format!("Failed to read state file: {}", e))?;
-
-    let mut st = serde_json::from_str::<ContainerState>(&content)
-        .map_err(|e| format!("Failed to parse state JSON: {}", e))?;
-
-    st.status = ContainerStatus::Stopped;
-    let tmp_file = container_dir.join("state.json.tmp");
-    let json = serde_json::to_string_pretty(&st)
-        .map_err(|e| format!("Failed to serialize state JSON: {}", e))?;
-
-    fs::write(&tmp_file, json).map_err(|e| format!("Failed to write tmp state file: {}", e))?;
-
-    fs::rename(&tmp_file, &state_file)
-        .map_err(|e| format!("Failed to replace state file: {}", e))?;
-
     // 3. Destroy container cgroup if owned by this supervisor
     if owns_cgroup {
+        if container_dir.join(".simulate_cgroup_destroy_fail").exists() {
+            return Err("Simulated cgroup destruction failure".to_string());
+        }
+
         let mgr = tavik_cgroups::CgroupManager::new()
             .map_err(|e| format!("Failed to initialize cgroup manager: {}", e))?;
         mgr.destroy_container_cgroup(id)
@@ -1001,6 +1114,33 @@ pub fn run_supervisor_finalization(
                 ));
             }
         }
+    }
+
+    // 5. Check simulated state persistence failure
+    if container_dir.join(".simulate_state_persist_fail").exists() {
+        return Err("Simulated state persistence failure".to_string());
+    }
+
+    // 6. Persist final Stopped state to state.json under StateLock only after all cleanup succeeds
+    {
+        let _lock = crate::executor::StateLock::acquire(&lock_path)
+            .map_err(|e| format!("Failed to acquire state lock: {}", e))?;
+
+        let content = fs::read_to_string(&state_file)
+            .map_err(|e| format!("Failed to read state file: {}", e))?;
+
+        let mut st = serde_json::from_str::<ContainerState>(&content)
+            .map_err(|e| format!("Failed to parse state JSON: {}", e))?;
+
+        st.status = ContainerStatus::Stopped;
+        let tmp_file = container_dir.join("state.json.tmp");
+        let json = serde_json::to_string_pretty(&st)
+            .map_err(|e| format!("Failed to serialize state JSON: {}", e))?;
+
+        fs::write(&tmp_file, json).map_err(|e| format!("Failed to write tmp state file: {}", e))?;
+
+        fs::rename(&tmp_file, &state_file)
+            .map_err(|e| format!("Failed to replace state file: {}", e))?;
     }
 
     Ok(())

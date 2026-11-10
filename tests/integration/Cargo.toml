@@ -17,4 +17,5 @@ tavik-cli = { path = "../../crates/tavik-cli" }
 tokio.workspace = true
 tempfile.workspace = true
 serde_json.workspace = true
+chrono.workspace = true
 libc.workspace = true

@@ -85,7 +85,18 @@ impl ContainerExecutor {
         if state.status == ContainerStatus::Running {
             if let Some(pid) = state.pid {
                 if !is_pid_alive(pid) {
-                    state.status = ContainerStatus::Stopped;
+                    #[cfg(target_os = "linux")]
+                    {
+                        if self.has_cgroup_ownership(id, &state) {
+                            state.status = ContainerStatus::CleanupPending;
+                        } else {
+                            state.status = ContainerStatus::Stopped;
+                        }
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        state.status = ContainerStatus::Stopped;
+                    }
                     let _ = self.save_state(&state);
                 }
             }
@@ -116,7 +127,12 @@ impl ContainerExecutor {
         F: FnOnce(&mut ContainerState) -> Result<()>,
     {
         let container_dir = self.container_dir(id);
-        fs::create_dir_all(&container_dir)?;
+        if !container_dir.exists() {
+            return Err(TavikError::NotFound(format!(
+                "Container '{}' not found",
+                id
+            )));
+        }
 
         #[cfg(unix)]
         let lock_path = container_dir.join("state.lock");
@@ -145,12 +161,20 @@ impl ContainerExecutor {
             (ContainerStatus::Creating, ContainerStatus::Created) => {}
             // Created -> Starting
             (ContainerStatus::Created, ContainerStatus::Starting) => {}
+            // Created -> CleanupPending / Stopped
+            (ContainerStatus::Created, ContainerStatus::CleanupPending) => {}
+            (ContainerStatus::Created, ContainerStatus::Stopped) => {}
             // Starting -> Running
             (ContainerStatus::Starting, ContainerStatus::Running) => {}
-            // Starting -> Stopped (startup failed or short-lived process finished immediately)
+            // Starting -> CleanupPending / Stopped
+            (ContainerStatus::Starting, ContainerStatus::CleanupPending) => {}
             (ContainerStatus::Starting, ContainerStatus::Stopped) => {}
+            // Running -> CleanupPending
+            (ContainerStatus::Running, ContainerStatus::CleanupPending) => {}
             // Running -> Stopped
             (ContainerStatus::Running, ContainerStatus::Stopped) => {}
+            // CleanupPending -> Stopped
+            (ContainerStatus::CleanupPending, ContainerStatus::Stopped) => {}
             // Stopped is a terminal state! Can never transition back to Running or Starting
             (ContainerStatus::Stopped, ContainerStatus::Running) => {
                 // Ignore late Running transition if supervisor already reaped child and marked Stopped
@@ -215,7 +239,15 @@ impl ContainerExecutor {
         let _final_state = match self.platform_create(id, &spec, &canonical_bundle, initial_state) {
             Ok(s) => s,
             Err(e) => {
-                // Clean up failed container state directory so no stale Creating state is left behind
+                let cgroup_owner = container_dir.join("cgroup.owner");
+                if cgroup_owner.exists() {
+                    warn!(
+                        "Container '{}' creation failed but cgroup cleanup was incomplete; preserving recovery metadata at {:?}",
+                        id, container_dir
+                    );
+                    return Err(e);
+                }
+                // Clean up failed container state directory only if no recovery metadata remains
                 let _ = fs::remove_dir_all(&container_dir);
                 return Err(e);
             }
@@ -278,7 +310,10 @@ impl ContainerExecutor {
             return Ok(state);
         }
 
-        if state.status != ContainerStatus::Running && state.status != ContainerStatus::Starting {
+        if state.status != ContainerStatus::Running
+            && state.status != ContainerStatus::Starting
+            && state.status != ContainerStatus::CleanupPending
+        {
             return Err(TavikError::InvalidState(format!(
                 "Cannot stop container '{}': status is '{}' (expected 'running')",
                 id, state.status
@@ -498,40 +533,53 @@ impl ContainerExecutor {
             self.load_state(id)?
         };
 
-        let is_active =
-            state.status == ContainerStatus::Running || state.status == ContainerStatus::Starting;
+        let is_running_or_starting = matches!(
+            state.status,
+            ContainerStatus::Running | ContainerStatus::Starting
+        );
 
-        if is_active && !force {
+        if is_running_or_starting && !force {
             return Err(TavikError::InvalidState(format!(
                 "Cannot delete container '{}' with status '{}' without force flag",
                 id, state.status
             )));
         }
 
-        if is_active && force {
+        let needs_cancellation = state.status == ContainerStatus::Created
+            || (is_running_or_starting && force)
+            || state.status == ContainerStatus::CleanupPending;
+
+        if needs_cancellation {
             #[cfg(target_os = "linux")]
             {
                 let control_sock = container_dir.join("control.sock");
                 if !control_sock.exists() {
                     let cur_state = self.load_state(id)?;
                     if cur_state.status != ContainerStatus::Stopped {
-                        return Err(TavikError::Execution(format!(
-                            "Cannot force delete active container '{}': supervisor control socket is unreachable at {:?}",
-                            id, control_sock
-                        )));
+                        if cur_state.status == ContainerStatus::Created {
+                            return Err(TavikError::Execution(format!(
+                                "Cannot delete created container '{}': supervisor control socket is unreachable at {:?}",
+                                id, control_sock
+                            )));
+                        } else if !force {
+                            return Err(TavikError::Execution(format!(
+                                "Cannot delete active container '{}': supervisor control socket is unreachable at {:?}",
+                                id, control_sock
+                            )));
+                        }
                     }
                 } else {
                     let resp = crate::init::send_control_command(&control_sock, "CANCEL").map_err(
                         |e| {
                             TavikError::Execution(format!(
-                            "Failed to force stop container '{}' via supervisor during delete: {}",
-                            id, e
-                        ))
+                                "Failed to stop container '{}' via supervisor during delete: {}",
+                                id, e
+                            ))
                         },
                     )?;
                     if resp != "OK" && !resp.starts_with("OK ") {
                         return Err(TavikError::Execution(format!(
-                            "Supervisor returned non-OK response during forced delete cancellation: {:?}",
+                            "Supervisor returned non-OK response during delete cancellation: {:?}",
                             resp
                         )));
                     }
@@ -539,7 +587,7 @@ impl ContainerExecutor {
                     let final_state = self.load_state(id)?;
                     if final_state.status != ContainerStatus::Stopped {
                         return Err(TavikError::Execution(format!(
-                            "Container '{}' remained in status '{}' after forced termination during delete",
+                            "Container '{}' remained in status '{}' after supervisor cancellation during delete",
                             id, final_state.status
                         )));
                     }
@@ -555,43 +603,78 @@ impl ContainerExecutor {
         }
 
         // 2. Final deletion under StateLock
-        let _lock = StateLock::acquire(&lock_path)?;
-        let final_state = self.load_state(id)?;
-        if final_state.status != ContainerStatus::Stopped
-            && final_state.status != ContainerStatus::Created
-        {
-            return Err(TavikError::InvalidState(format!(
-                "Cannot delete container '{}' with status '{}' without force flag",
-                id, final_state.status
+        if !container_dir.exists() {
+            return Err(TavikError::NotFound(format!(
+                "Container '{}' not found",
+                id
             )));
         }
 
-        #[cfg(target_os = "linux")]
         {
-            let owns_cgroup = self.has_cgroup_ownership(id, &final_state);
-            if owns_cgroup {
-                let cgroup_mgr = tavik_cgroups::CgroupManager::new().map_err(|e| {
-                    TavikError::Execution(format!(
-                        "Failed to initialize cgroup manager during deletion of '{}': {}",
-                        id, e
-                    ))
-                })?;
+            let _lock = StateLock::acquire(&lock_path)?;
+            let final_state = match self.load_state(id) {
+                Ok(s) => s,
+                Err(TavikError::NotFound(_)) => {
+                    return Err(TavikError::NotFound(format!(
+                        "Container '{}' not found",
+                        id
+                    )));
+                }
+                Err(e) => return Err(e),
+            };
 
-                cgroup_mgr.destroy_container_cgroup(id).map_err(|e| {
-                    TavikError::Execution(format!(
-                        "Failed to destroy cgroup for container '{}' on delete: {}",
-                        id, e
-                    ))
-                })?;
-
-                // After cgroup is successfully destroyed, remove cgroup.owner marker
-                let _ = fs::remove_file(container_dir.join("cgroup.owner"));
+            #[cfg(all(unix, not(target_os = "linux")))]
+            {
+                let _ = final_state;
             }
-        }
 
-        if container_dir.exists() {
-            fs::remove_dir_all(&container_dir)?;
-        }
+            #[cfg(target_os = "linux")]
+            {
+                if final_state.status != ContainerStatus::Stopped && !force {
+                    return Err(TavikError::InvalidState(format!(
+                        "Cannot delete container '{}' with status '{}' without force flag",
+                        id, final_state.status
+                    )));
+                }
+
+                let owns_cgroup = self.has_cgroup_ownership(id, &final_state);
+                if owns_cgroup {
+                    let cgroup_mgr = tavik_cgroups::CgroupManager::new().map_err(|e| {
+                        TavikError::Execution(format!(
+                            "Failed to initialize cgroup manager during deletion of '{}': {}",
+                            id, e
+                        ))
+                    })?;
+
+                    cgroup_mgr.destroy_container_cgroup(id).map_err(|e| {
+                        TavikError::Execution(format!(
+                            "Failed to destroy cgroup for container '{}' on delete: {}",
+                            id, e
+                        ))
+                    })?;
+
+                    // After cgroup is successfully destroyed, remove cgroup.owner marker
+                    let _ = fs::remove_file(container_dir.join("cgroup.owner"));
+                }
+            }
+
+            // Remove all files inside container_dir except state.lock
+            for entry in fs::read_dir(&container_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.file_name() != Some(std::ffi::OsStr::new("state.lock")) {
+                    if path.is_dir() {
+                        let _ = fs::remove_dir_all(&path);
+                    } else {
+                        let _ = fs::remove_file(&path);
+                    }
+                }
+            }
+        } // _lock dropped here
+
+        // Now remove state.lock and container_dir safely after releasing the lock
+        let _ = fs::remove_file(&lock_path);
+        let _ = fs::remove_dir(&container_dir);
 
         info!("Deleted container '{}'", id);
         Ok(())

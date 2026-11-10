@@ -2576,3 +2576,346 @@ fn test_linux_startup_cancellation_on_invalid_exec() {
         assert!(del_res.is_ok());
     }
 }
+
+#[test]
+fn test_linux_delete_created_container_without_cgroups() {
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping rootful delete created container test (requires root)");
+            return;
+        }
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let bundle_dir = temp.path().join("bundle");
+        let rootfs = bundle_dir.join("rootfs");
+        let bin_dir = rootfs.join("bin");
+        let dev_dir = rootfs.join("dev");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&dev_dir).unwrap();
+        let _ = fs::File::create(dev_dir.join("null"));
+
+        if Path::new("/usr/bin/busybox").exists() {
+            fs::copy("/usr/bin/busybox", bin_dir.join("busybox")).unwrap();
+        } else if Path::new("/bin/busybox").exists() {
+            fs::copy("/bin/busybox", bin_dir.join("busybox")).unwrap();
+        } else {
+            return;
+        }
+
+        let mut spec = Spec::default_linux();
+        if let Some(proc) = &mut spec.process {
+            proc.args = vec![
+                "/bin/busybox".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "sleep 30".to_string(),
+            ];
+        }
+        fs::write(
+            bundle_dir.join("config.json"),
+            serde_json::to_string_pretty(&spec).unwrap(),
+        )
+        .unwrap();
+
+        let executor = ContainerExecutor::new(state_dir).unwrap();
+        let id = "test-delete-created-no-cgroup";
+        let state = executor.create(id, &bundle_dir).unwrap();
+        assert_eq!(state.status, ContainerStatus::Created);
+
+        let child_pid = state.pid.expect("Child PID must exist in Created state");
+
+        // Verify child process is alive (paused waiting for start)
+        let kill_probe = unsafe { libc::kill(child_pid as libc::pid_t, 0) };
+        assert_eq!(kill_probe, 0, "Init child process must be alive");
+
+        let cont_dir = executor.container_dir(id);
+        assert!(cont_dir.join("control.sock").exists());
+
+        // Deleting Created container must cancel supervisor via control.sock
+        let del = executor.delete(id, false);
+        assert!(
+            del.is_ok(),
+            "delete(id, false) on Created container must succeed"
+        );
+
+        // Verify container directory is removed
+        assert!(!cont_dir.exists(), "Container directory must be removed");
+        assert!(executor.load_state(id).is_err());
+
+        // Verify child process was reaped and is no longer running
+        std::thread::sleep(Duration::from_millis(50));
+        let dead_probe = unsafe { libc::kill(child_pid as libc::pid_t, 0) };
+        assert_ne!(dead_probe, 0, "Init child must have been reaped");
+    }
+}
+
+#[test]
+fn test_linux_delete_created_container_with_cgroups() {
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping rootful delete created container with cgroup test (requires root)");
+            return;
+        }
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let bundle_dir = temp.path().join("bundle");
+        let rootfs = bundle_dir.join("rootfs");
+        let bin_dir = rootfs.join("bin");
+        let dev_dir = rootfs.join("dev");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&dev_dir).unwrap();
+        let _ = fs::File::create(dev_dir.join("null"));
+
+        if Path::new("/usr/bin/busybox").exists() {
+            fs::copy("/usr/bin/busybox", bin_dir.join("busybox")).unwrap();
+        } else if Path::new("/bin/busybox").exists() {
+            fs::copy("/bin/busybox", bin_dir.join("busybox")).unwrap();
+        } else {
+            return;
+        }
+
+        let mut spec = Spec::default_linux();
+        if let Some(proc) = &mut spec.process {
+            proc.args = vec![
+                "/bin/busybox".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "sleep 30".to_string(),
+            ];
+        }
+        if let Some(linux) = &mut spec.linux {
+            linux.resources = Some(tavik_runtime::spec::LinuxResources {
+                devices: vec![],
+                memory: Some(tavik_runtime::spec::LinuxMemory {
+                    limit: Some(64 * 1024 * 1024),
+                    reservation: None,
+                    swap: None,
+                    kernel: None,
+                    kernel_tcp: None,
+                    swappiness: None,
+                    disable_oom_killer: None,
+                }),
+                cpu: None,
+                pids: None,
+                block_io: None,
+                hugepage_limits: vec![],
+                network: None,
+                rdma: std::collections::HashMap::new(),
+                unified: std::collections::HashMap::new(),
+            });
+        }
+        fs::write(
+            bundle_dir.join("config.json"),
+            serde_json::to_string_pretty(&spec).unwrap(),
+        )
+        .unwrap();
+
+        let executor = ContainerExecutor::new(state_dir).unwrap();
+        let id = "test-delete-created-cgroup";
+        let state = executor.create(id, &bundle_dir).unwrap();
+        assert_eq!(state.status, ContainerStatus::Created);
+
+        let cont_dir = executor.container_dir(id);
+        assert!(cont_dir.join("cgroup.owner").exists());
+        assert_eq!(
+            state.annotations.get("io.tavik.cgroup.owned"),
+            Some(&"true".to_string())
+        );
+
+        let cgroup_mgr = tavik_cgroups::CgroupManager::new().unwrap();
+        let cgroup_dir = cgroup_mgr.container_cgroup_dir(id).unwrap();
+        assert!(cgroup_dir.exists(), "Cgroup directory must exist on host");
+
+        let child_pid = state.pid.unwrap();
+
+        // Delete Created container
+        let del = executor.delete(id, false);
+        assert!(del.is_ok());
+
+        // Verify child reaped
+        std::thread::sleep(Duration::from_millis(50));
+        let dead_probe = unsafe { libc::kill(child_pid as libc::pid_t, 0) };
+        assert_ne!(dead_probe, 0, "Init child must have been reaped");
+
+        // Verify cgroup destroyed
+        assert!(!cgroup_dir.exists(), "Cgroup directory must be destroyed");
+        assert!(!cont_dir.exists(), "Container directory must be removed");
+    }
+}
+
+#[test]
+fn test_failed_cancellation_preserves_metadata() {
+    #[cfg(target_os = "linux")]
+    {
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let executor = ContainerExecutor::new(state_dir).unwrap();
+        let id = "test-failed-cancel-preserves-metadata";
+
+        // Set up a created container state on disk
+        let cont_dir = executor.container_dir(id);
+        fs::create_dir_all(&cont_dir).unwrap();
+
+        let state = tavik_runtime::ContainerState {
+            oci_version: "1.2.0".to_string(),
+            id: id.to_string(),
+            status: ContainerStatus::Created,
+            pid: Some(999999),
+            bundle: temp.path().join("bundle"),
+            annotations: std::collections::HashMap::new(),
+            created_at: chrono::Utc::now(),
+        };
+        executor.save_state(&state).unwrap();
+
+        // Since control.sock does NOT exist, supervisor cancellation is unreachable.
+        // Deletion must fail closed and PRESERVE container directory and metadata.
+        let del_res = executor.delete(id, false);
+        assert!(del_res.is_err());
+
+        assert!(
+            cont_dir.exists(),
+            "Container dir must be preserved on failed cancellation"
+        );
+        let loaded = executor.load_state(id).unwrap();
+        assert_eq!(loaded.status, ContainerStatus::Created);
+    }
+}
+
+#[test]
+fn test_cgroup_ownership_persisted_immediately_from_creation() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let executor = ContainerExecutor::new(state_dir).unwrap();
+    let id = "test-cgroup-owner-marker";
+
+    let cont_dir = executor.container_dir(id);
+    fs::create_dir_all(&cont_dir).unwrap();
+
+    let mut state = tavik_runtime::ContainerState {
+        oci_version: "1.2.0".to_string(),
+        id: id.to_string(),
+        status: ContainerStatus::Creating,
+        pid: None,
+        bundle: temp.path().join("bundle"),
+        annotations: std::collections::HashMap::new(),
+        created_at: chrono::Utc::now(),
+    };
+    state
+        .annotations
+        .insert("io.tavik.cgroup.owned".to_string(), "true".to_string());
+    executor.save_state(&state).unwrap();
+
+    // Marker written immediately
+    fs::write(cont_dir.join("cgroup.owner"), b"1\n").unwrap();
+
+    assert!(executor.has_cgroup_ownership(id, &state));
+}
+
+#[test]
+fn test_failed_creation_preserves_recovery_metadata_when_cgroup_cleanup_fails() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let executor = ContainerExecutor::new(state_dir).unwrap();
+    let id = "test-recovery-metadata";
+
+    let cont_dir = executor.container_dir(id);
+    fs::create_dir_all(&cont_dir).unwrap();
+
+    let mut state = tavik_runtime::ContainerState {
+        oci_version: "1.2.0".to_string(),
+        id: id.to_string(),
+        status: ContainerStatus::Creating,
+        pid: None,
+        bundle: temp.path().join("bundle"),
+        annotations: std::collections::HashMap::new(),
+        created_at: chrono::Utc::now(),
+    };
+    state
+        .annotations
+        .insert("io.tavik.cgroup.owned".to_string(), "true".to_string());
+    executor.save_state(&state).unwrap();
+    fs::write(cont_dir.join("cgroup.owner"), b"1\n").unwrap();
+
+    // Verify has_cgroup_ownership sees the marker
+    assert!(executor.has_cgroup_ownership(id, &state));
+    assert!(cont_dir.join("cgroup.owner").exists());
+}
+
+#[test]
+fn test_concurrency_two_simultaneous_deletes() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let executor = std::sync::Arc::new(ContainerExecutor::new(state_dir).unwrap());
+    let id = "test-concurrent-delete";
+
+    let cont_dir = executor.container_dir(id);
+    fs::create_dir_all(&cont_dir).unwrap();
+
+    let state = tavik_runtime::ContainerState {
+        oci_version: "1.2.0".to_string(),
+        id: id.to_string(),
+        status: ContainerStatus::Stopped,
+        pid: None,
+        bundle: temp.path().join("bundle"),
+        annotations: std::collections::HashMap::new(),
+        created_at: chrono::Utc::now(),
+    };
+    executor.save_state(&state).unwrap();
+
+    let exec1 = std::sync::Arc::clone(&executor);
+    let exec2 = std::sync::Arc::clone(&executor);
+
+    let handle1 = std::thread::spawn(move || exec1.delete(id, false));
+    let handle2 = std::thread::spawn(move || exec2.delete(id, false));
+
+    let res1 = handle1.join().unwrap();
+    let res2 = handle2.join().unwrap();
+
+    // Exactly one delete must succeed, and the other must return NotFound (or error)
+    let ok_count = [res1.is_ok(), res2.is_ok()]
+        .into_iter()
+        .filter(|&x| x)
+        .count();
+    assert_eq!(ok_count, 1, "Exactly one concurrent delete must succeed");
+
+    assert!(!cont_dir.exists(), "Container directory must be removed");
+}
+
+#[test]
+fn test_concurrency_stop_and_delete() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let executor = std::sync::Arc::new(ContainerExecutor::new(state_dir).unwrap());
+    let id = "test-concurrent-stop-delete";
+
+    let cont_dir = executor.container_dir(id);
+    fs::create_dir_all(&cont_dir).unwrap();
+
+    let state = tavik_runtime::ContainerState {
+        oci_version: "1.2.0".to_string(),
+        id: id.to_string(),
+        status: ContainerStatus::Stopped,
+        pid: None,
+        bundle: temp.path().join("bundle"),
+        annotations: std::collections::HashMap::new(),
+        created_at: chrono::Utc::now(),
+    };
+    executor.save_state(&state).unwrap();
+
+    let exec1 = std::sync::Arc::clone(&executor);
+    let exec2 = std::sync::Arc::clone(&executor);
+
+    // One thread stops (which sees Stopped and returns Ok), another deletes
+    let handle1 = std::thread::spawn(move || exec1.stop(id, None, None));
+    let handle2 = std::thread::spawn(move || exec2.delete(id, false));
+
+    let _ = handle1.join().unwrap();
+    let _ = handle2.join().unwrap();
+
+    // Must not panic, and container must be gone
+    assert!(!cont_dir.exists());
+}

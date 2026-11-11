@@ -711,7 +711,7 @@ async fn test_create_and_run_container_linux_e2e() {
 
         let arch = detect_host_arch();
         let temp = tempdir().unwrap();
-        let store = Arc::new(ContentStore::new(temp.path().join("store")).await.unwrap());
+        let store = Arc::new(ContentStore::new(temp.path().join("store")).unwrap());
         let service = ImageService::new(store.clone());
 
         let (layer_bytes, diff_id) = create_tar_gz_layer(&[
@@ -852,7 +852,7 @@ async fn test_invalid_working_directory_fails_linux() {
         let busybox_bytes = std::fs::read(busybox_path).unwrap();
         let arch = detect_host_arch();
         let temp = tempdir().unwrap();
-        let store = Arc::new(ContentStore::new(temp.path().join("store")).await.unwrap());
+        let store = Arc::new(ContentStore::new(temp.path().join("store")).unwrap());
         let service = ImageService::new(store.clone());
 
         let (layer_bytes, diff_id) = create_tar_gz_layer(&[

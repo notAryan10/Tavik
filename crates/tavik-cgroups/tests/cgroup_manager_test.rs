@@ -407,10 +407,10 @@ mod mock_tests {
 
     #[test]
     fn test_cgroup_mock_pidfd_ownership_and_closure() {
-        // Fork child process to isolate descriptor assertions from concurrent test runner threads
-        let child = unsafe { libc::fork() };
-        assert!(child >= 0, "fork failed");
-        if child == 0 {
+        const SUBPROCESS_ENV: &str = "TAVIK_TEST_MOCK_PIDFD_SUBPROCESS";
+
+        if std::env::var(SUBPROCESS_ENV).is_ok() {
+            // Subprocess: execute descriptor ownership test body directly
             use std::os::unix::io::IntoRawFd;
             let (_temp, ops, mgr) = setup_mock_manager();
             let container_id = "test-mock-pidfd-closure";
@@ -465,17 +465,25 @@ mod mock_tests {
 
             // Clean up canary fd
             unsafe { libc::close(canary_fd) };
-
-            std::process::exit(0);
+            return;
         }
 
-        let mut status = 0;
-        let wres = unsafe { libc::waitpid(child, &mut status, 0) };
-        assert_eq!(wres, child);
+        // Parent: run the test body in a separately spawned test process using std::process::Command
+        let current_exe = std::env::current_exe().expect("Failed to get current_exe");
+        let output = std::process::Command::new(current_exe)
+            .arg("mock_tests::test_cgroup_mock_pidfd_ownership_and_closure")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(SUBPROCESS_ENV, "1")
+            .output()
+            .expect("Failed to spawn isolated test subprocess");
+
         assert!(
-            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-            "Child process failed with exit status: {}",
-            libc::WEXITSTATUS(status)
+            output.status.success(),
+            "Isolated mock pidfd ownership test failed with status: {:?}\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }

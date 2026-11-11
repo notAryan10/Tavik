@@ -4317,6 +4317,17 @@ fn test_e2e_real_supervisor_unexpected_exit_and_force_delete() {
                 "sleep 100".to_string(),
             ];
         }
+        if let Some(linux) = &mut spec.linux {
+            linux.resources = Some(tavik_cgroups::CgroupResources {
+                memory: Some(tavik_cgroups::MemoryResources {
+                    limit: Some(64 * 1024 * 1024),
+                    high: None,
+                    swap: None,
+                }),
+                cpu: None,
+                pids: None,
+            });
+        }
         fs::write(
             bundle_dir.join("config.json"),
             serde_json::to_string_pretty(&spec).unwrap(),

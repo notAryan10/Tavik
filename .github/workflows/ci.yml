@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  linux:
+  hosted-linux:
     name: Hosted Linux ${{ matrix.arch }} validation
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
@@ -61,9 +61,9 @@ jobs:
       - name: Test runtime without test hooks
         run: cargo test -p tavik-runtime --no-default-features
 
-      - name: Report privileged tests delegated to rootful job
+      - name: Report privileged tests delegated to rootful local VM suite
         run: |
-          echo "=== Privileged tests delegated to rootful Linux ARM64 runner ==="
+          echo "=== Privileged tests delegated to rootful Linux ARM64 local VM suite ==="
           echo "The following tests require privileged PID namespaces, mount namespaces, or rootful cgroups v2:"
           echo "  - tavik-runtime: executor::tests::test_executor_create_state_and_delete (marked #[ignore])"
           echo "  - tavik-cgroups: test_linux_cgroup_lifecycle"
@@ -105,92 +105,7 @@ jobs:
           echo "      test_cgroup_destruction_propagates_kill_and_process_errors"
           echo "      test_linux_lifecycle_graceful_stop_and_acknowledgment"
           echo "      test_signal_escalation_esrch_and_pidfd_exit"
-          echo "These tests are verified against real kernel semantics by the rootful Linux ARM64 job."
+          echo "These tests are verified against real Linux kernel semantics by the local UTM ARM64 rootful validation workflow."
 
       - name: Run full workspace tests as ordinary user
         run: cargo test --workspace --no-fail-fast
-
-  rootful-linux-arm64:
-    name: Rootful Linux ARM64 validation
-    runs-on: [self-hosted, Linux, ARM64, tavik-rootful]
-    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
-    timeout-minutes: 45
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Verify rootful Linux ARM64 prerequisites
-        run: |
-          set -eo pipefail
-
-          echo "=== 1. Checking Linux ARM64 architecture ==="
-          os_name="$(uname -s)"
-          arch_name="$(uname -m)"
-          echo "OS: ${os_name}, Architecture: ${arch_name}"
-          if [ "${os_name}" != "Linux" ] || [ "${arch_name}" != "aarch64" ]; then
-            echo "ERROR: Runner architecture is not Linux ARM64 (aarch64). Found: ${os_name} ${arch_name}" >&2
-            exit 1
-          fi
-
-          echo "=== 2. Checking non-interactive sudo access ==="
-          if ! sudo -n true 2>/dev/null; then
-            echo "ERROR: Non-interactive sudo is not available for runner user $(whoami)" >&2
-            exit 1
-          fi
-          echo "Non-interactive sudo verified."
-
-          echo "=== 3. Checking unified cgroup v2 hierarchy at /sys/fs/cgroup ==="
-          cgroup_type="$(stat -fc %T /sys/fs/cgroup 2>/dev/null || true)"
-          if [ "${cgroup_type}" != "cgroup2fs" ]; then
-            echo "ERROR: /sys/fs/cgroup is not cgroup v2 (found: ${cgroup_type:-unknown})" >&2
-            exit 1
-          fi
-          echo "Unified cgroup v2 mounted at /sys/fs/cgroup."
-
-          echo "=== 4. Checking required cgroup v2 controllers ==="
-          if [ ! -r /sys/fs/cgroup/cgroup.controllers ]; then
-            echo "ERROR: Cannot read /sys/fs/cgroup/cgroup.controllers" >&2
-            exit 1
-          fi
-          controllers="$(cat /sys/fs/cgroup/cgroup.controllers)"
-          echo "Available controllers: ${controllers}"
-          for ctrl in cpu memory pids; do
-            if ! grep -qw "$ctrl" <<< "$controllers"; then
-              echo "ERROR: Required cgroup v2 controller is missing: $ctrl" >&2
-              exit 1
-            fi
-          done
-          echo "Required controllers (cpu, memory, pids) verified."
-
-          echo "=== 5. Checking real kernel PID namespace creation ==="
-          if ! sudo -n unshare --pid --fork true; then
-            echo "ERROR: Real PID namespace creation failed under sudo unshare --pid --fork true" >&2
-            exit 1
-          fi
-          echo "Real PID namespace creation verified."
-
-      - name: Verify BusyBox availability
-        run: |
-          if ! command -v busybox >/dev/null 2>&1; then
-            echo "Installing busybox-static..."
-            sudo -n apt-get update && sudo -n apt-get install --yes busybox-static
-          fi
-          command -v busybox
-
-      - name: Run complete workspace test suite
-        run: |
-          SUDO=""
-          if [ "$(id -u)" -ne 0 ]; then
-            SUDO="sudo --preserve-env=PATH,CARGO_HOME,RUSTUP_HOME"
-          fi
-          $SUDO cargo test --workspace --no-fail-fast
-
-      - name: Run ignored privileged runtime test
-        run: |
-          SUDO=""
-          if [ "$(id -u)" -ne 0 ]; then
-            SUDO="sudo --preserve-env=PATH,CARGO_HOME,RUSTUP_HOME"
-          fi
-          export TAVIKR_PATH="${GITHUB_WORKSPACE:-$(pwd)}/target/debug/tavikr"
-          $SUDO env "TAVIKR_PATH=${TAVIKR_PATH}" cargo test -p tavik-runtime --no-default-features executor::tests::test_executor_create_state_and_delete -- --ignored --exact

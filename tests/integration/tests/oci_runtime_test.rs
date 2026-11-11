@@ -3354,6 +3354,12 @@ fn test_force_delete_does_not_signal_unrelated_process_on_pid_reuse() {
         .unwrap();
     let bystander_pid = bystander.id();
 
+    // Record a supervisor identity that is verifiably dead (PID 999999)
+    let dead_sup_ident = tavik_runtime::ProcessIdentity::new(999999, 12345);
+    dead_sup_ident
+        .save_to(&cont_dir.join("supervisor.identity"))
+        .unwrap();
+
     // Record an identity with a completely different start_time (simulating PID reuse)
     let recorded_ident = tavik_runtime::ProcessIdentity::new(bystander_pid, 99999999);
     recorded_ident
@@ -3363,23 +3369,39 @@ fn test_force_delete_does_not_signal_unrelated_process_on_pid_reuse() {
     let mut state = tavik_runtime::ContainerState {
         oci_version: "1.2.0".to_string(),
         id: id.to_string(),
-        status: ContainerStatus::Stopped,
+        status: ContainerStatus::Running,
         pid: Some(bystander_pid),
         bundle: temp.path().join("bundle"),
         annotations: std::collections::HashMap::new(),
         created_at: chrono::Utc::now(),
     };
+    state
+        .annotations
+        .insert("io.tavik.supervisor.pid".to_string(), "999999".to_string());
+    state.annotations.insert(
+        "io.tavik.supervisor.start_time".to_string(),
+        "12345".to_string(),
+    );
     state.annotations.insert(
         "io.tavik.init.start_time".to_string(),
         "99999999".to_string(),
     );
     executor.save_state(&state).unwrap();
 
-    // Delete the container
-    let del_res = executor.delete(id, false);
+    // control.sock is deliberately absent
+    assert!(!cont_dir.join("control.sock").exists());
+
+    // Force delete the container
+    let del_res = executor.delete(id, true);
     assert!(del_res.is_ok(), "Delete must succeed: {:?}", del_res.err());
 
-    // The bystander process MUST STILL BE ALIVE! It was never killed by delete!
+    // Container directory must be removed once identities are confirmed dead/absent
+    assert!(
+        !cont_dir.exists(),
+        "Container directory must be removed once identities are established as gone"
+    );
+
+    // The bystander process MUST STILL BE ALIVE! It was never killed by delete because PID reuse was detected!
     #[cfg(unix)]
     {
         let kill_zero = unsafe { libc::kill(bystander_pid as libc::pid_t, 0) };
@@ -3855,4 +3877,387 @@ fn test_process_identity_kill_safe_with_real_process() {
 
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[test]
+fn test_pidfd_open_enosys_fails_unsupported_and_preserves_process() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let child_pid = child.id();
+
+    let ident = tavik_runtime::ProcessIdentity::from_pid(child_pid).unwrap();
+    assert!(ident.is_alive().unwrap());
+
+    // Simulate ENOSYS from pidfd_open
+    tavik_runtime::test_hooks::set_simulate_pidfd_open_errno(libc::ENOSYS);
+
+    let res = ident.kill_safe();
+    assert!(
+        matches!(res, Err(tavik_common::error::TavikError::Unsupported(_))),
+        "Must return Unsupported when pidfd_open returns ENOSYS: {:?}",
+        res
+    );
+
+    // Ensure child process is still alive: NO unsafe numeric PID signal fallback allowed!
+    assert!(
+        ident.is_alive().unwrap(),
+        "Process must not be killed when pidfd_open fails unsupported"
+    );
+
+    tavik_runtime::test_hooks::reset();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn test_pidfd_send_signal_enosys_fails_unsupported_and_preserves_process() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let child_pid = child.id();
+
+    let ident = tavik_runtime::ProcessIdentity::from_pid(child_pid).unwrap();
+    assert!(ident.is_alive().unwrap());
+
+    // Simulate ENOSYS from pidfd_send_signal
+    tavik_runtime::test_hooks::set_simulate_pidfd_send_signal_errno(libc::ENOSYS);
+
+    let res = ident.kill_safe();
+    assert!(
+        matches!(res, Err(tavik_common::error::TavikError::Unsupported(_))),
+        "Must return Unsupported when pidfd_send_signal returns ENOSYS: {:?}",
+        res
+    );
+
+    // Ensure child process is still alive: NO unsafe numeric PID signal fallback allowed!
+    assert!(
+        ident.is_alive().unwrap(),
+        "Process must not be killed when pidfd_send_signal fails unsupported"
+    );
+
+    tavik_runtime::test_hooks::reset();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn test_pidfd_poll_terminal_events_and_unexpected_conditions() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let child_pid = child.id();
+
+    let ident = tavik_runtime::ProcessIdentity::from_pid(child_pid).unwrap();
+    assert!(ident.is_alive().unwrap());
+
+    // 1. POLLERR must be rejected as an error, NEVER treated as proof of termination!
+    tavik_runtime::test_hooks::set_simulate_pidfd_poll_revents(libc::POLLERR as i32);
+    let res_err = ident.kill_safe();
+    assert!(
+        res_err.is_err(),
+        "POLLERR must return an error rather than claiming termination"
+    );
+    match res_err {
+        Err(tavik_common::error::TavikError::Execution(msg)) => {
+            assert!(
+                msg.contains("Unexpected poll error event"),
+                "Error message was: {}",
+                msg
+            );
+        }
+        other => panic!("Expected Execution error for POLLERR, got: {:?}", other),
+    }
+
+    // 2. POLLNVAL must be rejected as an error
+    tavik_runtime::test_hooks::set_simulate_pidfd_poll_revents(libc::POLLNVAL as i32);
+    let res_nval = ident.kill_safe();
+    assert!(
+        res_nval.is_err(),
+        "POLLNVAL must return an error rather than claiming termination"
+    );
+    match res_nval {
+        Err(tavik_common::error::TavikError::Execution(msg)) => {
+            assert!(
+                msg.contains("Unexpected poll error event"),
+                "Error message was: {}",
+                msg
+            );
+        }
+        other => panic!("Expected Execution error for POLLNVAL, got: {:?}", other),
+    }
+
+    // Reset test hooks
+    tavik_runtime::test_hooks::reset();
+
+    // 3. Normal safe kill succeeds and terminates the child
+    let ok_res = ident.kill_safe();
+    assert!(ok_res.is_ok(), "kill_safe must succeed: {:?}", ok_res.err());
+    assert!(!ident.is_alive().unwrap(), "Process must be terminated");
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn test_force_delete_with_pidfd_open_failure_retains_metadata_and_fails_unsupported() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let executor = ContainerExecutor::new(state_dir.clone()).unwrap();
+    let id = "test-pidfd-open-fail-retain";
+    let cont_dir = executor.container_dir(id);
+    fs::create_dir_all(&cont_dir).unwrap();
+
+    // Spawn an init process
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let child_pid = child.id();
+
+    // Record dead supervisor identity
+    let dead_sup_ident = tavik_runtime::ProcessIdentity::new(999999, 12345);
+    dead_sup_ident
+        .save_to(&cont_dir.join("supervisor.identity"))
+        .unwrap();
+
+    // Record real init identity
+    let real_init_ident = tavik_runtime::ProcessIdentity::from_pid(child_pid).unwrap();
+    real_init_ident
+        .save_to(&cont_dir.join("container.identity"))
+        .unwrap();
+
+    let mut state = tavik_runtime::ContainerState {
+        oci_version: "1.2.0".to_string(),
+        id: id.to_string(),
+        status: ContainerStatus::Running,
+        pid: Some(child_pid),
+        bundle: temp.path().join("bundle"),
+        annotations: std::collections::HashMap::new(),
+        created_at: chrono::Utc::now(),
+    };
+    state
+        .annotations
+        .insert("io.tavik.supervisor.pid".to_string(), "999999".to_string());
+    state.annotations.insert(
+        "io.tavik.supervisor.start_time".to_string(),
+        "12345".to_string(),
+    );
+    state.annotations.insert(
+        "io.tavik.init.start_time".to_string(),
+        real_init_ident.start_time.to_string(),
+    );
+    executor.save_state(&state).unwrap();
+
+    // control.sock is absent
+    assert!(!cont_dir.join("control.sock").exists());
+
+    // Simulate ENOSYS from pidfd_open
+    tavik_runtime::test_hooks::set_simulate_pidfd_open_errno(libc::ENOSYS);
+
+    let del_res = executor.delete(id, true);
+    assert!(
+        matches!(
+            del_res,
+            Err(tavik_common::error::TavikError::Unsupported(_))
+        ),
+        "Delete must fail with Unsupported: {:?}",
+        del_res
+    );
+
+    // Container metadata directory MUST be retained!
+    assert!(
+        cont_dir.exists(),
+        "Container metadata directory must be retained when termination fails"
+    );
+
+    // Child must still be alive (no fallback)
+    assert!(
+        real_init_ident.is_alive().unwrap(),
+        "Child process must remain alive"
+    );
+
+    tavik_runtime::test_hooks::reset();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn test_cgroup_fallback_enumeration_and_membership_filtering() {
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping cgroup fallback test (requires root)");
+            return;
+        }
+
+        let mgr = tavik_cgroups::CgroupManager::new().unwrap();
+        if let Err(e) = mgr.validate_cgroup_v2() {
+            eprintln!("Skipping cgroup fallback test: {}", e);
+            return;
+        }
+
+        let container_id = format!("tavik-fb-test-{}", std::process::id());
+        let cgroup_dir = mgr.create_container_cgroup(&container_id).unwrap();
+        assert!(cgroup_dir.exists());
+
+        // Spawn a child process and add to cgroup
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("Failed to spawn child");
+        let child_pid = child.id();
+        mgr.add_process(&container_id, child_pid).unwrap();
+
+        // 1. Test simulated read failure of cgroup.procs
+        fs::write(cgroup_dir.join(".simulate_procs_read_fail"), b"1").unwrap();
+        let err_procs = mgr.destroy_container_cgroup(&container_id);
+        assert!(err_procs.is_err(), "Must fail when procs read fails");
+        assert!(
+            cgroup_dir.exists(),
+            "Cgroup directory must remain after error"
+        );
+        let _ = fs::remove_file(cgroup_dir.join(".simulate_procs_read_fail"));
+
+        // 2. Test simulated pidfd_open failure
+        fs::write(cgroup_dir.join(".simulate_disable_cgroup_kill"), b"1").unwrap();
+        fs::write(cgroup_dir.join(".simulate_pidfd_open_fail"), b"1").unwrap();
+        let err_open = mgr.destroy_container_cgroup(&container_id);
+        assert!(matches!(
+            err_open,
+            Err(tavik_common::error::TavikError::Unsupported(_))
+        ));
+        assert!(
+            cgroup_dir.exists(),
+            "Cgroup directory must remain after unsupported error"
+        );
+        let _ = fs::remove_file(cgroup_dir.join(".simulate_pidfd_open_fail"));
+
+        // 3. Test simulated pidfd_send_signal failure
+        fs::write(cgroup_dir.join(".simulate_pidfd_send_signal_fail"), b"1").unwrap();
+        let err_sig = mgr.destroy_container_cgroup(&container_id);
+        assert!(matches!(
+            err_sig,
+            Err(tavik_common::error::TavikError::Unsupported(_))
+        ));
+        assert!(
+            cgroup_dir.exists(),
+            "Cgroup directory must remain after unsupported error"
+        );
+        let _ = fs::remove_file(cgroup_dir.join(".simulate_pidfd_send_signal_fail"));
+
+        // 4. Test normal fallback termination (with cgroup.kill disabled)
+        let ok_destroy = mgr.destroy_container_cgroup(&container_id);
+        assert!(
+            ok_destroy.is_ok(),
+            "Fallback destruction must succeed: {:?}",
+            ok_destroy.err()
+        );
+        assert!(
+            !cgroup_dir.exists(),
+            "Cgroup directory must be removed on success"
+        );
+
+        let _ = child.wait();
+    }
+}
+
+#[test]
+fn test_e2e_real_supervisor_unexpected_exit_and_force_delete() {
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!(
+                "Skipping real supervisor unexpected exit and force delete test (requires root)"
+            );
+            return;
+        }
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let bundle_dir = temp.path().join("bundle");
+        let rootfs = bundle_dir.join("rootfs");
+        let bin_dir = rootfs.join("bin");
+        let dev_dir = rootfs.join("dev");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&dev_dir).unwrap();
+        let _ = fs::File::create(dev_dir.join("null"));
+
+        if Path::new("/usr/bin/busybox").exists() {
+            fs::copy("/usr/bin/busybox", bin_dir.join("busybox")).unwrap();
+        } else if Path::new("/bin/busybox").exists() {
+            fs::copy("/bin/busybox", bin_dir.join("busybox")).unwrap();
+        } else {
+            eprintln!("Skipping test: busybox not found");
+            return;
+        }
+
+        let mut spec = Spec::default_linux();
+        if let Some(proc) = &mut spec.process {
+            proc.args = vec![
+                "/bin/busybox".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "sleep 100".to_string(),
+            ];
+        }
+        fs::write(
+            bundle_dir.join("config.json"),
+            serde_json::to_string_pretty(&spec).unwrap(),
+        )
+        .unwrap();
+
+        let executor = ContainerExecutor::new(state_dir).unwrap();
+        let id = "test-e2e-sup-crash-force-delete";
+        let state = executor.create(id, &bundle_dir).unwrap();
+        assert_eq!(state.status, ContainerStatus::Created);
+
+        let started = executor.start(id).unwrap();
+        assert_eq!(started.status, ContainerStatus::Running);
+
+        let init_pid = started.pid.expect("Running container must have init pid");
+        let cont_dir = executor.container_dir(id);
+
+        let sup_ident =
+            tavik_runtime::ProcessIdentity::load_from(&cont_dir.join("supervisor.identity"))
+                .expect("Supervisor identity must exist");
+        let sup_pid = sup_ident.pid;
+
+        // Verify both supervisor and init are alive
+        assert_eq!(unsafe { libc::kill(sup_pid as libc::pid_t, 0) }, 0);
+        assert_eq!(unsafe { libc::kill(init_pid as libc::pid_t, 0) }, 0);
+
+        // Unexpectedly terminate the supervisor with SIGKILL
+        let kill_ret = unsafe { libc::kill(sup_pid as libc::pid_t, libc::SIGKILL) };
+        assert_eq!(kill_ret, 0, "SIGKILL supervisor must succeed");
+
+        // Give kernel a moment to deliver signal and exit supervisor
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Confirm supervisor is gone
+        assert_ne!(unsafe { libc::kill(sup_pid as libc::pid_t, 0) }, 0);
+
+        // Control socket is now stale/unresponsive
+        // Execute forced deletion
+        let del_res = executor.delete(id, true);
+        assert!(
+            del_res.is_ok(),
+            "Forced deletion must succeed after supervisor crash: {:?}",
+            del_res.err()
+        );
+
+        // Verify init process is terminated
+        std::thread::sleep(Duration::from_millis(50));
+        assert_ne!(
+            unsafe { libc::kill(init_pid as libc::pid_t, 0) },
+            0,
+            "Init process must be terminated"
+        );
+
+        // Verify container state directory is retired
+        assert!(!cont_dir.exists(), "Container directory must be removed");
+    }
 }

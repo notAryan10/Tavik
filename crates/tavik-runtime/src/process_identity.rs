@@ -8,6 +8,34 @@ pub struct ProcessIdentity {
     pub start_time: u64,
 }
 
+#[cfg(target_os = "macos")]
+fn get_process_stat_macos(pid: u32) -> Result<u64> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let ret = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::pid_t,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if ret <= 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            return Err(TavikError::NotFound(format!("Process {} not found", pid)));
+        } else if err.raw_os_error() == Some(libc::EPERM) {
+            return Err(TavikError::Execution(format!(
+                "Permission denied checking process {}",
+                pid
+            )));
+        }
+        return Err(TavikError::NotFound(format!("Process {} not found", pid)));
+    }
+    Ok(info.pbi_start_tvsec)
+}
+
 #[cfg(target_os = "linux")]
 fn get_process_stat_linux(pid: u32) -> Result<(char, u64)> {
     let stat_path = format!("/proc/{}/stat", pid);
@@ -52,6 +80,57 @@ fn get_process_stat_linux(pid: u32) -> Result<(char, u64)> {
     Ok((state_char, start_time))
 }
 
+#[doc(hidden)]
+pub mod test_hooks {
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    static SIMULATE_PIDFD_OPEN_ERRNO: AtomicI32 = AtomicI32::new(0);
+    static SIMULATE_PIDFD_SEND_SIGNAL_ERRNO: AtomicI32 = AtomicI32::new(0);
+    static SIMULATE_PIDFD_POLL_REVENTS: AtomicI32 = AtomicI32::new(-1);
+
+    pub fn set_simulate_pidfd_open_errno(errno: i32) {
+        SIMULATE_PIDFD_OPEN_ERRNO.store(errno, Ordering::SeqCst);
+    }
+
+    pub fn set_simulate_pidfd_send_signal_errno(errno: i32) {
+        SIMULATE_PIDFD_SEND_SIGNAL_ERRNO.store(errno, Ordering::SeqCst);
+    }
+
+    pub fn set_simulate_pidfd_poll_revents(revents: i32) {
+        SIMULATE_PIDFD_POLL_REVENTS.store(revents, Ordering::SeqCst);
+    }
+
+    pub fn get_simulate_pidfd_open_errno() -> i32 {
+        SIMULATE_PIDFD_OPEN_ERRNO.load(Ordering::SeqCst)
+    }
+
+    pub fn get_simulate_pidfd_send_signal_errno() -> i32 {
+        SIMULATE_PIDFD_SEND_SIGNAL_ERRNO.load(Ordering::SeqCst)
+    }
+
+    pub fn get_simulate_pidfd_poll_revents() -> i32 {
+        SIMULATE_PIDFD_POLL_REVENTS.load(Ordering::SeqCst)
+    }
+
+    pub fn reset() {
+        SIMULATE_PIDFD_OPEN_ERRNO.store(0, Ordering::SeqCst);
+        SIMULATE_PIDFD_SEND_SIGNAL_ERRNO.store(0, Ordering::SeqCst);
+        SIMULATE_PIDFD_POLL_REVENTS.store(-1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct FdGuard(libc::c_int);
+
+#[cfg(target_os = "linux")]
+impl Drop for FdGuard {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            unsafe { libc::close(self.0) };
+        }
+    }
+}
+
 impl ProcessIdentity {
     pub fn new(pid: u32, start_time: u64) -> Self {
         Self { pid, start_time }
@@ -63,7 +142,12 @@ impl ProcessIdentity {
             let (_state, start_time) = get_process_stat_linux(pid)?;
             Ok(Self { pid, start_time })
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            let start_time = get_process_stat_macos(pid)?;
+            Ok(Self { pid, start_time })
+        }
+        #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
         {
             let res = unsafe { libc::kill(pid as libc::pid_t, 0) };
             if res != 0 {
@@ -106,7 +190,28 @@ impl ProcessIdentity {
                 Err(e) => Err(e),
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            let mut status = 0;
+            let wait_res =
+                unsafe { libc::waitpid(self.pid as libc::pid_t, &mut status, libc::WNOHANG) };
+            if wait_res == self.pid as libc::pid_t {
+                return Ok(false);
+            }
+            match get_process_stat_macos(self.pid) {
+                Ok(start_time) => {
+                    if start_time != self.start_time {
+                        // PID reuse: original process has terminated
+                        Ok(false)
+                    } else {
+                        Ok(true)
+                    }
+                }
+                Err(TavikError::NotFound(_)) => Ok(false),
+                Err(e) => Err(e),
+            }
+        }
+        #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
         {
             let mut status = 0;
             let wait_res =
@@ -146,7 +251,14 @@ impl ProcessIdentity {
 
         #[cfg(target_os = "linux")]
         {
-            let pfd = unsafe { libc::syscall(libc::SYS_pidfd_open, self.pid, 0) as libc::c_int };
+            let sim_open = test_hooks::get_simulate_pidfd_open_errno();
+            let pfd = if sim_open != 0 {
+                unsafe { *libc::__errno_location() = sim_open };
+                -1
+            } else {
+                unsafe { libc::syscall(libc::SYS_pidfd_open, self.pid, 0) as libc::c_int }
+            };
+
             if pfd < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.raw_os_error() == Some(libc::ESRCH) {
@@ -170,25 +282,31 @@ impl ProcessIdentity {
                 }
             }
 
+            let _guard = FdGuard(pfd);
+
             // Verify identity while holding pfd
             if !self.is_alive()? {
-                unsafe { libc::close(pfd) };
                 return Ok(());
             }
 
-            let sig_ret = unsafe {
-                libc::syscall(
-                    libc::SYS_pidfd_send_signal,
-                    pfd,
-                    libc::SIGKILL,
-                    std::ptr::null::<libc::c_void>(),
-                    0,
-                )
+            let sim_sig = test_hooks::get_simulate_pidfd_send_signal_errno();
+            let sig_ret = if sim_sig != 0 {
+                unsafe { *libc::__errno_location() = sim_sig };
+                -1
+            } else {
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        pfd,
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::c_void>(),
+                        0,
+                    )
+                }
             };
 
             if sig_ret != 0 {
                 let err = std::io::Error::last_os_error();
-                unsafe { libc::close(pfd) };
                 if err.raw_os_error() == Some(libc::ESRCH) {
                     if !self.is_alive()? {
                         return Ok(());
@@ -222,20 +340,44 @@ impl ProcessIdentity {
                     events: libc::POLLIN,
                     revents: 0,
                 };
-                let poll_ret = unsafe { libc::poll(&mut pollfd, 1, rem_ms) };
+                let sim_poll = test_hooks::get_simulate_pidfd_poll_revents();
+                let poll_ret = if sim_poll >= 0 {
+                    pollfd.revents = sim_poll as libc::c_short;
+                    1
+                } else {
+                    unsafe { libc::poll(&mut pollfd, 1, rem_ms) }
+                };
                 if poll_ret < 0 {
                     let err = std::io::Error::last_os_error();
                     if err.raw_os_error() == Some(libc::EINTR) {
                         continue;
                     }
-                    unsafe { libc::close(pfd) };
                     return Err(TavikError::Io(format!("Failed to poll pidfd: {}", err)));
                 }
-                if poll_ret > 0
-                    && (pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0)
-                {
-                    terminated = true;
-                    break;
+                if poll_ret > 0 {
+                    let is_terminal = (pollfd.revents & (libc::POLLIN | libc::POLLHUP)) != 0;
+                    let is_err = (pollfd.revents & (libc::POLLERR | libc::POLLNVAL)) != 0;
+
+                    if is_terminal {
+                        // POLLIN indicates process exit and zombie state.
+                        // POLLHUP indicates process has been reaped.
+                        // Establish actual termination before declaring success.
+                        if !self.is_alive()? {
+                            terminated = true;
+                            break;
+                        }
+                    } else if is_err {
+                        // Never treat POLLERR or POLLNVAL as proof of termination!
+                        return Err(TavikError::Execution(format!(
+                            "Unexpected poll error event 0x{:x} on pidfd for PID {}",
+                            pollfd.revents, self.pid
+                        )));
+                    } else {
+                        return Err(TavikError::Execution(format!(
+                            "Unexpected poll readiness event 0x{:x} on pidfd for PID {}",
+                            pollfd.revents, self.pid
+                        )));
+                    }
                 }
                 if !self.is_alive()? {
                     terminated = true;
@@ -243,7 +385,6 @@ impl ProcessIdentity {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            unsafe { libc::close(pfd) };
 
             if !terminated && self.is_alive()? {
                 return Err(TavikError::Execution(format!(
@@ -257,6 +398,27 @@ impl ProcessIdentity {
 
         #[cfg(not(target_os = "linux"))]
         {
+            let sim_open = test_hooks::get_simulate_pidfd_open_errno();
+            if sim_open == libc::ENOSYS {
+                return Err(TavikError::Unsupported(
+                    "Safe race-free forced termination requires Linux SYS_pidfd_open support"
+                        .into(),
+                ));
+            }
+            let sim_sig = test_hooks::get_simulate_pidfd_send_signal_errno();
+            if sim_sig == libc::ENOSYS {
+                return Err(TavikError::Unsupported(
+                    "Safe race-free forced termination requires Linux SYS_pidfd_send_signal support".into(),
+                ));
+            }
+            let sim_poll = test_hooks::get_simulate_pidfd_poll_revents();
+            if sim_poll >= 0 && (sim_poll & (libc::POLLERR as i32 | libc::POLLNVAL as i32)) != 0 {
+                return Err(TavikError::Execution(format!(
+                    "Unexpected poll error event 0x{:x} on pidfd for PID {}",
+                    sim_poll, self.pid
+                )));
+            }
+
             let ret = unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGKILL) };
             if ret != 0 {
                 let err = std::io::Error::last_os_error();

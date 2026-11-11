@@ -21,6 +21,18 @@ pub struct CgroupManager {
 }
 
 #[cfg(target_os = "linux")]
+struct FdGuard(libc::c_int);
+
+#[cfg(target_os = "linux")]
+impl Drop for FdGuard {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            unsafe { libc::close(self.0) };
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn is_process_in_cgroup(pid: u32, expected_rel_path: &Path) -> bool {
     let proc_cgroup_path = format!("/proc/{}/cgroup", pid);
     if let Ok(content) = fs::read_to_string(&proc_cgroup_path) {
@@ -350,6 +362,12 @@ impl CgroupManager {
         #[cfg(target_os = "linux")]
         {
             let dir = self.container_cgroup_dir(container_id)?;
+            if dir.join(".simulate_procs_read_fail").exists() {
+                return Err(TavikError::Io(format!(
+                    "Simulated failure reading cgroup.procs for container '{}'",
+                    container_id
+                )));
+            }
             let procs_file = dir.join("cgroup.procs");
             if !procs_file.exists() {
                 return Ok(Vec::new());
@@ -424,7 +442,7 @@ impl CgroupManager {
 
             // 1. Try atomic cgroup.kill (available in Linux 5.14+)
             let kill_file = dir.join("cgroup.kill");
-            if kill_file.exists() {
+            if kill_file.exists() && !dir.join(".simulate_disable_cgroup_kill").exists() {
                 fs::write(&kill_file, "1").map_err(|e| {
                     TavikError::Io(format!(
                         "Failed to write to cgroup.kill at {:?}: {}",
@@ -441,8 +459,16 @@ impl CgroupManager {
                         continue;
                     }
 
-                    let pfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as libc::c_int };
-                    if pfd < 0 {
+                    if dir.join(".simulate_pidfd_open_fail").exists() {
+                        return Err(TavikError::Unsupported(
+                            "Safe cgroup process termination requires Linux SYS_pidfd_open support"
+                                .into(),
+                        ));
+                    }
+
+                    let pfd_raw =
+                        unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as libc::c_int };
+                    if pfd_raw < 0 {
                         let err = std::io::Error::last_os_error();
                         if err.raw_os_error() == Some(libc::ESRCH) {
                             continue;
@@ -458,16 +484,23 @@ impl CgroupManager {
                         }
                     }
 
+                    let pfd = FdGuard(pfd_raw);
+
                     // Re-verify while holding pidfd to avoid race condition where process exited and PID was reused
                     if !is_process_in_cgroup(pid, rel_path) {
-                        unsafe { libc::close(pfd) };
                         continue;
+                    }
+
+                    if dir.join(".simulate_pidfd_send_signal_fail").exists() {
+                        return Err(TavikError::Unsupported(
+                            "Safe cgroup process termination requires Linux SYS_pidfd_send_signal support".into(),
+                        ));
                     }
 
                     let sig_ret = unsafe {
                         libc::syscall(
                             libc::SYS_pidfd_send_signal,
-                            pfd,
+                            pfd.0,
                             libc::SIGKILL,
                             std::ptr::null::<libc::c_void>(),
                             0,
@@ -476,7 +509,6 @@ impl CgroupManager {
 
                     if sig_ret != 0 {
                         let err = std::io::Error::last_os_error();
-                        unsafe { libc::close(pfd) };
                         if err.raw_os_error() == Some(libc::ESRCH) {
                             continue;
                         } else if err.raw_os_error() == Some(libc::ENOSYS) {
@@ -490,8 +522,6 @@ impl CgroupManager {
                             )));
                         }
                     }
-
-                    unsafe { libc::close(pfd) };
                 }
             }
 

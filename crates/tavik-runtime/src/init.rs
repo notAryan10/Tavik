@@ -552,10 +552,32 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
     }
 
     let sup_pid = unsafe { libc::getpid() as u32 };
-    let sup_identity = crate::ProcessIdentity::from_pid(sup_pid);
-    if let Ok(ref ident) = sup_identity {
-        let _ = ident.save_to(&container_dir.join("supervisor.identity"));
-    }
+    let sup_identity = match crate::ProcessIdentity::from_pid(sup_pid) {
+        Ok(ident) => {
+            if let Err(e) = ident.save_to(&container_dir.join("supervisor.identity")) {
+                let msg = format!("Failed to save supervisor identity: {}", e);
+                let _ = unsafe { libc::write(trampoline_pipe[1], msg.as_ptr() as _, msg.len()) };
+                unsafe {
+                    libc::close(control_listener_fd);
+                    let _ = fs::remove_file(&control_sock_path);
+                    libc::_exit(1);
+                };
+            }
+            ident
+        }
+        Err(e) => {
+            let msg = format!(
+                "Failed to capture supervisor identity for PID {}: {}",
+                sup_pid, e
+            );
+            let _ = unsafe { libc::write(trampoline_pipe[1], msg.as_ptr() as _, msg.len()) };
+            unsafe {
+                libc::close(control_listener_fd);
+                let _ = fs::remove_file(&control_sock_path);
+                libc::_exit(1);
+            };
+        }
+    };
 
     // 6. Initialize cgroups v2 resource limits with fail-closed RAII cleanup guard
     let cgroup_guard = if let Some(linux) = &spec.linux {
@@ -797,10 +819,59 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
 
     // Acquire pidfd immediately while supervisor is guaranteed to own the child
     let child_pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child_pid, 0) as i32 };
-    let init_identity = crate::ProcessIdentity::from_pid(child_pid as u32);
-    if let Ok(ref ident) = init_identity {
-        let _ = ident.save_to(&container_dir.join("container.identity"));
-    }
+    let init_identity = match crate::ProcessIdentity::from_pid(child_pid as u32) {
+        Ok(ident) => {
+            if let Err(e) = ident.save_to(&container_dir.join("container.identity")) {
+                let msg = format!("Failed to persist container init identity: {}", e);
+                unsafe {
+                    libc::kill(child_pid, libc::SIGKILL);
+                    let mut status = 0;
+                    libc::waitpid(child_pid, &mut status, 0);
+                    if child_pidfd >= 0 {
+                        libc::close(child_pidfd);
+                    }
+                    libc::close(control_listener_fd);
+                    let _ = fs::remove_file(&control_sock_path);
+                }
+                let mut full_msg = msg;
+                if let Some(mut guard) = cgroup_guard {
+                    if let Err(cleanup_err) = guard.cleanup(&container_dir) {
+                        full_msg = format!("{}; furthermore, {}", full_msg, cleanup_err);
+                    }
+                }
+                let _ = unsafe {
+                    libc::write(trampoline_pipe[1], full_msg.as_ptr() as _, full_msg.len())
+                };
+                unsafe { libc::_exit(1) };
+            }
+            ident
+        }
+        Err(e) => {
+            let msg = format!(
+                "Failed to capture container init identity for child PID {}: {}",
+                child_pid, e
+            );
+            unsafe {
+                libc::kill(child_pid, libc::SIGKILL);
+                let mut status = 0;
+                libc::waitpid(child_pid, &mut status, 0);
+                if child_pidfd >= 0 {
+                    libc::close(child_pidfd);
+                }
+                libc::close(control_listener_fd);
+                let _ = fs::remove_file(&control_sock_path);
+            }
+            let mut full_msg = msg;
+            if let Some(mut guard) = cgroup_guard {
+                if let Err(cleanup_err) = guard.cleanup(&container_dir) {
+                    full_msg = format!("{}; furthermore, {}", full_msg, cleanup_err);
+                }
+            }
+            let _ =
+                unsafe { libc::write(trampoline_pipe[1], full_msg.as_ptr() as _, full_msg.len()) };
+            unsafe { libc::_exit(1) };
+        }
+    };
     if child_pidfd < 0 {
         let msg = format!(
             "Failed to acquire pidfd for child PID {}: {}",
@@ -814,6 +885,7 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
             libc::close(control_listener_fd);
             let _ = fs::remove_file(&control_sock_path);
         }
+        let _ = fs::remove_file(container_dir.join("container.identity"));
         let mut full_msg = msg;
         if let Some(mut guard) = cgroup_guard {
             if let Err(cleanup_err) = guard.cleanup(&container_dir) {
@@ -913,21 +985,18 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
         let mut updated_state = state;
         updated_state.status = ContainerStatus::Created;
         updated_state.pid = Some(child_pid as u32);
-        if let Ok(ref ident) = init_identity {
-            updated_state.annotations.insert(
-                "io.tavik.init.start_time".to_string(),
-                ident.start_time.to_string(),
-            );
-        }
-        if let Ok(ref ident) = sup_identity {
-            updated_state
-                .annotations
-                .insert("io.tavik.supervisor.pid".to_string(), ident.pid.to_string());
-            updated_state.annotations.insert(
-                "io.tavik.supervisor.start_time".to_string(),
-                ident.start_time.to_string(),
-            );
-        }
+        updated_state.annotations.insert(
+            "io.tavik.init.start_time".to_string(),
+            init_identity.start_time.to_string(),
+        );
+        updated_state.annotations.insert(
+            "io.tavik.supervisor.pid".to_string(),
+            sup_identity.pid.to_string(),
+        );
+        updated_state.annotations.insert(
+            "io.tavik.supervisor.start_time".to_string(),
+            sup_identity.start_time.to_string(),
+        );
         if owns_cgroup {
             updated_state
                 .annotations

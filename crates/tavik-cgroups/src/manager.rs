@@ -20,6 +20,24 @@ pub struct CgroupManager {
     parent_path: PathBuf,
 }
 
+#[cfg(target_os = "linux")]
+fn is_process_in_cgroup(pid: u32, expected_rel_path: &Path) -> bool {
+    let proc_cgroup_path = format!("/proc/{}/cgroup", pid);
+    if let Ok(content) = fs::read_to_string(&proc_cgroup_path) {
+        let expected_str = expected_rel_path.to_string_lossy();
+        let expected_trimmed = expected_str.trim_start_matches('/');
+        for line in content.lines() {
+            if let Some(cgroup_path) = line.strip_prefix("0::") {
+                let trimmed = cgroup_path.trim_start_matches('/');
+                if trimmed == expected_trimmed {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 impl CgroupManager {
     /// Constructs a CgroupManager pointing to the default `/sys/fs/cgroup/tavik` parent hierarchy.
     pub fn new() -> Result<Self> {
@@ -414,19 +432,66 @@ impl CgroupManager {
                     ))
                 })?;
             } else {
-                // Fallback: enumerate cgroup.procs and send SIGKILL to each
+                // Fallback: enumerate cgroup.procs and send SIGKILL to each using pidfd
+                let rel_path = dir.strip_prefix(&self.cgroup_root).unwrap_or(&dir);
                 let pids = self.get_processes(container_id)?;
                 for pid in pids {
-                    let res = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-                    if res != 0 {
+                    // Pre-verify that the process belongs to target cgroup before acquiring pidfd
+                    if !is_process_in_cgroup(pid, rel_path) {
+                        continue;
+                    }
+
+                    let pfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as libc::c_int };
+                    if pfd < 0 {
                         let err = std::io::Error::last_os_error();
-                        if err.raw_os_error() != Some(libc::ESRCH) {
+                        if err.raw_os_error() == Some(libc::ESRCH) {
+                            continue;
+                        } else if err.raw_os_error() == Some(libc::ENOSYS) {
+                            return Err(TavikError::Unsupported(
+                                "Safe cgroup process termination requires Linux SYS_pidfd_open support".into(),
+                            ));
+                        } else {
                             return Err(TavikError::Io(format!(
-                                "Failed to send SIGKILL to process {} in cgroup '{}': {}",
+                                "Failed to open pidfd for process {} in cgroup '{}': {}",
                                 pid, container_id, err
                             )));
                         }
                     }
+
+                    // Re-verify while holding pidfd to avoid race condition where process exited and PID was reused
+                    if !is_process_in_cgroup(pid, rel_path) {
+                        unsafe { libc::close(pfd) };
+                        continue;
+                    }
+
+                    let sig_ret = unsafe {
+                        libc::syscall(
+                            libc::SYS_pidfd_send_signal,
+                            pfd,
+                            libc::SIGKILL,
+                            std::ptr::null::<libc::c_void>(),
+                            0,
+                        )
+                    };
+
+                    if sig_ret != 0 {
+                        let err = std::io::Error::last_os_error();
+                        unsafe { libc::close(pfd) };
+                        if err.raw_os_error() == Some(libc::ESRCH) {
+                            continue;
+                        } else if err.raw_os_error() == Some(libc::ENOSYS) {
+                            return Err(TavikError::Unsupported(
+                                "Safe cgroup process termination requires Linux SYS_pidfd_send_signal support".into(),
+                            ));
+                        } else {
+                            return Err(TavikError::Io(format!(
+                                "Failed to send SIGKILL to pidfd for process {} in cgroup '{}': {}",
+                                pid, container_id, err
+                            )));
+                        }
+                    }
+
+                    unsafe { libc::close(pfd) };
                 }
             }
 

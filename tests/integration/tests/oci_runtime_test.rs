@@ -2760,7 +2760,7 @@ fn test_failed_cancellation_preserves_metadata() {
         let cont_dir = executor.container_dir(id);
         fs::create_dir_all(&cont_dir).unwrap();
 
-        let state = tavik_runtime::ContainerState {
+        let mut state = tavik_runtime::ContainerState {
             oci_version: "1.2.0".to_string(),
             id: id.to_string(),
             status: ContainerStatus::Created,
@@ -2973,7 +2973,17 @@ fn test_stale_control_socket_recovery_with_force_delete() {
     let cont_dir = executor.container_dir(id);
     fs::create_dir_all(&cont_dir).unwrap();
 
-    let state = tavik_runtime::ContainerState {
+    let init_ident = tavik_runtime::ProcessIdentity::new(999999, 11111);
+    init_ident
+        .save_to(&cont_dir.join("container.identity"))
+        .unwrap();
+
+    let sup_ident = tavik_runtime::ProcessIdentity::new(888888, 22222);
+    sup_ident
+        .save_to(&cont_dir.join("supervisor.identity"))
+        .unwrap();
+
+    let mut state = tavik_runtime::ContainerState {
         oci_version: "1.2.0".to_string(),
         id: id.to_string(),
         status: ContainerStatus::Running,
@@ -2982,6 +2992,18 @@ fn test_stale_control_socket_recovery_with_force_delete() {
         annotations: std::collections::HashMap::new(),
         created_at: chrono::Utc::now(),
     };
+    state.annotations.insert(
+        "io.tavik.init.start_time".to_string(),
+        init_ident.start_time.to_string(),
+    );
+    state.annotations.insert(
+        "io.tavik.supervisor.pid".to_string(),
+        sup_ident.pid.to_string(),
+    );
+    state.annotations.insert(
+        "io.tavik.supervisor.start_time".to_string(),
+        sup_ident.start_time.to_string(),
+    );
     executor.save_state(&state).unwrap();
 
     // Create a stale Unix socket file
@@ -3024,7 +3046,7 @@ fn test_live_control_socket_is_never_unlinked_as_stale() {
         .unwrap();
     let dummy_pid = dummy_proc.id();
 
-    let state = tavik_runtime::ContainerState {
+    let mut state = tavik_runtime::ContainerState {
         oci_version: "1.2.0".to_string(),
         id: id.to_string(),
         status: ContainerStatus::Running,
@@ -3381,7 +3403,7 @@ fn test_finalization_fails_when_persisting_cleanup_pending_fails() {
     let cont_dir = state_dir.join(id);
     fs::create_dir_all(&cont_dir).unwrap();
 
-    let state = tavik_runtime::ContainerState {
+    let mut state = tavik_runtime::ContainerState {
         oci_version: "1.2.0".to_string(),
         id: id.to_string(),
         status: ContainerStatus::Running,
@@ -3472,4 +3494,365 @@ fn test_cgroup_destruction_propagates_kill_and_process_errors() {
         );
         assert!(cont_dir.exists(), "Container directory must remain");
     }
+}
+
+#[test]
+fn test_missing_socket_with_live_supervisor_rejects_unforced_and_terminates_on_force() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let executor = ContainerExecutor::new(state_dir.clone()).unwrap();
+    let id = "test-missing-sock-live-sup";
+    let cont_dir = executor.container_dir(id);
+    fs::create_dir_all(&cont_dir).unwrap();
+
+    let mut dummy_sup = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let sup_pid = dummy_sup.id();
+    let sup_ident = tavik_runtime::ProcessIdentity::from_pid(sup_pid).unwrap();
+    sup_ident
+        .save_to(&cont_dir.join("supervisor.identity"))
+        .unwrap();
+
+    let mut dummy_init = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let init_pid = dummy_init.id();
+    let init_ident = tavik_runtime::ProcessIdentity::from_pid(init_pid).unwrap();
+    init_ident
+        .save_to(&cont_dir.join("container.identity"))
+        .unwrap();
+
+    let mut state = tavik_runtime::ContainerState {
+        oci_version: "1.2.0".to_string(),
+        id: id.to_string(),
+        status: ContainerStatus::Running,
+        pid: Some(init_pid),
+        bundle: temp.path().join("bundle"),
+        annotations: std::collections::HashMap::new(),
+        created_at: chrono::Utc::now(),
+    };
+    state.annotations.insert(
+        "io.tavik.init.start_time".to_string(),
+        init_ident.start_time.to_string(),
+    );
+    state.annotations.insert(
+        "io.tavik.supervisor.pid".to_string(),
+        sup_ident.pid.to_string(),
+    );
+    state.annotations.insert(
+        "io.tavik.supervisor.start_time".to_string(),
+        sup_ident.start_time.to_string(),
+    );
+    executor.save_state(&state).unwrap();
+
+    // control.sock does NOT exist
+    assert!(!cont_dir.join("control.sock").exists());
+
+    // Unforced delete must fail
+    let unforced_res = executor.delete(id, false);
+    assert!(
+        unforced_res.is_err(),
+        "Unforced delete of running container without control socket must fail"
+    );
+
+    // Force delete must safely terminate live supervisor and live init, then clean up
+    let force_res = executor.delete(id, true);
+    assert!(
+        force_res.is_ok(),
+        "Force delete with live supervisor must succeed: {:?}",
+        force_res.err()
+    );
+    assert!(
+        !cont_dir.exists(),
+        "Container directory must be removed on successful force delete"
+    );
+
+    // Verify processes terminated
+    let _ = dummy_sup.kill();
+    let _ = dummy_sup.wait();
+    let _ = dummy_init.kill();
+    let _ = dummy_init.wait();
+}
+
+#[test]
+fn test_missing_socket_with_dead_supervisor_and_live_init() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let executor = ContainerExecutor::new(state_dir.clone()).unwrap();
+    let id = "test-missing-sock-dead-sup-live-init";
+    let cont_dir = executor.container_dir(id);
+    fs::create_dir_all(&cont_dir).unwrap();
+
+    let sup_ident = tavik_runtime::ProcessIdentity::new(999999, 12345);
+    sup_ident
+        .save_to(&cont_dir.join("supervisor.identity"))
+        .unwrap();
+
+    let mut dummy_init = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let init_pid = dummy_init.id();
+    let init_ident = tavik_runtime::ProcessIdentity::from_pid(init_pid).unwrap();
+    init_ident
+        .save_to(&cont_dir.join("container.identity"))
+        .unwrap();
+
+    let mut state = tavik_runtime::ContainerState {
+        oci_version: "1.2.0".to_string(),
+        id: id.to_string(),
+        status: ContainerStatus::Running,
+        pid: Some(init_pid),
+        bundle: temp.path().join("bundle"),
+        annotations: std::collections::HashMap::new(),
+        created_at: chrono::Utc::now(),
+    };
+    state.annotations.insert(
+        "io.tavik.init.start_time".to_string(),
+        init_ident.start_time.to_string(),
+    );
+    state.annotations.insert(
+        "io.tavik.supervisor.pid".to_string(),
+        sup_ident.pid.to_string(),
+    );
+    state.annotations.insert(
+        "io.tavik.supervisor.start_time".to_string(),
+        sup_ident.start_time.to_string(),
+    );
+    executor.save_state(&state).unwrap();
+
+    // control.sock does NOT exist
+    assert!(!cont_dir.join("control.sock").exists());
+
+    // Unforced delete must fail because init process is still running
+    let unforced_res = executor.delete(id, false);
+    assert!(
+        unforced_res.is_err(),
+        "Unforced delete must fail when init process is still alive"
+    );
+
+    // Force delete safely terminates verified init process and succeeds
+    let force_res = executor.delete(id, true);
+    assert!(
+        force_res.is_ok(),
+        "Force delete must succeed: {:?}",
+        force_res.err()
+    );
+    assert!(!cont_dir.exists(), "Container directory must be removed");
+
+    let _ = dummy_init.kill();
+    let _ = dummy_init.wait();
+}
+
+#[test]
+fn test_missing_socket_with_unverifiable_supervisor_identity_fails_closed() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let executor = ContainerExecutor::new(state_dir.clone()).unwrap();
+    let id = "test-unverifiable-sup-ident";
+    let cont_dir = executor.container_dir(id);
+    fs::create_dir_all(&cont_dir).unwrap();
+
+    // Corrupted supervisor identity file
+    fs::write(cont_dir.join("supervisor.identity"), b"invalid-json").unwrap();
+
+    let init_ident = tavik_runtime::ProcessIdentity::new(999999, 11111);
+    init_ident
+        .save_to(&cont_dir.join("container.identity"))
+        .unwrap();
+
+    let mut state = tavik_runtime::ContainerState {
+        oci_version: "1.2.0".to_string(),
+        id: id.to_string(),
+        status: ContainerStatus::Running,
+        pid: Some(999999),
+        bundle: temp.path().join("bundle"),
+        annotations: std::collections::HashMap::new(),
+        created_at: chrono::Utc::now(),
+    };
+    state.annotations.insert(
+        "io.tavik.init.start_time".to_string(),
+        init_ident.start_time.to_string(),
+    );
+    state
+        .annotations
+        .insert("io.tavik.supervisor.pid".to_string(), "888888".to_string());
+    state.annotations.insert(
+        "io.tavik.supervisor.start_time".to_string(),
+        "22222".to_string(),
+    );
+    executor.save_state(&state).unwrap();
+
+    // Force delete MUST FAIL CLOSED due to unverifiable supervisor identity
+    let force_res = executor.delete(id, true);
+    assert!(
+        force_res.is_err(),
+        "Force delete must fail closed when supervisor identity is unreadable/corrupted"
+    );
+    assert!(
+        cont_dir.exists(),
+        "Container directory must be preserved on identity verification failure"
+    );
+}
+
+#[test]
+fn test_missing_socket_with_unverifiable_init_identity_fails_closed() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let executor = ContainerExecutor::new(state_dir.clone()).unwrap();
+    let id = "test-unverifiable-init-ident";
+    let cont_dir = executor.container_dir(id);
+    fs::create_dir_all(&cont_dir).unwrap();
+
+    let sup_ident = tavik_runtime::ProcessIdentity::new(999999, 22222);
+    sup_ident
+        .save_to(&cont_dir.join("supervisor.identity"))
+        .unwrap();
+
+    // Corrupted container identity file
+    fs::write(cont_dir.join("container.identity"), b"not-a-valid-json").unwrap();
+
+    let mut state = tavik_runtime::ContainerState {
+        oci_version: "1.2.0".to_string(),
+        id: id.to_string(),
+        status: ContainerStatus::Running,
+        pid: Some(999999),
+        bundle: temp.path().join("bundle"),
+        annotations: std::collections::HashMap::new(),
+        created_at: chrono::Utc::now(),
+    };
+    state
+        .annotations
+        .insert("io.tavik.init.start_time".to_string(), "11111".to_string());
+    state.annotations.insert(
+        "io.tavik.supervisor.pid".to_string(),
+        sup_ident.pid.to_string(),
+    );
+    state.annotations.insert(
+        "io.tavik.supervisor.start_time".to_string(),
+        sup_ident.start_time.to_string(),
+    );
+    executor.save_state(&state).unwrap();
+
+    // Force delete MUST FAIL CLOSED due to unverifiable container init identity
+    let force_res = executor.delete(id, true);
+    assert!(
+        force_res.is_err(),
+        "Force delete must fail closed when init identity is unreadable/corrupted"
+    );
+    assert!(
+        cont_dir.exists(),
+        "Container directory must be preserved on identity verification failure"
+    );
+}
+
+#[test]
+fn test_contradictory_identities_fail_closed() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let executor = ContainerExecutor::new(state_dir.clone()).unwrap();
+    let id = "test-contradictory-ident";
+    let cont_dir = executor.container_dir(id);
+    fs::create_dir_all(&cont_dir).unwrap();
+
+    let sup_ident = tavik_runtime::ProcessIdentity::new(999999, 22222);
+    sup_ident
+        .save_to(&cont_dir.join("supervisor.identity"))
+        .unwrap();
+
+    let init_ident = tavik_runtime::ProcessIdentity::new(888888, 11111);
+    init_ident
+        .save_to(&cont_dir.join("container.identity"))
+        .unwrap();
+
+    let mut state = tavik_runtime::ContainerState {
+        oci_version: "1.2.0".to_string(),
+        id: id.to_string(),
+        status: ContainerStatus::Running,
+        pid: Some(888888),
+        bundle: temp.path().join("bundle"),
+        annotations: std::collections::HashMap::new(),
+        created_at: chrono::Utc::now(),
+    };
+    // Contradictory init start_time!
+    state
+        .annotations
+        .insert("io.tavik.init.start_time".to_string(), "999999".to_string());
+    state.annotations.insert(
+        "io.tavik.supervisor.pid".to_string(),
+        sup_ident.pid.to_string(),
+    );
+    state.annotations.insert(
+        "io.tavik.supervisor.start_time".to_string(),
+        sup_ident.start_time.to_string(),
+    );
+    executor.save_state(&state).unwrap();
+
+    let force_res = executor.delete(id, true);
+    assert!(
+        force_res.is_err(),
+        "Force delete must fail closed when identity file and annotations contradict"
+    );
+    let err_msg = format!("{}", force_res.unwrap_err());
+    assert!(
+        err_msg.contains("Contradictory init process identity"),
+        "Error message must specify contradiction: {}",
+        err_msg
+    );
+    assert!(cont_dir.exists(), "Container directory must be preserved");
+}
+
+#[test]
+fn test_active_container_missing_init_identity_fails_closed() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let executor = ContainerExecutor::new(state_dir.clone()).unwrap();
+    let id = "test-active-missing-ident";
+    let cont_dir = executor.container_dir(id);
+    fs::create_dir_all(&cont_dir).unwrap();
+
+    let state = tavik_runtime::ContainerState {
+        oci_version: "1.2.0".to_string(),
+        id: id.to_string(),
+        status: ContainerStatus::Created,
+        pid: Some(12345),
+        bundle: temp.path().join("bundle"),
+        annotations: std::collections::HashMap::new(),
+        created_at: chrono::Utc::now(),
+    };
+    executor.save_state(&state).unwrap();
+
+    // No identity files written, no annotations written
+    let del_res = executor.delete(id, true);
+    assert!(
+        del_res.is_err(),
+        "Delete must fail closed when active container has no identity metadata"
+    );
+    assert!(cont_dir.exists(), "Container directory must be preserved");
+}
+
+#[test]
+fn test_process_identity_kill_safe_with_real_process() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let child_pid = child.id();
+
+    let ident = tavik_runtime::ProcessIdentity::from_pid(child_pid).unwrap();
+    assert!(ident.is_alive().unwrap());
+
+    // Safely terminate via kill_safe
+    ident.kill_safe().unwrap();
+
+    assert!(!ident.is_alive().unwrap());
+
+    // Subsequent kill_safe is an idempotent no-op
+    assert!(ident.kill_safe().is_ok());
+
+    let _ = child.kill();
+    let _ = child.wait();
 }

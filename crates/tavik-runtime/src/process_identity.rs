@@ -137,7 +137,7 @@ impl ProcessIdentity {
     }
 
     /// Safely terminates this process with SIGKILL only after verifying identity.
-    /// Prefers pidfd on Linux where available.
+    /// Requires pidfd on Linux for race-free termination; fails closed with Unsupported if unavailable.
     /// Waits up to 2 seconds and confirms termination.
     pub fn kill_safe(&self) -> Result<()> {
         if !self.is_alive()? {
@@ -147,32 +147,112 @@ impl ProcessIdentity {
         #[cfg(target_os = "linux")]
         {
             let pfd = unsafe { libc::syscall(libc::SYS_pidfd_open, self.pid, 0) as libc::c_int };
-            if pfd >= 0 {
-                // Double-check identity before sending signal
-                if self.is_alive()? {
-                    unsafe {
-                        libc::syscall(
-                            libc::SYS_pidfd_send_signal,
-                            pfd,
-                            libc::SIGKILL,
-                            std::ptr::null::<()>(),
-                            0,
-                        );
+            if pfd < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::ESRCH) {
+                    if !self.is_alive()? {
+                        return Ok(());
                     }
-                }
-                unsafe { libc::close(pfd) };
-            } else if self.is_alive()? {
-                let ret = unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGKILL) };
-                if ret != 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.raw_os_error() != Some(libc::ESRCH) {
-                        return Err(TavikError::Io(format!(
-                            "Failed to send SIGKILL to PID {}: {}",
-                            self.pid, err
-                        )));
-                    }
+                    return Err(TavikError::Execution(format!(
+                        "pidfd_open returned ESRCH but process {} identity check failed",
+                        self.pid
+                    )));
+                } else if err.raw_os_error() == Some(libc::ENOSYS) {
+                    return Err(TavikError::Unsupported(
+                        "Safe race-free forced termination requires Linux SYS_pidfd_open support"
+                            .into(),
+                    ));
+                } else {
+                    return Err(TavikError::Io(format!(
+                        "Failed to open pidfd for PID {}: {}",
+                        self.pid, err
+                    )));
                 }
             }
+
+            // Verify identity while holding pfd
+            if !self.is_alive()? {
+                unsafe { libc::close(pfd) };
+                return Ok(());
+            }
+
+            let sig_ret = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    pfd,
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::c_void>(),
+                    0,
+                )
+            };
+
+            if sig_ret != 0 {
+                let err = std::io::Error::last_os_error();
+                unsafe { libc::close(pfd) };
+                if err.raw_os_error() == Some(libc::ESRCH) {
+                    if !self.is_alive()? {
+                        return Ok(());
+                    }
+                    return Err(TavikError::Execution(format!(
+                        "pidfd_send_signal returned ESRCH but process {} identity check failed",
+                        self.pid
+                    )));
+                } else if err.raw_os_error() == Some(libc::ENOSYS) {
+                    return Err(TavikError::Unsupported(
+                        "Safe race-free forced termination requires Linux SYS_pidfd_send_signal support".into(),
+                    ));
+                } else {
+                    return Err(TavikError::Io(format!(
+                        "pidfd_send_signal failed for PID {}: {}",
+                        self.pid, err
+                    )));
+                }
+            }
+
+            // Wait up to 2000ms for confirmed termination using poll on pidfd
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+            let mut terminated = false;
+            while std::time::Instant::now() < deadline {
+                let rem_ms = (deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_millis() as i32)
+                    .max(1);
+                let mut pollfd = libc::pollfd {
+                    fd: pfd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let poll_ret = unsafe { libc::poll(&mut pollfd, 1, rem_ms) };
+                if poll_ret < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    unsafe { libc::close(pfd) };
+                    return Err(TavikError::Io(format!("Failed to poll pidfd: {}", err)));
+                }
+                if poll_ret > 0
+                    && (pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0)
+                {
+                    terminated = true;
+                    break;
+                }
+                if !self.is_alive()? {
+                    terminated = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            unsafe { libc::close(pfd) };
+
+            if !terminated && self.is_alive()? {
+                return Err(TavikError::Execution(format!(
+                    "Process {} failed to terminate within timeout after pidfd SIGKILL",
+                    self.pid
+                )));
+            }
+
+            Ok(())
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -187,23 +267,24 @@ impl ProcessIdentity {
                     )));
                 }
             }
-        }
 
-        // Wait up to 2000ms for confirmed termination
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
-        while std::time::Instant::now() < deadline {
-            let mut status = 0;
-            let _ = unsafe { libc::waitpid(self.pid as libc::pid_t, &mut status, libc::WNOHANG) };
-            if !self.is_alive()? {
-                return Ok(());
+            // Wait up to 2000ms for confirmed termination
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+            while std::time::Instant::now() < deadline {
+                let mut status = 0;
+                let _ =
+                    unsafe { libc::waitpid(self.pid as libc::pid_t, &mut status, libc::WNOHANG) };
+                if !self.is_alive()? {
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
 
-        Err(TavikError::Execution(format!(
-            "Process {} failed to terminate within timeout after SIGKILL",
-            self.pid
-        )))
+            Err(TavikError::Execution(format!(
+                "Process {} failed to terminate within timeout after SIGKILL",
+                self.pid
+            )))
+        }
     }
 
     pub fn save_to(&self, path: &Path) -> Result<()> {

@@ -1885,35 +1885,54 @@ fn test_concurrent_start_requests_atomic_rejection() {
 fn test_close_range_fallback_closes_high_descriptors() {
     #[cfg(target_os = "linux")]
     {
-        // Open deliberately high file descriptors
-        let test_fds = [42, 100, 250];
-        for &fd in &test_fds {
-            let res = unsafe { libc::dup2(1, fd) };
-            assert_eq!(res, fd, "dup2 to high fd {} failed", fd);
-            assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0);
+        // Run descriptor sanitization in an isolated child process to avoid closing
+        // file descriptors in concurrent test runner threads.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            // Open deliberately high file descriptors
+            let test_fds = [42, 100, 250];
+            for &fd in &test_fds {
+                let res = unsafe { libc::dup2(1, fd) };
+                if res != fd {
+                    unsafe { libc::_exit(1) };
+                }
+                if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+                    unsafe { libc::_exit(2) };
+                }
+            }
+
+            // Call descriptor sanitization for fds >= 5
+            tavik_runtime::init::close_inherited_descriptors_above(5);
+
+            // Verify all test fds are now closed
+            for &fd in &test_fds {
+                let fcntl_res = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+                if fcntl_res != -1
+                    || std::io::Error::last_os_error().raw_os_error() != Some(libc::EBADF)
+                {
+                    unsafe { libc::_exit(3) };
+                }
+            }
+
+            // Verify standard descriptors 0, 1, 2 remain valid
+            for fd in 0..=2 {
+                if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+                    unsafe { libc::_exit(4) };
+                }
+            }
+
+            unsafe { libc::_exit(0) };
         }
 
-        // Call descriptor sanitization for fds >= 5
-        tavik_runtime::init::close_inherited_descriptors_above(5);
-
-        // Verify all test fds are now closed
-        for &fd in &test_fds {
-            let fcntl_res = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-            assert_eq!(fcntl_res, -1, "High fd {} should have been closed", fd);
-            assert_eq!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(libc::EBADF)
-            );
-        }
-
-        // Verify standard descriptors 0, 1, 2 remain valid
-        for fd in 0..=2 {
-            assert!(
-                unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0,
-                "Standard fd {} must remain open",
-                fd
-            );
-        }
+        let mut status = 0;
+        let wres = unsafe { libc::waitpid(child, &mut status, 0) };
+        assert_eq!(wres, child);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "Child failed with exit status: {}",
+            libc::WEXITSTATUS(status)
+        );
     }
 }
 

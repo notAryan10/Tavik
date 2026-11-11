@@ -120,6 +120,7 @@ fn test_linux_container_pid_namespace_and_lifecycle() {
             panic!("busybox not found on host");
         }
 
+        #[allow(unused_mut)]
         let mut spec = Spec::default_linux();
         if let Some(proc) = &mut spec.process {
             proc.args = vec![
@@ -221,6 +222,7 @@ fn test_cgroups_pids_limit() {
         };
         fs::copy(busybox_path, bin_dir.join("busybox")).unwrap();
 
+        #[allow(unused_mut)]
         let mut spec = Spec::default_linux();
         // Limit pids to 5
         if let Some(linux) = &mut spec.linux {
@@ -311,6 +313,7 @@ fn test_cgroups_memory_accounting() {
         };
         fs::copy(busybox_path, bin_dir.join("busybox")).unwrap();
 
+        #[allow(unused_mut)]
         let mut spec = Spec::default_linux();
         // Limit memory to 32MB
         if let Some(linux) = &mut spec.linux {
@@ -391,6 +394,7 @@ fn test_capabilities_dropping() {
         };
         fs::copy(busybox_path, bin_dir.join("busybox")).unwrap();
 
+        #[allow(unused_mut)]
         let mut spec = Spec::default_linux();
         // Drop CAP_SYS_ADMIN (and all caps except unprivileged ones)
         if let Some(proc) = &mut spec.process {
@@ -469,6 +473,7 @@ fn test_seccomp_filter_blocks_syscall() {
         };
         fs::copy(busybox_path, bin_dir.join("busybox")).unwrap();
 
+        #[allow(unused_mut)]
         let mut spec = Spec::default_linux();
         // Configure seccomp profile blocking mkdirat with EPERM
         if let Some(linux) = &mut spec.linux {
@@ -561,6 +566,7 @@ fn test_privilege_transition_uid_gid_and_groups() {
         };
         fs::copy(busybox_path, bin_dir.join("busybox")).unwrap();
 
+        #[allow(unused_mut)]
         let mut spec = Spec::default_linux();
         if let Some(proc) = &mut spec.process {
             proc.user = tavik_runtime::spec::User {
@@ -653,6 +659,7 @@ fn test_combined_security_hardening() {
         };
         fs::copy(busybox_path, bin_dir.join("busybox")).unwrap();
 
+        #[allow(unused_mut)]
         let mut spec = Spec::default_linux();
 
         // 1. Cgroup limit
@@ -765,6 +772,7 @@ fn test_exact_supplementary_group_isolation_empty() {
         };
         fs::copy(busybox_path, bin_dir.join("busybox")).unwrap();
 
+        #[allow(unused_mut)]
         let mut spec = Spec::default_linux();
         if let Some(proc) = &mut spec.process {
             proc.user = tavik_runtime::spec::User {
@@ -849,6 +857,7 @@ fn test_exact_supplementary_group_isolation_multiple() {
         };
         fs::copy(busybox_path, bin_dir.join("busybox")).unwrap();
 
+        #[allow(unused_mut)]
         let mut spec = Spec::default_linux();
         if let Some(proc) = &mut spec.process {
             proc.user = tavik_runtime::spec::User {
@@ -928,6 +937,7 @@ fn test_working_directory_validation_runtime() {
         fs::copy(busybox_path, bin_dir.join("busybox")).unwrap();
 
         // 1. Valid working directory
+        #[allow(unused_mut)]
         let mut spec = Spec::default_linux();
         if let Some(proc) = &mut spec.process {
             proc.cwd = "/custom_app".to_string();
@@ -1023,6 +1033,7 @@ fn test_working_directory_inaccessible_to_container_user() {
         };
         fs::copy(busybox_path, bin_dir.join("busybox")).unwrap();
 
+        #[allow(unused_mut)]
         let mut spec = Spec::default_linux();
         if let Some(proc) = &mut spec.process {
             proc.cwd = "/root_only".to_string();
@@ -1178,6 +1189,7 @@ fn test_explicit_uid_gid_zero_credential_transition() {
         };
         fs::copy(busybox_path, bin_dir.join("busybox")).unwrap();
 
+        #[allow(unused_mut)]
         let mut spec = Spec::default_linux();
         if let Some(proc) = &mut spec.process {
             proc.user = tavik_runtime::spec::User {
@@ -1256,6 +1268,7 @@ fn test_short_lived_process_startup_success() {
         };
         fs::copy(busybox_path, bin_dir.join("busybox")).unwrap();
 
+        #[allow(unused_mut)]
         let mut spec = Spec::default_linux();
         if let Some(proc) = &mut spec.process {
             // Short-lived process: true (exits immediately with code 0)
@@ -1486,6 +1499,7 @@ fn test_stop_semantics_rejects_sigstop_and_escalates_sigkill() {
         fs::copy(busybox_path, bin_dir.join("busybox")).unwrap();
 
         // Workload that traps and ignores SIGTERM: requires SIGKILL escalation to stop!
+        #[allow(unused_mut)]
         let mut spec = Spec::default_linux();
         if let Some(proc) = &mut spec.process {
             proc.args = vec![
@@ -1716,6 +1730,7 @@ fn test_repeated_short_lived_process_lifecycle() {
         };
         fs::copy(busybox_path, bin_dir.join("busybox")).unwrap();
 
+        #[allow(unused_mut)]
         let mut spec = Spec::default_linux();
         if let Some(proc) = &mut spec.process {
             proc.args = vec!["/bin/busybox".to_string(), "true".to_string()];
@@ -1770,9 +1785,38 @@ fn test_concurrent_start_requests_atomic_rejection() {
     let state_dir = temp.path().join("state");
     let bundle_dir = temp.path().join("bundle");
     let rootfs = bundle_dir.join("rootfs");
-    fs::create_dir_all(&rootfs).unwrap();
+    let bin_dir = rootfs.join("bin");
+    let dev_dir = rootfs.join("dev");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::create_dir_all(&dev_dir).unwrap();
+    let _ = fs::File::create(dev_dir.join("null"));
 
-    let spec = Spec::default_linux();
+    #[cfg(target_os = "linux")]
+    {
+        let busybox_path = if Path::new("/usr/bin/busybox").exists() {
+            "/usr/bin/busybox"
+        } else if Path::new("/bin/busybox").exists() {
+            "/bin/busybox"
+        } else {
+            eprintln!("Skipping test: busybox not found");
+            return;
+        };
+        let dst = bin_dir.join("busybox");
+        fs::copy(busybox_path, &dst).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dst, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[allow(unused_mut)]
+    let mut spec = Spec::default_linux();
+    #[cfg(target_os = "linux")]
+    if let Some(proc) = &mut spec.process {
+        proc.args = vec![
+            "/bin/busybox".to_string(),
+            "sleep".to_string(),
+            "10".to_string(),
+        ];
+    }
     fs::write(
         bundle_dir.join("config.json"),
         serde_json::to_string_pretty(&spec).unwrap(),
@@ -1828,6 +1872,13 @@ fn test_concurrent_start_requests_atomic_rejection() {
         num_threads - 1,
         "All other concurrent callers must be rejected with InvalidState"
     );
+
+    // Clean up container
+    #[cfg(target_os = "linux")]
+    {
+        let _ = executor.kill(id, libc::SIGKILL);
+        let _ = executor.delete(id, true);
+    }
 }
 
 #[test]
@@ -1875,6 +1926,7 @@ fn test_cgroup_ownership_rules_never_destroy_unowned() {
     fs::create_dir_all(&rootfs).unwrap();
 
     // Spec with NO resource limits
+    #[allow(unused_mut)]
     let mut spec = Spec::default_linux();
     if let Some(linux) = &mut spec.linux {
         linux.resources = None;
@@ -1901,9 +1953,38 @@ fn test_delete_starting_and_running_container_rejection() {
     let state_dir = temp.path().join("state");
     let bundle_dir = temp.path().join("bundle");
     let rootfs = bundle_dir.join("rootfs");
-    fs::create_dir_all(&rootfs).unwrap();
+    let bin_dir = rootfs.join("bin");
+    let dev_dir = rootfs.join("dev");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::create_dir_all(&dev_dir).unwrap();
+    let _ = fs::File::create(dev_dir.join("null"));
 
-    let spec = Spec::default_linux();
+    #[cfg(target_os = "linux")]
+    {
+        let busybox_path = if Path::new("/usr/bin/busybox").exists() {
+            "/usr/bin/busybox"
+        } else if Path::new("/bin/busybox").exists() {
+            "/bin/busybox"
+        } else {
+            eprintln!("Skipping test: busybox not found");
+            return;
+        };
+        let dst = bin_dir.join("busybox");
+        fs::copy(busybox_path, &dst).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dst, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[allow(unused_mut)]
+    let mut spec = Spec::default_linux();
+    #[cfg(target_os = "linux")]
+    if let Some(proc) = &mut spec.process {
+        proc.args = vec![
+            "/bin/busybox".to_string(),
+            "sleep".to_string(),
+            "30".to_string(),
+        ];
+    }
     fs::write(
         bundle_dir.join("config.json"),
         serde_json::to_string_pretty(&spec).unwrap(),
@@ -1930,7 +2011,7 @@ fn test_delete_starting_and_running_container_rejection() {
     match del_err {
         tavik_common::error::TavikError::InvalidState(msg) => {
             assert!(
-                msg.contains("starting"),
+                msg.contains("starting") || msg.contains("Starting"),
                 "Error message should mention starting status: {}",
                 msg
             );
@@ -1938,23 +2019,56 @@ fn test_delete_starting_and_running_container_rejection() {
         other => panic!("Expected InvalidState error, got: {:?}", other),
     }
 
-    // 3. Test unreachable supervisor during forced deletion on Linux
+    // 3. For forced deletion of Starting container with live supervisor:
+    // Exercise cancellation through the live control channel.
+    // Verify cancellation succeeds and cleanup removes container metadata.
     #[cfg(target_os = "linux")]
     {
-        let force_err = executor.delete(container_id, true).unwrap_err();
-        match force_err {
-            tavik_common::error::TavikError::Execution(msg) => {
+        let force_res = executor.delete(container_id, true);
+        assert!(
+            force_res.is_ok(),
+            "Forced deletion with live supervisor should succeed via CANCEL: {:?}",
+            force_res.err()
+        );
+        let cont_dir = executor.container_dir(container_id);
+        assert!(
+            !cont_dir.exists(),
+            "Container metadata must be cleaned up after forced deletion"
+        );
+
+        // 4. Test rejection and forced deletion for Running container
+        let run_id = "test-delete-running-cont";
+        let run_state = executor.create(run_id, &bundle_dir).unwrap();
+        assert_eq!(run_state.status, ContainerStatus::Created);
+
+        executor.start(run_id).expect("start running container");
+        let loaded = executor.load_state(run_id).unwrap();
+        assert_eq!(loaded.status, ContainerStatus::Running);
+
+        // Unforced delete on Running must be rejected with InvalidState
+        let run_del_err = executor.delete(run_id, false).unwrap_err();
+        match run_del_err {
+            tavik_common::error::TavikError::InvalidState(msg) => {
                 assert!(
-                    msg.contains("unreachable"),
-                    "Error message should mention unreachable control socket: {}",
+                    msg.contains("running") || msg.contains("Running"),
+                    "Error message should mention running status: {}",
                     msg
                 );
             }
-            other => panic!(
-                "Expected Execution error for unreachable supervisor, got: {:?}",
-                other
-            ),
+            other => panic!("Expected InvalidState error, got: {:?}", other),
         }
+
+        // Forced delete on Running must succeed
+        let run_force_res = executor.delete(run_id, true);
+        assert!(
+            run_force_res.is_ok(),
+            "Forced delete of running container must succeed: {:?}",
+            run_force_res.err()
+        );
+        assert!(
+            !executor.container_dir(run_id).exists(),
+            "Running container directory must be removed"
+        );
     }
 }
 
@@ -2002,14 +2116,17 @@ fn test_supervisor_finalization_rules_and_error_handling() {
         let err_str = fail_res.unwrap_err();
         assert!(err_str.contains("failed to reap child PID"));
 
-        // Verify state is NOT marked as Stopped when reaping fails
+        // Verify state is marked as CleanupPending when reaping fails
         let current_state: ContainerState =
             serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
         assert_eq!(
             current_state.status,
-            ContainerStatus::Running,
-            "State must remain Running when waitpid fails"
+            ContainerStatus::CleanupPending,
+            "State must transition to CleanupPending when finalization fails"
         );
+        // Verify FIFOs are preserved on failure
+        assert!(start_fifo.exists(), "start.fifo must remain on failure");
+        assert!(exec_fifo.exists(), "exec.fifo must remain on failure");
 
         // 2. When child is confirmed reaped (child_reaped = true), finalization succeeds
         let ok_res = tavik_runtime::init::run_supervisor_finalization(
@@ -2102,6 +2219,7 @@ fn test_linux_lifecycle_graceful_stop_and_acknowledgment() {
             return;
         }
 
+        #[allow(unused_mut)]
         let mut spec = Spec::default_linux();
         if let Some(proc) = &mut spec.process {
             proc.args = vec![
@@ -2165,6 +2283,7 @@ fn test_linux_stop_sigkill_escalation() {
         }
 
         // Process traps and ignores SIGTERM
+        #[allow(unused_mut)]
         let mut spec = Spec::default_linux();
         if let Some(proc) = &mut spec.process {
             proc.args = vec![
@@ -2226,6 +2345,7 @@ fn test_linux_force_delete_running_container() {
             return;
         }
 
+        #[allow(unused_mut)]
         let mut spec = Spec::default_linux();
         if let Some(proc) = &mut spec.process {
             proc.args = vec![
@@ -2338,6 +2458,7 @@ fn test_durable_cgroup_ownership_and_deletion_safety() {
     let rootfs = bundle_dir.join("rootfs");
     fs::create_dir_all(&rootfs).unwrap();
 
+    #[allow(unused_mut)]
     let mut spec = Spec::default_linux();
     if let Some(linux) = &mut spec.linux {
         // Spec with resource limits (owned cgroup)
@@ -2466,15 +2587,35 @@ fn test_finalization_error_handling_and_recovery() {
 fn test_signal_escalation_esrch_and_pidfd_exit() {
     #[cfg(target_os = "linux")]
     {
-        // 1. Fork a child that terminates immediately
+        // 1. Synchronize parent and child using a pipe
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         let child = unsafe { libc::fork() };
         assert!(child >= 0);
         if child == 0 {
-            unsafe { libc::_exit(0) };
+            unsafe {
+                libc::close(fds[1]); // Close write end in child
+                let mut buf = [0u8; 1];
+                let _ = libc::read(fds[0], buf.as_mut_ptr() as *mut libc::c_void, 1);
+                libc::close(fds[0]);
+                libc::_exit(0);
+            }
         }
+        unsafe {
+            libc::close(fds[0]);
+        } // Close read end in parent
 
-        // 2. Open pidfd for the child while it is running / zombie
+        // 2. Open pidfd for child while it is running and waiting on pipe read
         let child_pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child, 0) } as i32;
+        assert!(
+            child_pidfd >= 0,
+            "pidfd_open must succeed for running child"
+        );
+
+        // Release child to terminate
+        unsafe {
+            libc::close(fds[1]);
+        }
 
         // 3. Reap child completely
         let mut status = 0;
@@ -2485,22 +2626,20 @@ fn test_signal_escalation_esrch_and_pidfd_exit() {
         //    - see ESRCH from pidfd_send_signal (or invalid fd if pidfd closed)
         //    - verify termination via waitpid(WNOHANG) returning ECHILD
         //    - confirm child_reaped = true without hanging!
-        if child_pidfd >= 0 {
-            let mut child_reaped = false;
-            let res = tavik_runtime::init::terminate_child_with_escalation(
-                child,
-                child_pidfd,
-                libc::SIGTERM,
-                Duration::from_millis(100),
-                &mut child_reaped,
-            );
-            unsafe { libc::close(child_pidfd) };
-            assert!(res.is_ok());
-            assert!(
-                child_reaped,
-                "Child must be marked reaped on confirmed ESRCH/ECHILD"
-            );
-        }
+        let mut child_reaped = false;
+        let res = tavik_runtime::init::terminate_child_with_escalation(
+            child,
+            child_pidfd,
+            libc::SIGTERM,
+            Duration::from_millis(100),
+            &mut child_reaped,
+        );
+        unsafe { libc::close(child_pidfd) };
+        assert!(res.is_ok());
+        assert!(
+            child_reaped,
+            "Child must be marked reaped on confirmed ESRCH/ECHILD"
+        );
 
         // 5. Verify signalling failures do not cause false Stopped states
         let temp = tempdir().unwrap();
@@ -2510,11 +2649,18 @@ fn test_signal_escalation_esrch_and_pidfd_exit() {
         let cont_dir = state_dir.join(cont_id);
         fs::create_dir_all(&cont_dir).unwrap();
 
+        // Spawn a real child that remains alive
+        let mut sleep_child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let real_pid = sleep_child.id();
+
         let initial_state = ContainerState {
             oci_version: "1.2.0".to_string(),
             id: cont_id.to_string(),
             status: ContainerStatus::Running,
-            pid: Some(999999),
+            pid: Some(real_pid),
             bundle: temp.path().to_path_buf(),
             annotations: std::collections::HashMap::new(),
             created_at: chrono::Utc::now(),
@@ -2534,6 +2680,10 @@ fn test_signal_escalation_esrch_and_pidfd_exit() {
             ContainerStatus::Running,
             "Signalling failure must not cause false Stopped state"
         );
+
+        // Clean up sleep child
+        let _ = sleep_child.kill();
+        let _ = sleep_child.wait();
     }
 }
 
@@ -2557,6 +2707,7 @@ fn test_linux_startup_cancellation_on_invalid_exec() {
         let _ = fs::File::create(dev_dir.join("null"));
 
         // Point args to a non-existent binary to trigger execve failure
+        #[allow(unused_mut)]
         let mut spec = Spec::default_linux();
         if let Some(proc) = &mut spec.process {
             proc.args = vec!["/bin/nonexistent_binary_xyz".to_string()];
@@ -2613,6 +2764,7 @@ fn test_linux_delete_created_container_without_cgroups() {
             return;
         }
 
+        #[allow(unused_mut)]
         let mut spec = Spec::default_linux();
         if let Some(proc) = &mut spec.process {
             proc.args = vec![
@@ -2687,6 +2839,7 @@ fn test_linux_delete_created_container_with_cgroups() {
             return;
         }
 
+        #[allow(unused_mut)]
         let mut spec = Spec::default_linux();
         if let Some(proc) = &mut spec.process {
             proc.args = vec![
@@ -2929,6 +3082,20 @@ fn test_stale_control_socket_recovery_allows_force_delete_and_cleanup_pending() 
     let cont_dir = executor.container_dir(id);
     fs::create_dir_all(&cont_dir).unwrap();
 
+    // Spawn a temporary child process, obtain its ProcessIdentity, terminate and reap it
+    let mut dummy = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let dummy_pid = dummy.id();
+    let sup_ident = tavik_runtime::ProcessIdentity::from_pid(dummy_pid).unwrap();
+    sup_ident
+        .save_to(&cont_dir.join("supervisor.identity"))
+        .unwrap();
+
+    dummy.kill().unwrap();
+    dummy.wait().unwrap();
+
     let mut state = ContainerState {
         oci_version: "1.2.0".to_string(),
         id: id.to_string(),
@@ -2941,7 +3108,24 @@ fn test_stale_control_socket_recovery_allows_force_delete_and_cleanup_pending() 
     state
         .annotations
         .insert("io.tavik.cgroup.owned".to_string(), "true".to_string());
+    state.annotations.insert(
+        "io.tavik.supervisor.pid".to_string(),
+        sup_ident.pid.to_string(),
+    );
+    state.annotations.insert(
+        "io.tavik.supervisor.start_time".to_string(),
+        sup_ident.start_time.to_string(),
+    );
     executor.save_state(&state).unwrap();
+    fs::write(cont_dir.join("cgroup.owner"), b"1\n").unwrap();
+
+    #[cfg(target_os = "linux")]
+    let cgroup_dir = {
+        let cgroup_mgr = tavik_cgroups::CgroupManager::new().expect("CgroupManager::new");
+        cgroup_mgr
+            .create_container_cgroup(id)
+            .expect("create_container_cgroup")
+    };
 
     // Create a stale Unix socket file (bind and immediately close, leaving socket inode without listener)
     let sock_path = cont_dir.join("control.sock");
@@ -2952,7 +3136,7 @@ fn test_stale_control_socket_recovery_allows_force_delete_and_cleanup_pending() 
     }
     assert!(sock_path.exists(), "control.sock must exist on disk");
 
-    // Deleting a CleanupPending container should detect stale socket, unlink it, and clean up
+    // Deleting a CleanupPending container should detect stale socket, verify dead supervisor identity, unlink it, and clean up
     let del_res = executor.delete(id, false);
     assert!(
         del_res.is_ok(),
@@ -2960,6 +3144,11 @@ fn test_stale_control_socket_recovery_allows_force_delete_and_cleanup_pending() 
         del_res.err()
     );
     assert!(!cont_dir.exists(), "Container directory must be removed");
+    #[cfg(target_os = "linux")]
+    assert!(
+        !cgroup_dir.exists(),
+        "Cgroup directory must be removed on successful delete"
+    );
 }
 
 #[test]
@@ -3238,6 +3427,20 @@ fn test_cleanup_retry_successfully_removes_cgroup_and_marker() {
     let cont_dir = executor.container_dir(id);
     fs::create_dir_all(&cont_dir).unwrap();
 
+    // Spawn a temporary child process, obtain its ProcessIdentity, terminate and reap it
+    let mut dummy = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let dummy_pid = dummy.id();
+    let sup_ident = tavik_runtime::ProcessIdentity::from_pid(dummy_pid).unwrap();
+    sup_ident
+        .save_to(&cont_dir.join("supervisor.identity"))
+        .unwrap();
+
+    dummy.kill().unwrap();
+    dummy.wait().unwrap();
+
     let mut state = ContainerState {
         oci_version: "1.2.0".to_string(),
         id: id.to_string(),
@@ -3250,8 +3453,24 @@ fn test_cleanup_retry_successfully_removes_cgroup_and_marker() {
     state
         .annotations
         .insert("io.tavik.cgroup.owned".to_string(), "true".to_string());
+    state.annotations.insert(
+        "io.tavik.supervisor.pid".to_string(),
+        sup_ident.pid.to_string(),
+    );
+    state.annotations.insert(
+        "io.tavik.supervisor.start_time".to_string(),
+        sup_ident.start_time.to_string(),
+    );
     executor.save_state(&state).unwrap();
     fs::write(cont_dir.join("cgroup.owner"), b"1\n").unwrap();
+
+    #[cfg(target_os = "linux")]
+    let cgroup_dir = {
+        let cgroup_mgr = tavik_cgroups::CgroupManager::new().expect("CgroupManager::new");
+        cgroup_mgr
+            .create_container_cgroup(id)
+            .expect("create_container_cgroup")
+    };
 
     // A delete on CleanupPending executes cgroup destroy and unlinks marker
     let del_res = executor.delete(id, false);
@@ -3263,6 +3482,11 @@ fn test_cleanup_retry_successfully_removes_cgroup_and_marker() {
     assert!(
         !cont_dir.exists(),
         "Container directory must be removed after successful cleanup"
+    );
+    #[cfg(target_os = "linux")]
+    assert!(
+        !cgroup_dir.exists(),
+        "Cgroup directory must be removed after successful cleanup"
     );
 }
 
@@ -3497,12 +3721,16 @@ fn test_cgroup_destruction_propagates_kill_and_process_errors() {
     executor.save_state(&state).unwrap();
     fs::write(cont_dir.join("cgroup.owner"), b"1\n").unwrap();
 
-    // Inject simulated cgroup destruction failure
-    fs::write(cont_dir.join(".simulate_cgroup_destroy_fail"), b"1\n").unwrap();
-
-    // Delete must fail because cgroup destruction failed
     #[cfg(target_os = "linux")]
     {
+        let cgroup_mgr = tavik_cgroups::CgroupManager::new().expect("CgroupManager::new");
+        let cgroup_dir = cgroup_mgr
+            .create_container_cgroup(id)
+            .expect("create_container_cgroup");
+        let blocker = cgroup_dir.join("blocker_subgroup");
+        fs::create_dir(&blocker).expect("create blocker_subgroup");
+
+        // Delete must fail because cgroup destruction fails (directory not empty / busy)
         let del_res = executor.delete(id, false);
         assert!(
             del_res.is_err(),
@@ -3514,6 +3742,23 @@ fn test_cgroup_destruction_propagates_kill_and_process_errors() {
             "cgroup.owner must remain"
         );
         assert!(cont_dir.exists(), "Container directory must remain");
+
+        // Clean up the blocker child cgroup and assert that deletion succeeds on retry
+        fs::remove_dir(&blocker).expect("remove blocker_subgroup");
+        let retry_res = executor.delete(id, false);
+        assert!(
+            retry_res.is_ok(),
+            "Delete must succeed once cgroup blocker is removed: {:?}",
+            retry_res.err()
+        );
+        assert!(
+            !cont_dir.exists(),
+            "Container directory must be removed on successful delete"
+        );
+        assert!(
+            !cgroup_dir.exists(),
+            "Cgroup directory must be removed on successful delete"
+        );
     }
 }
 
@@ -4308,6 +4553,7 @@ fn test_e2e_real_supervisor_unexpected_exit_and_force_delete() {
             return;
         }
 
+        #[allow(unused_mut)]
         let mut spec = Spec::default_linux();
         if let Some(proc) = &mut spec.process {
             proc.args = vec![

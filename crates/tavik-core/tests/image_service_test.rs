@@ -22,12 +22,22 @@ fn create_tar_gz_layer(entries: &[(&str, &[u8], u32)]) -> (Vec<u8>, String) {
 
     for (name, data, mode) in entries {
         let mut header = tar::Header::new_gnu();
-        header.set_size(data.len() as u64);
-        header.set_mode(*mode);
-        header.set_cksum();
-        tar_builder
-            .append_data(&mut header, *name, *data)
-            .expect("Failed to append tar entry");
+        if name.ends_with('/') {
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_size(0);
+            header.set_mode(*mode);
+            header.set_cksum();
+            tar_builder
+                .append_data(&mut header, *name, std::io::empty())
+                .expect("Failed to append tar directory");
+        } else {
+            header.set_size(data.len() as u64);
+            header.set_mode(*mode);
+            header.set_cksum();
+            tar_builder
+                .append_data(&mut header, *name, *data)
+                .expect("Failed to append tar entry");
+        }
     }
 
     let uncompressed_tar = tar_builder.into_inner().expect("Failed to finish tar");
@@ -716,6 +726,7 @@ async fn test_create_and_run_container_linux_e2e() {
 
         let (layer_bytes, diff_id) = create_tar_gz_layer(&[
             ("bin/busybox", &busybox_bytes, 0o755),
+            ("app/", b"", 0o777),
             ("app/run.sh", b"#!/bin/busybox sh\necho test\n", 0o755),
             ("dev/null", b"", 0o666),
             ("etc/passwd", b"user:x:1001:2001:User:/app:/bin/sh\n", 0o644),
@@ -743,7 +754,7 @@ async fn test_create_and_run_container_linux_e2e() {
                 "WorkingDir": "/app",
                 "Env": ["PATH=/nonexistent:/bin"],
                 "Entrypoint": ["busybox", "sh", "-c"],
-                "Cmd": ["busybox id -u > /uid.out && busybox id -g > /gid.out && busybox id -G > /gids.out && busybox pwd > /cwd.out && sleep 10"],
+                "Cmd": ["busybox id -u > /app/uid.out && busybox id -g > /app/gid.out && busybox id -G > /app/gids.out && busybox pwd > /app/cwd.out && sleep 10"],
                 "StopSignal": "SIGTERM"
             }
         });
@@ -789,11 +800,14 @@ async fn test_create_and_run_container_linux_e2e() {
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
         let rootfs = bundle_dir.join("rootfs");
-        let uid_out = std::fs::read_to_string(rootfs.join("uid.out")).expect("uid.out must exist");
-        let gid_out = std::fs::read_to_string(rootfs.join("gid.out")).expect("gid.out must exist");
+        let uid_out =
+            std::fs::read_to_string(rootfs.join("app/uid.out")).expect("uid.out must exist");
+        let gid_out =
+            std::fs::read_to_string(rootfs.join("app/gid.out")).expect("gid.out must exist");
         let gids_out =
-            std::fs::read_to_string(rootfs.join("gids.out")).expect("gids.out must exist");
-        let cwd_out = std::fs::read_to_string(rootfs.join("cwd.out")).expect("cwd.out must exist");
+            std::fs::read_to_string(rootfs.join("app/gids.out")).expect("gids.out must exist");
+        let cwd_out =
+            std::fs::read_to_string(rootfs.join("app/cwd.out")).expect("cwd.out must exist");
 
         // Verify container UID and GID match resolved user
         assert_eq!(uid_out.trim(), "1001", "Expected UID 1001");

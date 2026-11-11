@@ -2919,3 +2919,258 @@ fn test_concurrency_stop_and_delete() {
     // Must not panic, and container must be gone
     assert!(!cont_dir.exists());
 }
+
+#[test]
+fn test_stale_control_socket_recovery_allows_force_delete_and_cleanup_pending() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let executor = ContainerExecutor::new(state_dir).unwrap();
+    let id = "test-stale-sock-cont";
+
+    let cont_dir = executor.container_dir(id);
+    fs::create_dir_all(&cont_dir).unwrap();
+
+    let mut state = tavik_runtime::ContainerState {
+        oci_version: "1.2.0".to_string(),
+        id: id.to_string(),
+        status: ContainerStatus::CleanupPending,
+        pid: None,
+        bundle: temp.path().join("bundle"),
+        annotations: std::collections::HashMap::new(),
+        created_at: chrono::Utc::now(),
+    };
+    state
+        .annotations
+        .insert("io.tavik.cgroup.owned".to_string(), "true".to_string());
+    executor.save_state(&state).unwrap();
+
+    // Create a stale Unix socket file (bind and immediately close, leaving socket inode without listener)
+    let sock_path = cont_dir.join("control.sock");
+    {
+        use std::os::unix::net::UnixListener;
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        drop(listener); // closed listener leaves stale control.sock file on disk
+    }
+    assert!(sock_path.exists(), "control.sock must exist on disk");
+
+    // Deleting a CleanupPending container should detect stale socket, unlink it, and clean up
+    let del_res = executor.delete(id, false);
+    assert!(
+        del_res.is_ok(),
+        "Delete on CleanupPending with stale control socket must succeed: {:?}",
+        del_res.err()
+    );
+    assert!(!cont_dir.exists(), "Container directory must be removed");
+}
+
+#[test]
+fn test_stale_control_socket_recovery_with_force_delete() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let executor = ContainerExecutor::new(state_dir).unwrap();
+    let id = "test-stale-sock-force";
+
+    let cont_dir = executor.container_dir(id);
+    fs::create_dir_all(&cont_dir).unwrap();
+
+    let state = tavik_runtime::ContainerState {
+        oci_version: "1.2.0".to_string(),
+        id: id.to_string(),
+        status: ContainerStatus::Running,
+        pid: Some(999999), // dead PID
+        bundle: temp.path().join("bundle"),
+        annotations: std::collections::HashMap::new(),
+        created_at: chrono::Utc::now(),
+    };
+    executor.save_state(&state).unwrap();
+
+    // Create a stale Unix socket file
+    let sock_path = cont_dir.join("control.sock");
+    {
+        use std::os::unix::net::UnixListener;
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        drop(listener);
+    }
+    assert!(sock_path.exists());
+
+    // Without force, deleting a Running container must fail with InvalidState
+    let no_force_res = executor.delete(id, false);
+    assert!(no_force_res.is_err());
+
+    // With force, stale socket is unlinked and cleanup proceeds
+    let force_res = executor.delete(id, true);
+    assert!(
+        force_res.is_ok(),
+        "Force delete with stale socket must succeed: {:?}",
+        force_res.err()
+    );
+    assert!(!cont_dir.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_live_control_socket_is_never_unlinked_as_stale() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let executor = ContainerExecutor::new(state_dir).unwrap();
+    let id = "test-live-sock-cont";
+
+    let cont_dir = executor.container_dir(id);
+    fs::create_dir_all(&cont_dir).unwrap();
+
+    let mut dummy_proc = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let dummy_pid = dummy_proc.id();
+
+    let state = tavik_runtime::ContainerState {
+        oci_version: "1.2.0".to_string(),
+        id: id.to_string(),
+        status: ContainerStatus::Running,
+        pid: Some(dummy_pid),
+        bundle: temp.path().join("bundle"),
+        annotations: std::collections::HashMap::new(),
+        created_at: chrono::Utc::now(),
+    };
+    executor.save_state(&state).unwrap();
+
+    let sock_path = cont_dir.join("control.sock");
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+    let listener = UnixListener::bind(&sock_path).unwrap();
+
+    // Spawn a mock supervisor listener that refuses to CANCEL by returning ERR
+    let handle = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 64];
+            let n = stream.read(&mut buf).unwrap();
+            let cmd = String::from_utf8_lossy(&buf[..n]);
+            if cmd.starts_with("CANCEL") {
+                let _ = stream.write_all(b"ERR failed to cancel container\n");
+            }
+        }
+    });
+
+    let del_res = executor.delete(id, true);
+    assert!(
+        del_res.is_err(),
+        "Delete must fail when live supervisor returns ERR"
+    );
+    // Live socket must NOT have been unlinked or deleted
+    assert!(
+        sock_path.exists(),
+        "Live control socket must never be unlinked on cancellation failure"
+    );
+
+    handle.join().unwrap();
+    let _ = dummy_proc.kill();
+    let _ = dummy_proc.wait();
+}
+
+#[test]
+fn test_concurrency_state_reconciliation_racing_with_deletion() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let executor = std::sync::Arc::new(ContainerExecutor::new(state_dir).unwrap());
+    let id = "test-race-reconcile-delete";
+
+    let cont_dir = executor.container_dir(id);
+    fs::create_dir_all(&cont_dir).unwrap();
+
+    let state = tavik_runtime::ContainerState {
+        oci_version: "1.2.0".to_string(),
+        id: id.to_string(),
+        status: ContainerStatus::Running,
+        pid: Some(999999), // Dead PID to trigger reconciliation
+        bundle: temp.path().join("bundle"),
+        annotations: std::collections::HashMap::new(),
+        created_at: chrono::Utc::now(),
+    };
+    executor.save_state(&state).unwrap();
+
+    let exec1 = std::sync::Arc::clone(&executor);
+    let exec2 = std::sync::Arc::clone(&executor);
+
+    let stop_reconcile = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_flag = std::sync::Arc::clone(&stop_reconcile);
+
+    // Thread 1: continually reconciles state via load_state
+    let handle1 = std::thread::spawn(move || {
+        while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = exec1.load_state(id);
+            std::thread::yield_now();
+        }
+    });
+
+    // Small delay to ensure reconciliation loop has started
+    std::thread::sleep(Duration::from_millis(5));
+
+    // Thread 2: deletes container with force
+    let handle2 = std::thread::spawn(move || exec2.delete(id, true));
+
+    let del_res = handle2.join().unwrap();
+    stop_reconcile.store(true, std::sync::atomic::Ordering::Relaxed);
+    handle1.join().unwrap();
+
+    assert!(
+        del_res.is_ok(),
+        "Concurrent delete must succeed: {:?}",
+        del_res.err()
+    );
+
+    // After deletion, load_state must return NotFound and container directory must NOT be resurrected
+    let final_load = executor.load_state(id);
+    assert!(
+        final_load.is_err(),
+        "load_state after deletion must return error"
+    );
+    assert!(
+        !cont_dir.exists(),
+        "Deleted container directory must never be resurrected by load_state"
+    );
+}
+
+#[test]
+fn test_truthful_deletion_errors_and_save_state_rejection() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let executor = ContainerExecutor::new(state_dir).unwrap();
+    let id = "test-truthful-delete";
+
+    let cont_dir = executor.container_dir(id);
+    fs::create_dir_all(&cont_dir).unwrap();
+
+    let state = tavik_runtime::ContainerState {
+        oci_version: "1.2.0".to_string(),
+        id: id.to_string(),
+        status: ContainerStatus::Stopped,
+        pid: None,
+        bundle: temp.path().join("bundle"),
+        annotations: std::collections::HashMap::new(),
+        created_at: chrono::Utc::now(),
+    };
+    executor.save_state(&state).unwrap();
+
+    // Verify saving state on a non-existent container fails truthfully with NotFound
+    let mut fake_state = state.clone();
+    fake_state.id = "non-existent-cont".to_string();
+    let save_res = executor.save_state(&fake_state);
+    assert!(
+        save_res.is_err(),
+        "save_state on non-existent container must return error"
+    );
+
+    // Successful delete removes container completely
+    let del_res = executor.delete(id, false);
+    assert!(del_res.is_ok());
+    assert!(!cont_dir.exists());
+
+    // Subsequent save_state on deleted container must return NotFound
+    let retry_save = executor.save_state(&state);
+    assert!(
+        retry_save.is_err(),
+        "save_state on deleted container must return error without resurrecting directory"
+    );
+    assert!(!cont_dir.exists(), "Directory must not be recreated");
+}

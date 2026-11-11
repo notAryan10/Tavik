@@ -44,7 +44,17 @@ impl CgroupGuard {
         match self.mgr.destroy_container_cgroup(&self.container_id) {
             Ok(()) => {
                 self.active = false;
-                let _ = fs::remove_file(container_dir.join("cgroup.owner"));
+                let owner_path = container_dir.join("cgroup.owner");
+                if owner_path.exists() {
+                    if let Err(e) = fs::remove_file(&owner_path) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            return Err(format!(
+                                "Failed to remove cgroup.owner marker for container '{}': {}",
+                                self.container_id, e
+                            ));
+                        }
+                    }
+                }
                 Ok(())
             }
             Err(e) => {
@@ -222,6 +232,12 @@ pub fn send_control_command(sock_path: &Path, cmd: &str) -> Result<String> {
     if unsafe { libc::connect(fd, &addr as *const _ as *const libc::sockaddr, len) } != 0 {
         let err = std::io::Error::last_os_error();
         unsafe { libc::close(fd) };
+        if err.raw_os_error() == Some(libc::ECONNREFUSED) {
+            return Err(TavikError::DaemonUnreachable(format!(
+                "Failed to connect to control socket at {:?}: connection refused (supervisor exited or socket is stale)",
+                sock_path
+            )));
+        }
         return Err(TavikError::Io(format!(
             "Failed to connect to control socket at {:?}: {}",
             sock_path, err
@@ -560,8 +576,13 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
                     libc::_exit(1);
                 };
             }
-            if let Err(e) = mgr.create_container_cgroup(id) {
-                let msg = format!("Failed to create cgroup for container '{}': {}", id, e);
+            // Persist cgroup ownership intent BEFORE creating the cgroup
+            let cgroup_owner_file = container_dir.join("cgroup.owner");
+            if let Err(e) = fs::write(&cgroup_owner_file, b"1\n") {
+                let msg = format!(
+                    "Failed to record cgroup ownership intent for container '{}': {}",
+                    id, e
+                );
                 let _ = unsafe { libc::write(trampoline_pipe[1], msg.as_ptr() as _, msg.len()) };
                 unsafe {
                     libc::close(control_listener_fd);
@@ -569,18 +590,52 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
                     libc::_exit(1);
                 };
             }
-            // Persist cgroup ownership immediately upon creation before any subsequent operation
-            let cgroup_owner_file = container_dir.join("cgroup.owner");
-            let _ = fs::write(&cgroup_owner_file, b"1\n");
             let mut init_state = state.clone();
             init_state
                 .annotations
                 .insert("io.tavik.cgroup.owned".to_string(), "true".to_string());
-            if let Ok(json) = serde_json::to_string_pretty(&init_state) {
-                let tmp = container_dir.join("state.json.tmp");
-                if fs::write(&tmp, json).is_ok() {
-                    let _ = fs::rename(&tmp, &state_file);
+            let json = match serde_json::to_string_pretty(&init_state) {
+                Ok(j) => j,
+                Err(e) => {
+                    let msg = format!(
+                        "Failed to serialize cgroup ownership state for container '{}': {}",
+                        id, e
+                    );
+                    let _ =
+                        unsafe { libc::write(trampoline_pipe[1], msg.as_ptr() as _, msg.len()) };
+                    let _ = fs::remove_file(&cgroup_owner_file);
+                    unsafe {
+                        libc::close(control_listener_fd);
+                        let _ = fs::remove_file(&control_sock_path);
+                        libc::_exit(1);
+                    };
                 }
+            };
+            let tmp = container_dir.join("state.json.tmp");
+            if let Err(e) = fs::write(&tmp, json).and_then(|_| fs::rename(&tmp, &state_file)) {
+                let msg = format!(
+                    "Failed to persist cgroup ownership state for container '{}': {}",
+                    id, e
+                );
+                let _ = unsafe { libc::write(trampoline_pipe[1], msg.as_ptr() as _, msg.len()) };
+                let _ = fs::remove_file(&cgroup_owner_file);
+                unsafe {
+                    libc::close(control_listener_fd);
+                    let _ = fs::remove_file(&control_sock_path);
+                    libc::_exit(1);
+                };
+            }
+
+            if let Err(e) = mgr.create_container_cgroup(id) {
+                let msg = format!("Failed to create cgroup for container '{}': {}", id, e);
+                let _ = unsafe { libc::write(trampoline_pipe[1], msg.as_ptr() as _, msg.len()) };
+                let _ = mgr.destroy_container_cgroup(id);
+                let _ = fs::remove_file(&cgroup_owner_file);
+                unsafe {
+                    libc::close(control_listener_fd);
+                    let _ = fs::remove_file(&control_sock_path);
+                    libc::_exit(1);
+                };
             }
 
             let mut guard = CgroupGuard::new(mgr, id.to_string());
@@ -1091,7 +1146,17 @@ pub fn run_supervisor_finalization(
             .map_err(|e| format!("Failed to initialize cgroup manager: {}", e))?;
         mgr.destroy_container_cgroup(id)
             .map_err(|e| format!("Failed to destroy cgroup for container '{}': {}", id, e))?;
-        let _ = fs::remove_file(container_dir.join("cgroup.owner"));
+        let owner_path = container_dir.join("cgroup.owner");
+        if owner_path.exists() {
+            if let Err(e) = fs::remove_file(&owner_path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(format!(
+                        "Failed to remove cgroup.owner marker for container '{}': {}",
+                        id, e
+                    ));
+                }
+            }
+        }
     }
 
     // 4. Remove FIFO files

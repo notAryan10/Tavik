@@ -13,13 +13,29 @@ pub(crate) struct StateLock {
 #[cfg(unix)]
 impl StateLock {
     pub(crate) fn acquire(path: &Path) -> Result<Self> {
+        let parent = path.parent();
+        if let Some(p) = parent {
+            if !p.exists() {
+                return Err(TavikError::NotFound(format!(
+                    "Cannot acquire lock: directory {:?} does not exist",
+                    p
+                )));
+            }
+        }
+
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(path)
-            .map_err(|e| TavikError::Io(format!("Failed to open state lock file: {}", e)))?;
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    TavikError::NotFound(format!("State lock file {:?} not found: {}", path, e))
+                } else {
+                    TavikError::Io(format!("Failed to open state lock file: {}", e))
+                }
+            })?;
 
         let res =
             unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) };
@@ -27,6 +43,30 @@ impl StateLock {
             return Err(TavikError::Io(format!(
                 "Failed to acquire flock: {}",
                 std::io::Error::last_os_error()
+            )));
+        }
+
+        // Verify that the file was not unlinked or retired between open and flock
+        let mut st1: libc::stat = unsafe { std::mem::zeroed() };
+        let mut st2: libc::stat = unsafe { std::mem::zeroed() };
+        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
+        let fstat_res = unsafe { libc::fstat(fd, &mut st1) };
+        if fstat_res != 0 {
+            return Err(TavikError::Io(format!(
+                "Failed to fstat lock file descriptor: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|e| TavikError::Config(format!("Invalid path for stat: {}", e)))?;
+        let stat_res = unsafe { libc::stat(c_path.as_ptr(), &mut st2) };
+        if stat_res != 0 || st1.st_dev != st2.st_dev || st1.st_ino != st2.st_ino {
+            return Err(TavikError::NotFound(format!(
+                "Lock file {:?} was unlinked or replaced before acquisition",
+                path
             )));
         }
 
@@ -68,8 +108,16 @@ impl ContainerExecutor {
         self.container_dir(id).join("state.json")
     }
 
-    /// Loads the current container state from disk.
-    pub fn load_state(&self, id: &str) -> Result<ContainerState> {
+    /// Reads state directly from disk without locking or side-effects.
+    pub(crate) fn load_state_raw(&self, id: &str) -> Result<ContainerState> {
+        let container_dir = self.container_dir(id);
+        if !container_dir.exists() {
+            return Err(TavikError::NotFound(format!(
+                "Container '{}' not found",
+                id
+            )));
+        }
+
         let path = self.state_file_path(id);
         if !path.exists() {
             return Err(TavikError::NotFound(format!(
@@ -79,25 +127,19 @@ impl ContainerExecutor {
         }
 
         let content = fs::read_to_string(&path)?;
-        let mut state: ContainerState = serde_json::from_str(&content)?;
+        let state: ContainerState = serde_json::from_str(&content)?;
+        Ok(state)
+    }
 
-        // Reconcile PID liveness
+    /// Loads the current container state from disk, reconciling dead processes under StateLock if needed.
+    pub fn load_state(&self, id: &str) -> Result<ContainerState> {
+        let state = self.load_state_raw(id)?;
+
+        // Reconcile PID liveness if running and process is dead
         if state.status == ContainerStatus::Running {
             if let Some(pid) = state.pid {
                 if !is_pid_alive(pid) {
-                    #[cfg(target_os = "linux")]
-                    {
-                        if self.has_cgroup_ownership(id, &state) {
-                            state.status = ContainerStatus::CleanupPending;
-                        } else {
-                            state.status = ContainerStatus::Stopped;
-                        }
-                    }
-                    #[cfg(not(target_os = "linux"))]
-                    {
-                        state.status = ContainerStatus::Stopped;
-                    }
-                    let _ = self.save_state(&state);
+                    return self.reconcile_dead_process(id, pid);
                 }
             }
         }
@@ -105,10 +147,61 @@ impl ContainerExecutor {
         Ok(state)
     }
 
-    /// Atomically persists container state.
+    fn reconcile_dead_process(&self, id: &str, expected_pid: u32) -> Result<ContainerState> {
+        let container_dir = self.container_dir(id);
+        if !container_dir.exists() {
+            return Err(TavikError::NotFound(format!(
+                "Container '{}' not found",
+                id
+            )));
+        }
+
+        #[cfg(unix)]
+        let lock_path = container_dir.join("state.lock");
+        #[cfg(unix)]
+        let _lock = StateLock::acquire(&lock_path)?;
+
+        // Re-check directory and state existence under lock
+        if !container_dir.exists() {
+            return Err(TavikError::NotFound(format!(
+                "Container '{}' not found",
+                id
+            )));
+        }
+
+        let mut state = self.load_state_raw(id)?;
+
+        if state.status == ContainerStatus::Running
+            && state.pid == Some(expected_pid)
+            && !is_pid_alive(expected_pid)
+        {
+            #[cfg(target_os = "linux")]
+            {
+                if self.has_cgroup_ownership(id, &state) {
+                    state.status = ContainerStatus::CleanupPending;
+                } else {
+                    state.status = ContainerStatus::Stopped;
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                state.status = ContainerStatus::Stopped;
+            }
+            self.save_state(&state)?;
+        }
+
+        Ok(state)
+    }
+
+    /// Atomically persists container state. Never recreates a missing container directory.
     pub fn save_state(&self, state: &ContainerState) -> Result<()> {
         let container_dir = self.container_dir(&state.id);
-        fs::create_dir_all(&container_dir)?;
+        if !container_dir.exists() {
+            return Err(TavikError::NotFound(format!(
+                "Cannot save state: container '{}' directory does not exist",
+                state.id
+            )));
+        }
 
         let target_path = self.state_file_path(&state.id);
         let tmp_path = container_dir.join("state.json.tmp");
@@ -222,6 +315,8 @@ impl ContainerExecutor {
             "Creating OCI container '{}' from bundle {:?}",
             id, canonical_bundle
         );
+
+        fs::create_dir_all(&container_dir)?;
 
         let initial_state = ContainerState {
             oci_version: spec.oci_version.clone(),
@@ -530,7 +625,7 @@ impl ContainerExecutor {
         // 1. Initial state inspection under StateLock
         let state = {
             let _lock = StateLock::acquire(&lock_path)?;
-            self.load_state(id)?
+            self.load_state_raw(id)?
         };
 
         let is_running_or_starting = matches!(
@@ -554,8 +649,10 @@ impl ContainerExecutor {
             {
                 let control_sock = container_dir.join("control.sock");
                 if !control_sock.exists() {
-                    let cur_state = self.load_state(id)?;
-                    if cur_state.status != ContainerStatus::Stopped {
+                    let cur_state = self.load_state_raw(id)?;
+                    if cur_state.status != ContainerStatus::Stopped
+                        && cur_state.status != ContainerStatus::CleanupPending
+                    {
                         if cur_state.status == ContainerStatus::Created {
                             return Err(TavikError::Execution(format!(
                                 "Cannot delete created container '{}': supervisor control socket is unreachable at {:?}",
@@ -569,27 +666,61 @@ impl ContainerExecutor {
                         }
                     }
                 } else {
-                    let resp = crate::init::send_control_command(&control_sock, "CANCEL").map_err(
-                        |e| {
-                            TavikError::Execution(format!(
+                    match crate::init::send_control_command(&control_sock, "CANCEL") {
+                        Ok(resp) => {
+                            if resp != "OK" && !resp.starts_with("OK ") {
+                                return Err(TavikError::Execution(format!(
+                                    "Supervisor returned non-OK response during delete cancellation: {:?}",
+                                    resp
+                                )));
+                            }
+
+                            let final_state = self.load_state_raw(id)?;
+                            if final_state.status != ContainerStatus::Stopped
+                                && final_state.status != ContainerStatus::CleanupPending
+                            {
+                                return Err(TavikError::Execution(format!(
+                                    "Container '{}' remained in status '{}' after supervisor cancellation during delete",
+                                    id, final_state.status
+                                )));
+                            }
+                        }
+                        Err(TavikError::DaemonUnreachable(_)) => {
+                            // Supervisor has exited (connection refused on control socket).
+                            if state.status == ContainerStatus::Created && !force {
+                                return Err(TavikError::Execution(format!(
+                                    "Cannot delete created container '{}': supervisor is unreachable at {:?}",
+                                    id, control_sock
+                                )));
+                            }
+                            if let Some(pid) = state.pid {
+                                if is_pid_alive(pid) {
+                                    if !force {
+                                        return Err(TavikError::Execution(format!(
+                                            "Cannot delete container '{}': process {} is still running but supervisor is dead",
+                                            id, pid
+                                        )));
+                                    }
+                                    unsafe {
+                                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                                        let mut status = 0;
+                                        libc::waitpid(
+                                            pid as libc::pid_t,
+                                            &mut status,
+                                            libc::WNOHANG,
+                                        );
+                                    }
+                                }
+                            }
+                            // Clean up stale socket so it does not block recovery
+                            let _ = fs::remove_file(&control_sock);
+                        }
+                        Err(e) => {
+                            return Err(TavikError::Execution(format!(
                                 "Failed to stop container '{}' via supervisor during delete: {}",
                                 id, e
-                            ))
-                        },
-                    )?;
-                    if resp != "OK" && !resp.starts_with("OK ") {
-                        return Err(TavikError::Execution(format!(
-                            "Supervisor returned non-OK response during delete cancellation: {:?}",
-                            resp
-                        )));
-                    }
-
-                    let final_state = self.load_state(id)?;
-                    if final_state.status != ContainerStatus::Stopped {
-                        return Err(TavikError::Execution(format!(
-                            "Container '{}' remained in status '{}' after supervisor cancellation during delete",
-                            id, final_state.status
-                        )));
+                            )));
+                        }
                     }
                 }
             }
@@ -610,9 +741,13 @@ impl ContainerExecutor {
             )));
         }
 
+        let retired_dir = self
+            .state_dir
+            .join(format!(".retired-{}-{}", id, uuid::Uuid::new_v4()));
+
         {
             let _lock = StateLock::acquire(&lock_path)?;
-            let final_state = match self.load_state(id) {
+            let final_state = match self.load_state_raw(id) {
                 Ok(s) => s,
                 Err(TavikError::NotFound(_)) => {
                     return Err(TavikError::NotFound(format!(
@@ -630,7 +765,10 @@ impl ContainerExecutor {
 
             #[cfg(target_os = "linux")]
             {
-                if final_state.status != ContainerStatus::Stopped && !force {
+                if final_state.status != ContainerStatus::Stopped
+                    && final_state.status != ContainerStatus::CleanupPending
+                    && !force
+                {
                     return Err(TavikError::InvalidState(format!(
                         "Cannot delete container '{}' with status '{}' without force flag",
                         id, final_state.status
@@ -654,27 +792,34 @@ impl ContainerExecutor {
                     })?;
 
                     // After cgroup is successfully destroyed, remove cgroup.owner marker
-                    let _ = fs::remove_file(container_dir.join("cgroup.owner"));
-                }
-            }
-
-            // Remove all files inside container_dir except state.lock
-            for entry in fs::read_dir(&container_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.file_name() != Some(std::ffi::OsStr::new("state.lock")) {
-                    if path.is_dir() {
-                        let _ = fs::remove_dir_all(&path);
-                    } else {
-                        let _ = fs::remove_file(&path);
+                    let owner_path = container_dir.join("cgroup.owner");
+                    if owner_path.exists() {
+                        fs::remove_file(&owner_path).map_err(|e| {
+                            TavikError::Io(format!(
+                                "Failed to remove cgroup.owner marker for container '{}': {}",
+                                id, e
+                            ))
+                        })?;
                     }
                 }
             }
+
+            // Atomically retire container directory to prevent concurrent recreation/races
+            fs::rename(&container_dir, &retired_dir).map_err(|e| {
+                TavikError::Io(format!(
+                    "Failed to retire container directory for '{}' ({:?} -> {:?}): {}",
+                    id, container_dir, retired_dir, e
+                ))
+            })?;
         } // _lock dropped here
 
-        // Now remove state.lock and container_dir safely after releasing the lock
-        let _ = fs::remove_file(&lock_path);
-        let _ = fs::remove_dir(&container_dir);
+        // Clean up retired directory and propagate any filesystem errors truthfully
+        fs::remove_dir_all(&retired_dir).map_err(|e| {
+            TavikError::Io(format!(
+                "Failed to remove retired container directory {:?}: {}",
+                retired_dir, e
+            ))
+        })?;
 
         info!("Deleted container '{}'", id);
         Ok(())

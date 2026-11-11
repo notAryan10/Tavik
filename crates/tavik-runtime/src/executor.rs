@@ -837,11 +837,15 @@ impl ContainerExecutor {
                             )));
                         }
                         // For force deletion, safely terminate the unresponsive supervisor first
-                        sup_ident.kill_safe().map_err(|e| {
-                            TavikError::Execution(format!(
+                        sup_ident.kill_safe().map_err(|e| match e {
+                            TavikError::Unsupported(msg) => TavikError::Unsupported(format!(
                                 "Failed to terminate unresponsive supervisor (PID {}) for container '{}': {}",
-                                sup_ident.pid, id, e
-                            ))
+                                sup_ident.pid, id, msg
+                            )),
+                            other => TavikError::Execution(format!(
+                                "Failed to terminate unresponsive supervisor (PID {}) for container '{}': {}",
+                                sup_ident.pid, id, other
+                            )),
                         })?;
                     }
                     Ok(false) => {
@@ -879,11 +883,15 @@ impl ContainerExecutor {
                             )));
                         }
                         // Safely terminate verified process
-                        init_ident.kill_safe().map_err(|e| {
-                            TavikError::Execution(format!(
+                        init_ident.kill_safe().map_err(|e| match e {
+                            TavikError::Unsupported(msg) => TavikError::Unsupported(format!(
                                 "Failed to safely terminate process {} for container '{}': {}",
-                                init_ident.pid, id, e
-                            ))
+                                init_ident.pid, id, msg
+                            )),
+                            other => TavikError::Execution(format!(
+                                "Failed to safely terminate process {} for container '{}': {}",
+                                init_ident.pid, id, other
+                            )),
                         })?;
                     }
                     Ok(false) => {

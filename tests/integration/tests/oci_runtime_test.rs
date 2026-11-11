@@ -3879,19 +3879,42 @@ fn test_process_identity_kill_safe_with_real_process() {
     let _ = child.wait();
 }
 
+struct ChildGuard(std::process::Child);
+
+impl ChildGuard {
+    fn spawn_sleep() -> Self {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("Failed to spawn sleep child process");
+        Self(child)
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[test]
 fn test_pidfd_open_enosys_fails_unsupported_and_preserves_process() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .unwrap();
-    let child_pid = child.id();
+    use tavik_runtime::test_hooks::{MockSyscalls, ScopedMockSyscalls};
 
-    let ident = tavik_runtime::ProcessIdentity::from_pid(child_pid).unwrap();
+    let child = ChildGuard::spawn_sleep();
+    let ident = tavik_runtime::ProcessIdentity::from_pid(child.pid()).unwrap();
     assert!(ident.is_alive().unwrap());
 
-    // Simulate ENOSYS from pidfd_open
-    tavik_runtime::test_hooks::set_simulate_pidfd_open_errno(libc::ENOSYS);
+    // Simulate ENOSYS from pidfd_open using scoped thread-local injection
+    let _mock = ScopedMockSyscalls::set(MockSyscalls {
+        pidfd_open_errno: libc::ENOSYS,
+        ..Default::default()
+    });
 
     let res = ident.kill_safe();
     assert!(
@@ -3905,25 +3928,21 @@ fn test_pidfd_open_enosys_fails_unsupported_and_preserves_process() {
         ident.is_alive().unwrap(),
         "Process must not be killed when pidfd_open fails unsupported"
     );
-
-    tavik_runtime::test_hooks::reset();
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 #[test]
 fn test_pidfd_send_signal_enosys_fails_unsupported_and_preserves_process() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .unwrap();
-    let child_pid = child.id();
+    use tavik_runtime::test_hooks::{MockSyscalls, ScopedMockSyscalls};
 
-    let ident = tavik_runtime::ProcessIdentity::from_pid(child_pid).unwrap();
+    let child = ChildGuard::spawn_sleep();
+    let ident = tavik_runtime::ProcessIdentity::from_pid(child.pid()).unwrap();
     assert!(ident.is_alive().unwrap());
 
-    // Simulate ENOSYS from pidfd_send_signal
-    tavik_runtime::test_hooks::set_simulate_pidfd_send_signal_errno(libc::ENOSYS);
+    // Simulate ENOSYS from pidfd_send_signal using scoped thread-local injection
+    let _mock = ScopedMockSyscalls::set(MockSyscalls {
+        pidfd_send_signal_errno: libc::ENOSYS,
+        ..Default::default()
+    });
 
     let res = ident.kill_safe();
     assert!(
@@ -3937,73 +3956,156 @@ fn test_pidfd_send_signal_enosys_fails_unsupported_and_preserves_process() {
         ident.is_alive().unwrap(),
         "Process must not be killed when pidfd_send_signal fails unsupported"
     );
-
-    tavik_runtime::test_hooks::reset();
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 #[test]
 fn test_pidfd_poll_terminal_events_and_unexpected_conditions() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .unwrap();
-    let child_pid = child.id();
-
-    let ident = tavik_runtime::ProcessIdentity::from_pid(child_pid).unwrap();
-    assert!(ident.is_alive().unwrap());
+    use tavik_runtime::test_hooks::{MockSyscalls, ScopedMockSyscalls};
 
     // 1. POLLERR must be rejected as an error, NEVER treated as proof of termination!
-    tavik_runtime::test_hooks::set_simulate_pidfd_poll_revents(libc::POLLERR as i32);
-    let res_err = ident.kill_safe();
-    assert!(
-        res_err.is_err(),
-        "POLLERR must return an error rather than claiming termination"
-    );
-    match res_err {
-        Err(tavik_common::error::TavikError::Execution(msg)) => {
-            assert!(
-                msg.contains("Unexpected poll error event"),
-                "Error message was: {}",
-                msg
-            );
+    {
+        let child = ChildGuard::spawn_sleep();
+        let ident = tavik_runtime::ProcessIdentity::from_pid(child.pid()).unwrap();
+        let _mock = ScopedMockSyscalls::set(MockSyscalls {
+            poll_revents: Some(libc::POLLERR),
+            ..Default::default()
+        });
+        let res = ident.kill_safe();
+        match res {
+            Err(tavik_common::error::TavikError::Execution(msg)) => {
+                assert!(msg.contains("Unexpected poll error event 0x"));
+            }
+            other => panic!("Expected Execution error for POLLERR, got: {:?}", other),
         }
-        other => panic!("Expected Execution error for POLLERR, got: {:?}", other),
     }
 
     // 2. POLLNVAL must be rejected as an error
-    tavik_runtime::test_hooks::set_simulate_pidfd_poll_revents(libc::POLLNVAL as i32);
-    let res_nval = ident.kill_safe();
-    assert!(
-        res_nval.is_err(),
-        "POLLNVAL must return an error rather than claiming termination"
-    );
-    match res_nval {
-        Err(tavik_common::error::TavikError::Execution(msg)) => {
-            assert!(
-                msg.contains("Unexpected poll error event"),
-                "Error message was: {}",
-                msg
-            );
+    {
+        let child = ChildGuard::spawn_sleep();
+        let ident = tavik_runtime::ProcessIdentity::from_pid(child.pid()).unwrap();
+        let _mock = ScopedMockSyscalls::set(MockSyscalls {
+            poll_revents: Some(libc::POLLNVAL),
+            ..Default::default()
+        });
+        let res = ident.kill_safe();
+        match res {
+            Err(tavik_common::error::TavikError::Execution(msg)) => {
+                assert!(msg.contains("Unexpected poll error event 0x"));
+            }
+            other => panic!("Expected Execution error for POLLNVAL, got: {:?}", other),
         }
-        other => panic!("Expected Execution error for POLLNVAL, got: {:?}", other),
     }
 
-    // Reset test hooks
-    tavik_runtime::test_hooks::reset();
+    // 3. POLLIN | POLLERR must be rejected as an error even though POLLIN is present
+    {
+        let child = ChildGuard::spawn_sleep();
+        let ident = tavik_runtime::ProcessIdentity::from_pid(child.pid()).unwrap();
+        let _mock = ScopedMockSyscalls::set(MockSyscalls {
+            poll_revents: Some(libc::POLLIN | libc::POLLERR),
+            ..Default::default()
+        });
+        let res = ident.kill_safe();
+        match res {
+            Err(tavik_common::error::TavikError::Execution(msg)) => {
+                assert!(msg.contains("Unexpected poll error event 0x"));
+            }
+            other => panic!(
+                "Expected Execution error for POLLIN | POLLERR, got: {:?}",
+                other
+            ),
+        }
+    }
 
-    // 3. Normal safe kill succeeds and terminates the child
-    let ok_res = ident.kill_safe();
-    assert!(ok_res.is_ok(), "kill_safe must succeed: {:?}", ok_res.err());
-    assert!(!ident.is_alive().unwrap(), "Process must be terminated");
+    // 4. POLLHUP | POLLNVAL must be rejected as an error even though POLLHUP is present
+    {
+        let child = ChildGuard::spawn_sleep();
+        let ident = tavik_runtime::ProcessIdentity::from_pid(child.pid()).unwrap();
+        let _mock = ScopedMockSyscalls::set(MockSyscalls {
+            poll_revents: Some(libc::POLLHUP | libc::POLLNVAL),
+            ..Default::default()
+        });
+        let res = ident.kill_safe();
+        match res {
+            Err(tavik_common::error::TavikError::Execution(msg)) => {
+                assert!(msg.contains("Unexpected poll error event 0x"));
+            }
+            other => panic!(
+                "Expected Execution error for POLLHUP | POLLNVAL, got: {:?}",
+                other
+            ),
+        }
+    }
 
-    let _ = child.kill();
-    let _ = child.wait();
+    // 5. Unrequested readiness bit combined with POLLIN (e.g. POLLIN | POLLOUT) must be rejected
+    {
+        let child = ChildGuard::spawn_sleep();
+        let ident = tavik_runtime::ProcessIdentity::from_pid(child.pid()).unwrap();
+        let _mock = ScopedMockSyscalls::set(MockSyscalls {
+            poll_revents: Some(libc::POLLIN | libc::POLLOUT),
+            ..Default::default()
+        });
+        let res = ident.kill_safe();
+        match res {
+            Err(tavik_common::error::TavikError::Execution(msg)) => {
+                assert!(msg.contains("Unrequested poll readiness flags 0x"));
+            }
+            other => panic!(
+                "Expected Execution error for POLLIN | POLLOUT, got: {:?}",
+                other
+            ),
+        }
+    }
+
+    // 6. No readiness before timeout (mock returns 0 until deadline)
+    {
+        let child = ChildGuard::spawn_sleep();
+        let ident = tavik_runtime::ProcessIdentity::from_pid(child.pid()).unwrap();
+        let _mock = ScopedMockSyscalls::set(MockSyscalls {
+            poll_return: Some(0),
+            ..Default::default()
+        });
+        let res = ident.kill_safe();
+        match res {
+            Err(tavik_common::error::TavikError::Execution(msg)) => {
+                assert!(
+                    msg.contains("failed to terminate within timeout")
+                        || msg.contains("Timed out waiting for process")
+                );
+            }
+            other => panic!("Expected timeout Execution error, got: {:?}", other),
+        }
+    }
+
+    // 7. Interrupted poll (EINTR retry)
+    {
+        let child = ChildGuard::spawn_sleep();
+        let ident = tavik_runtime::ProcessIdentity::from_pid(child.pid()).unwrap();
+        let _mock = ScopedMockSyscalls::set(MockSyscalls {
+            poll_eintr_count: 1,
+            ..Default::default()
+        });
+        let res = ident.kill_safe();
+        assert!(
+            res.is_ok(),
+            "Interrupted poll must retry on EINTR and succeed: {:?}",
+            res
+        );
+    }
+
+    // 8. Normal terminal readiness (POLLIN / exit)
+    {
+        let child = ChildGuard::spawn_sleep();
+        let ident = tavik_runtime::ProcessIdentity::from_pid(child.pid()).unwrap();
+        let res = ident.kill_safe();
+        assert!(res.is_ok(), "kill_safe must succeed: {:?}", res);
+        assert!(!ident.is_alive().unwrap(), "Process must be terminated");
+    }
 }
 
 #[test]
 fn test_force_delete_with_pidfd_open_failure_retains_metadata_and_fails_unsupported() {
+    use tavik_runtime::test_hooks::{MockSyscalls, ScopedMockSyscalls};
+
     let temp = tempdir().unwrap();
     let state_dir = temp.path().join("state");
     let executor = ContainerExecutor::new(state_dir.clone()).unwrap();
@@ -4012,11 +4114,8 @@ fn test_force_delete_with_pidfd_open_failure_retains_metadata_and_fails_unsuppor
     fs::create_dir_all(&cont_dir).unwrap();
 
     // Spawn an init process
-    let mut child = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .unwrap();
-    let child_pid = child.id();
+    let child = ChildGuard::spawn_sleep();
+    let child_pid = child.pid();
 
     // Record dead supervisor identity
     let dead_sup_ident = tavik_runtime::ProcessIdentity::new(999999, 12345);
@@ -4055,8 +4154,11 @@ fn test_force_delete_with_pidfd_open_failure_retains_metadata_and_fails_unsuppor
     // control.sock is absent
     assert!(!cont_dir.join("control.sock").exists());
 
-    // Simulate ENOSYS from pidfd_open
-    tavik_runtime::test_hooks::set_simulate_pidfd_open_errno(libc::ENOSYS);
+    // Simulate ENOSYS from pidfd_open via scoped mock
+    let _mock = ScopedMockSyscalls::set(MockSyscalls {
+        pidfd_open_errno: libc::ENOSYS,
+        ..Default::default()
+    });
 
     let del_res = executor.delete(id, true);
     assert!(
@@ -4079,10 +4181,6 @@ fn test_force_delete_with_pidfd_open_failure_retains_metadata_and_fails_unsuppor
         real_init_ident.is_alive().unwrap(),
         "Child process must remain alive"
     );
-
-    tavik_runtime::test_hooks::reset();
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 #[test]
@@ -4094,14 +4192,49 @@ fn test_cgroup_fallback_enumeration_and_membership_filtering() {
             return;
         }
 
-        let mgr = tavik_cgroups::CgroupManager::new().unwrap();
-        if let Err(e) = mgr.validate_cgroup_v2() {
+        // Custom CgroupSysOps backend that forces the fallback path by reporting cgroup_kill_available = false
+        // while performing all actual kernel operations using DefaultCgroupSysOps without any marker files!
+        struct FallbackOnlySysOps(tavik_cgroups::DefaultCgroupSysOps);
+
+        impl tavik_cgroups::CgroupSysOps for FallbackOnlySysOps {
+            fn cgroup_kill_available(&self, _cgroup_dir: &Path) -> bool {
+                false
+            }
+            fn kill_cgroup(&self, cgroup_dir: &Path) -> Result<()> {
+                self.0.kill_cgroup(cgroup_dir)
+            }
+            fn read_procs(&self, cgroup_dir: &Path) -> Result<Vec<u32>> {
+                self.0.read_procs(cgroup_dir)
+            }
+            fn is_process_in_cgroup(&self, pid: u32, expected_rel_path: &Path) -> bool {
+                self.0.is_process_in_cgroup(pid, expected_rel_path)
+            }
+            fn pidfd_open(&self, pid: u32) -> Result<libc::c_int> {
+                self.0.pidfd_open(pid)
+            }
+            fn pidfd_send_signal(&self, pidfd: libc::c_int, sig: libc::c_int) -> Result<()> {
+                self.0.pidfd_send_signal(pidfd, sig)
+            }
+            fn remove_cgroup_dir(&self, cgroup_dir: &Path) -> Result<()> {
+                self.0.remove_cgroup_dir(cgroup_dir)
+            }
+        }
+
+        let default_mgr = tavik_cgroups::CgroupManager::new().unwrap();
+        if let Err(e) = default_mgr.validate_cgroup_v2() {
             eprintln!("Skipping cgroup fallback test: {}", e);
             return;
         }
 
         let container_id = format!("tavik-fb-test-{}", std::process::id());
-        let cgroup_dir = mgr.create_container_cgroup(&container_id).unwrap();
+        let fallback_mgr = tavik_cgroups::CgroupManager::with_sys_ops(
+            default_mgr.cgroup_root().to_path_buf(),
+            default_mgr.parent_path().to_path_buf(),
+            std::sync::Arc::new(FallbackOnlySysOps(tavik_cgroups::DefaultCgroupSysOps)),
+        )
+        .unwrap();
+
+        let cgroup_dir = fallback_mgr.create_container_cgroup(&container_id).unwrap();
         assert!(cgroup_dir.exists());
 
         // Spawn a child process and add to cgroup
@@ -4110,47 +4243,13 @@ fn test_cgroup_fallback_enumeration_and_membership_filtering() {
             .spawn()
             .expect("Failed to spawn child");
         let child_pid = child.id();
-        mgr.add_process(&container_id, child_pid).unwrap();
+        fallback_mgr.add_process(&container_id, child_pid).unwrap();
 
-        // 1. Test simulated read failure of cgroup.procs
-        fs::write(cgroup_dir.join(".simulate_procs_read_fail"), b"1").unwrap();
-        let err_procs = mgr.destroy_container_cgroup(&container_id);
-        assert!(err_procs.is_err(), "Must fail when procs read fails");
-        assert!(
-            cgroup_dir.exists(),
-            "Cgroup directory must remain after error"
-        );
-        let _ = fs::remove_file(cgroup_dir.join(".simulate_procs_read_fail"));
+        let procs = fallback_mgr.get_processes(&container_id).unwrap();
+        assert!(procs.contains(&child_pid));
 
-        // 2. Test simulated pidfd_open failure
-        fs::write(cgroup_dir.join(".simulate_disable_cgroup_kill"), b"1").unwrap();
-        fs::write(cgroup_dir.join(".simulate_pidfd_open_fail"), b"1").unwrap();
-        let err_open = mgr.destroy_container_cgroup(&container_id);
-        assert!(matches!(
-            err_open,
-            Err(tavik_common::error::TavikError::Unsupported(_))
-        ));
-        assert!(
-            cgroup_dir.exists(),
-            "Cgroup directory must remain after unsupported error"
-        );
-        let _ = fs::remove_file(cgroup_dir.join(".simulate_pidfd_open_fail"));
-
-        // 3. Test simulated pidfd_send_signal failure
-        fs::write(cgroup_dir.join(".simulate_pidfd_send_signal_fail"), b"1").unwrap();
-        let err_sig = mgr.destroy_container_cgroup(&container_id);
-        assert!(matches!(
-            err_sig,
-            Err(tavik_common::error::TavikError::Unsupported(_))
-        ));
-        assert!(
-            cgroup_dir.exists(),
-            "Cgroup directory must remain after unsupported error"
-        );
-        let _ = fs::remove_file(cgroup_dir.join(".simulate_pidfd_send_signal_fail"));
-
-        // 4. Test normal fallback termination (with cgroup.kill disabled)
-        let ok_destroy = mgr.destroy_container_cgroup(&container_id);
+        // Destroy cgroup via fallback path (cgroup.kill disabled via FallbackOnlySysOps)
+        let ok_destroy = fallback_mgr.destroy_container_cgroup(&container_id);
         assert!(
             ok_destroy.is_ok(),
             "Fallback destruction must succeed: {:?}",
@@ -4226,19 +4325,30 @@ fn test_e2e_real_supervisor_unexpected_exit_and_force_delete() {
                 .expect("Supervisor identity must exist");
         let sup_pid = sup_ident.pid;
 
-        // Verify both supervisor and init are alive
-        assert_eq!(unsafe { libc::kill(sup_pid as libc::pid_t, 0) }, 0);
-        assert_eq!(unsafe { libc::kill(init_pid as libc::pid_t, 0) }, 0);
+        // Verify both supervisor and init are alive via ProcessIdentity
+        let init_ident = tavik_runtime::ProcessIdentity::from_pid(init_pid)
+            .expect("Init identity must be resolvable");
+        assert!(sup_ident.is_alive().unwrap_or(false));
+        assert!(init_ident.is_alive().unwrap_or(false));
 
         // Unexpectedly terminate the supervisor with SIGKILL
         let kill_ret = unsafe { libc::kill(sup_pid as libc::pid_t, libc::SIGKILL) };
         assert_eq!(kill_ret, 0, "SIGKILL supervisor must succeed");
 
-        // Give kernel a moment to deliver signal and exit supervisor
-        std::thread::sleep(Duration::from_millis(50));
-
-        // Confirm supervisor is gone
-        assert_ne!(unsafe { libc::kill(sup_pid as libc::pid_t, 0) }, 0);
+        // Dynamically poll until supervisor identity is confirmed dead
+        let sup_dead_deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+        let mut sup_is_dead = false;
+        while std::time::Instant::now() < sup_dead_deadline {
+            if !sup_ident.is_alive().unwrap_or(false) {
+                sup_is_dead = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            sup_is_dead,
+            "Supervisor must be confirmed dead by identity check"
+        );
 
         // Control socket is now stale/unresponsive
         // Execute forced deletion
@@ -4249,12 +4359,19 @@ fn test_e2e_real_supervisor_unexpected_exit_and_force_delete() {
             del_res.err()
         );
 
-        // Verify init process is terminated
-        std::thread::sleep(Duration::from_millis(50));
-        assert_ne!(
-            unsafe { libc::kill(init_pid as libc::pid_t, 0) },
-            0,
-            "Init process must be terminated"
+        // Verify init identity is confirmed terminated (using ProcessIdentity::is_alive())
+        assert!(
+            !init_ident.is_alive().unwrap_or(false),
+            "Init process must be confirmed terminated by ProcessIdentity"
+        );
+
+        // Verify cgroup has no remaining processes
+        let cgroup_mgr = tavik_cgroups::CgroupManager::new().unwrap();
+        let remaining_procs = cgroup_mgr.get_processes(id).unwrap_or_default();
+        assert!(
+            remaining_procs.is_empty(),
+            "Cgroup must contain no remaining processes: {:?}",
+            remaining_procs
         );
 
         // Verify container state directory is retired

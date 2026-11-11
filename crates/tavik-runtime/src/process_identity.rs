@@ -31,9 +31,12 @@ fn get_process_stat_macos(pid: u32) -> Result<u64> {
                 pid
             )));
         }
-        return Err(TavikError::NotFound(format!("Process {} not found", pid)));
+        return Err(TavikError::Io(format!(
+            "proc_pidinfo failed for PID {}: {}",
+            pid, err
+        )));
     }
-    Ok(info.pbi_start_tvsec)
+    Ok((info.pbi_start_tvsec as u64) * 1_000_000 + (info.pbi_start_tvusec as u64))
 }
 
 #[cfg(target_os = "linux")]
@@ -80,42 +83,47 @@ fn get_process_stat_linux(pid: u32) -> Result<(char, u64)> {
     Ok((state_char, start_time))
 }
 
-#[doc(hidden)]
+#[cfg(feature = "test-hooks")]
 pub mod test_hooks {
-    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::cell::RefCell;
 
-    static SIMULATE_PIDFD_OPEN_ERRNO: AtomicI32 = AtomicI32::new(0);
-    static SIMULATE_PIDFD_SEND_SIGNAL_ERRNO: AtomicI32 = AtomicI32::new(0);
-    static SIMULATE_PIDFD_POLL_REVENTS: AtomicI32 = AtomicI32::new(-1);
-
-    pub fn set_simulate_pidfd_open_errno(errno: i32) {
-        SIMULATE_PIDFD_OPEN_ERRNO.store(errno, Ordering::SeqCst);
+    #[derive(Default, Clone, Copy, Debug)]
+    pub struct MockSyscalls {
+        pub pidfd_open_errno: i32,
+        pub pidfd_send_signal_errno: i32,
+        pub poll_revents: Option<i16>,
+        pub poll_return: Option<i32>,
+        pub poll_errno: i32,
+        pub poll_eintr_count: u32,
     }
 
-    pub fn set_simulate_pidfd_send_signal_errno(errno: i32) {
-        SIMULATE_PIDFD_SEND_SIGNAL_ERRNO.store(errno, Ordering::SeqCst);
+    thread_local! {
+        static MOCK_STATE: RefCell<MockSyscalls> = RefCell::new(MockSyscalls::default());
     }
 
-    pub fn set_simulate_pidfd_poll_revents(revents: i32) {
-        SIMULATE_PIDFD_POLL_REVENTS.store(revents, Ordering::SeqCst);
+    pub struct ScopedMockSyscalls(MockSyscalls);
+
+    impl ScopedMockSyscalls {
+        pub fn set(mocks: MockSyscalls) -> Self {
+            let prev = MOCK_STATE.with(|s| {
+                let old = *s.borrow();
+                *s.borrow_mut() = mocks;
+                old
+            });
+            Self(prev)
+        }
     }
 
-    pub fn get_simulate_pidfd_open_errno() -> i32 {
-        SIMULATE_PIDFD_OPEN_ERRNO.load(Ordering::SeqCst)
+    impl Drop for ScopedMockSyscalls {
+        fn drop(&mut self) {
+            MOCK_STATE.with(|s| {
+                *s.borrow_mut() = self.0;
+            });
+        }
     }
 
-    pub fn get_simulate_pidfd_send_signal_errno() -> i32 {
-        SIMULATE_PIDFD_SEND_SIGNAL_ERRNO.load(Ordering::SeqCst)
-    }
-
-    pub fn get_simulate_pidfd_poll_revents() -> i32 {
-        SIMULATE_PIDFD_POLL_REVENTS.load(Ordering::SeqCst)
-    }
-
-    pub fn reset() {
-        SIMULATE_PIDFD_OPEN_ERRNO.store(0, Ordering::SeqCst);
-        SIMULATE_PIDFD_SEND_SIGNAL_ERRNO.store(0, Ordering::SeqCst);
-        SIMULATE_PIDFD_POLL_REVENTS.store(-1, Ordering::SeqCst);
+    pub fn with_mocks<R>(f: impl FnOnce(&mut MockSyscalls) -> R) -> R {
+        MOCK_STATE.with(|s| f(&mut s.borrow_mut()))
     }
 }
 
@@ -251,7 +259,11 @@ impl ProcessIdentity {
 
         #[cfg(target_os = "linux")]
         {
-            let sim_open = test_hooks::get_simulate_pidfd_open_errno();
+            #[cfg(feature = "test-hooks")]
+            let sim_open = test_hooks::with_mocks(|m| m.pidfd_open_errno);
+            #[cfg(not(feature = "test-hooks"))]
+            let sim_open = 0;
+
             let pfd = if sim_open != 0 {
                 unsafe { *libc::__errno_location() = sim_open };
                 -1
@@ -289,7 +301,11 @@ impl ProcessIdentity {
                 return Ok(());
             }
 
-            let sim_sig = test_hooks::get_simulate_pidfd_send_signal_errno();
+            #[cfg(feature = "test-hooks")]
+            let sim_sig = test_hooks::with_mocks(|m| m.pidfd_send_signal_errno);
+            #[cfg(not(feature = "test-hooks"))]
+            let sim_sig = 0;
+
             let sig_ret = if sim_sig != 0 {
                 unsafe { *libc::__errno_location() = sim_sig };
                 -1
@@ -340,43 +356,75 @@ impl ProcessIdentity {
                     events: libc::POLLIN,
                     revents: 0,
                 };
-                let sim_poll = test_hooks::get_simulate_pidfd_poll_revents();
-                let poll_ret = if sim_poll >= 0 {
-                    pollfd.revents = sim_poll as libc::c_short;
+
+                #[cfg(feature = "test-hooks")]
+                let (poll_ret, poll_revents, poll_errno, eintr_remaining) =
+                    test_hooks::with_mocks(|m| {
+                        let eintr = if m.poll_eintr_count > 0 {
+                            m.poll_eintr_count -= 1;
+                            true
+                        } else {
+                            false
+                        };
+                        (m.poll_return, m.poll_revents, m.poll_errno, eintr)
+                    });
+                #[cfg(not(feature = "test-hooks"))]
+                let (poll_ret, poll_revents, poll_errno, eintr_remaining): (
+                    Option<i32>,
+                    Option<i16>,
+                    i32,
+                    bool,
+                ) = (None, None, 0, false);
+
+                let poll_res = if eintr_remaining {
+                    unsafe { *libc::__errno_location() = libc::EINTR };
+                    -1
+                } else if let Some(ret) = poll_ret {
+                    if let Some(rev) = poll_revents {
+                        pollfd.revents = rev;
+                    }
+                    if ret < 0 && poll_errno != 0 {
+                        unsafe { *libc::__errno_location() = poll_errno };
+                    }
+                    ret
+                } else if let Some(rev) = poll_revents {
+                    pollfd.revents = rev;
                     1
                 } else {
                     unsafe { libc::poll(&mut pollfd, 1, rem_ms) }
                 };
-                if poll_ret < 0 {
+
+                if poll_res < 0 {
                     let err = std::io::Error::last_os_error();
                     if err.raw_os_error() == Some(libc::EINTR) {
                         continue;
                     }
                     return Err(TavikError::Io(format!("Failed to poll pidfd: {}", err)));
                 }
-                if poll_ret > 0 {
-                    let is_terminal = (pollfd.revents & (libc::POLLIN | libc::POLLHUP)) != 0;
-                    let is_err = (pollfd.revents & (libc::POLLERR | libc::POLLNVAL)) != 0;
+                if poll_res > 0 {
+                    let revents = pollfd.revents;
 
-                    if is_terminal {
-                        // POLLIN indicates process exit and zombie state.
-                        // POLLHUP indicates process has been reaped.
-                        // Establish actual termination before declaring success.
-                        if !self.is_alive()? {
-                            terminated = true;
-                            break;
-                        }
-                    } else if is_err {
-                        // Never treat POLLERR or POLLNVAL as proof of termination!
+                    // 1. Reject POLLERR and POLLNVAL regardless of whether terminal readiness flags are also present.
+                    if (revents & (libc::POLLERR | libc::POLLNVAL)) != 0 {
                         return Err(TavikError::Execution(format!(
                             "Unexpected poll error event 0x{:x} on pidfd for PID {}",
-                            pollfd.revents, self.pid
+                            revents, self.pid
                         )));
-                    } else {
+                    }
+
+                    // 2. Reject every unrequested readiness flag.
+                    let unrequested = revents & !(libc::POLLIN | libc::POLLHUP);
+                    if unrequested != 0 {
                         return Err(TavikError::Execution(format!(
-                            "Unexpected poll readiness event 0x{:x} on pidfd for PID {}",
-                            pollfd.revents, self.pid
+                            "Unrequested poll readiness flags 0x{:x} (full revents 0x{:x}) on pidfd for PID {}",
+                            unrequested, revents, self.pid
                         )));
+                    }
+
+                    // 3. Only accept documented terminal readiness bits after validating the entire returned event mask.
+                    if (revents & (libc::POLLIN | libc::POLLHUP)) != 0 && !self.is_alive()? {
+                        terminated = true;
+                        break;
                     }
                 }
                 if !self.is_alive()? {
@@ -398,25 +446,70 @@ impl ProcessIdentity {
 
         #[cfg(not(target_os = "linux"))]
         {
-            let sim_open = test_hooks::get_simulate_pidfd_open_errno();
-            if sim_open == libc::ENOSYS {
-                return Err(TavikError::Unsupported(
-                    "Safe race-free forced termination requires Linux SYS_pidfd_open support"
-                        .into(),
-                ));
-            }
-            let sim_sig = test_hooks::get_simulate_pidfd_send_signal_errno();
-            if sim_sig == libc::ENOSYS {
-                return Err(TavikError::Unsupported(
-                    "Safe race-free forced termination requires Linux SYS_pidfd_send_signal support".into(),
-                ));
-            }
-            let sim_poll = test_hooks::get_simulate_pidfd_poll_revents();
-            if sim_poll >= 0 && (sim_poll & (libc::POLLERR as i32 | libc::POLLNVAL as i32)) != 0 {
-                return Err(TavikError::Execution(format!(
-                    "Unexpected poll error event 0x{:x} on pidfd for PID {}",
-                    sim_poll, self.pid
-                )));
+            #[cfg(feature = "test-hooks")]
+            {
+                let (sim_open, sim_sig, sim_revents, sim_ret, sim_errno, eintr_remaining) =
+                    test_hooks::with_mocks(|m| {
+                        let eintr = if m.poll_eintr_count > 0 {
+                            m.poll_eintr_count -= 1;
+                            true
+                        } else {
+                            false
+                        };
+                        (
+                            m.pidfd_open_errno,
+                            m.pidfd_send_signal_errno,
+                            m.poll_revents,
+                            m.poll_return,
+                            m.poll_errno,
+                            eintr,
+                        )
+                    });
+
+                if sim_open == libc::ENOSYS {
+                    return Err(TavikError::Unsupported(
+                        "Safe race-free forced termination requires Linux SYS_pidfd_open support"
+                            .into(),
+                    ));
+                }
+                if sim_sig == libc::ENOSYS {
+                    return Err(TavikError::Unsupported(
+                        "Safe race-free forced termination requires Linux SYS_pidfd_send_signal support".into(),
+                    ));
+                }
+                if let Some(revents) = sim_revents {
+                    // 1. Reject POLLERR and POLLNVAL
+                    if (revents & (libc::POLLERR | libc::POLLNVAL)) != 0 {
+                        return Err(TavikError::Execution(format!(
+                            "Unexpected poll error event 0x{:x} on pidfd for PID {}",
+                            revents, self.pid
+                        )));
+                    }
+                    // 2. Reject unrequested flags
+                    let unrequested = revents & !(libc::POLLIN | libc::POLLHUP);
+                    if unrequested != 0 {
+                        return Err(TavikError::Execution(format!(
+                            "Unrequested poll readiness flags 0x{:x} (full revents 0x{:x}) on pidfd for PID {}",
+                            unrequested, revents, self.pid
+                        )));
+                    }
+                }
+                if eintr_remaining {
+                    // simulated EINTR retry
+                } else if let Some(ret) = sim_ret {
+                    if ret == 0 {
+                        return Err(TavikError::Execution(format!(
+                            "Timed out waiting for process {} to terminate",
+                            self.pid
+                        )));
+                    }
+                    if ret < 0 && sim_errno != libc::EINTR {
+                        return Err(TavikError::Io(format!(
+                            "Failed to poll pidfd: simulated error {}",
+                            sim_errno
+                        )));
+                    }
+                }
             }
 
             let ret = unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGKILL) };
@@ -461,5 +554,18 @@ impl ProcessIdentity {
         let content = fs::read_to_string(path)?;
         let ident: Self = serde_json::from_str(&content)?;
         Ok(ident)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_production_build_has_no_active_test_hooks() {
+        // When compiled without the `test-hooks` feature (default production build),
+        // test-hooks feature is not active.
+        #[cfg(not(feature = "test-hooks"))]
+        {
+            assert!(!cfg!(feature = "test-hooks"));
+        }
     }
 }

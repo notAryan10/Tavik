@@ -112,3 +112,263 @@ fn test_linux_cgroup_lifecycle() {
         let _ = child.wait();
     }
 }
+
+#[cfg(target_os = "linux")]
+mod mock_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tavik_cgroups::CgroupSysOps;
+    use tavik_common::error::{Result, TavikError};
+
+    #[derive(Default)]
+    struct MockCgroupSysOps {
+        cgroup_kill_supported: AtomicBool,
+        kill_cgroup_err: Mutex<Option<String>>,
+        read_procs_queue: Mutex<VecDeque<Result<Vec<u32>>>>,
+        in_cgroup_pids: Mutex<HashSet<u32>>,
+        pidfd_open_results: Mutex<HashMap<u32, Result<libc::c_int>>>,
+        pidfd_send_signal_err: Mutex<Option<TavikError>>,
+        opened_pids: Mutex<Vec<u32>>,
+        signaled_fds: Mutex<Vec<(libc::c_int, libc::c_int)>>,
+        removed_dirs: Mutex<Vec<PathBuf>>,
+    }
+
+    impl CgroupSysOps for MockCgroupSysOps {
+        fn cgroup_kill_available(&self, _cgroup_dir: &Path) -> bool {
+            self.cgroup_kill_supported.load(Ordering::SeqCst)
+        }
+
+        fn kill_cgroup(&self, _cgroup_dir: &Path) -> Result<()> {
+            if let Some(err) = self.kill_cgroup_err.lock().unwrap().as_ref() {
+                return Err(TavikError::Io(err.clone()));
+            }
+            Ok(())
+        }
+
+        fn read_procs(&self, _cgroup_dir: &Path) -> Result<Vec<u32>> {
+            let mut queue = self.read_procs_queue.lock().unwrap();
+            if let Some(res) = queue.pop_front() {
+                res
+            } else {
+                Ok(Vec::new())
+            }
+        }
+
+        fn is_process_in_cgroup(&self, pid: u32, _expected_rel_path: &Path) -> bool {
+            self.in_cgroup_pids.lock().unwrap().contains(&pid)
+        }
+
+        fn pidfd_open(&self, pid: u32) -> Result<libc::c_int> {
+            self.opened_pids.lock().unwrap().push(pid);
+            if let Some(res) = self.pidfd_open_results.lock().unwrap().remove(&pid) {
+                res
+            } else {
+                Ok(100 + pid as libc::c_int)
+            }
+        }
+
+        fn pidfd_send_signal(&self, pidfd: libc::c_int, sig: libc::c_int) -> Result<()> {
+            self.signaled_fds.lock().unwrap().push((pidfd, sig));
+            if let Some(err) = self.pidfd_send_signal_err.lock().unwrap().clone() {
+                return Err(err);
+            }
+            Ok(())
+        }
+
+        fn remove_cgroup_dir(&self, cgroup_dir: &Path) -> Result<()> {
+            self.removed_dirs
+                .lock()
+                .unwrap()
+                .push(cgroup_dir.to_path_buf());
+            let _ = std::fs::remove_dir(cgroup_dir);
+            Ok(())
+        }
+    }
+
+    fn setup_mock_manager() -> (tempfile::TempDir, Arc<MockCgroupSysOps>, CgroupManager) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("cgroup");
+        let parent = root.join("tavik");
+        std::fs::create_dir_all(&parent).unwrap();
+
+        let ops = Arc::new(MockCgroupSysOps::default());
+        let mgr = CgroupManager::with_sys_ops(root, parent, ops.clone()).unwrap();
+        (temp, ops, mgr)
+    }
+
+    #[test]
+    fn test_cgroup_idempotent_cleanup() {
+        let (_temp, _ops, mgr) = setup_mock_manager();
+        // Destroying non-existent container cgroup returns Ok(())
+        let res = mgr.destroy_container_cgroup("nonexistent");
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn test_cgroup_procs_read_failure_fails_closed_and_preserves_dir() {
+        let (_temp, ops, mgr) = setup_mock_manager();
+        let container_id = "test-fail-read-procs";
+        let cgroup_dir = mgr.parent_path().join(container_id);
+        std::fs::create_dir_all(&cgroup_dir).unwrap();
+
+        ops.cgroup_kill_supported.store(false, Ordering::SeqCst);
+        ops.read_procs_queue
+            .lock()
+            .unwrap()
+            .push_back(Err(TavikError::Io(
+                "simulated io error reading procs".into(),
+            )));
+
+        let res = mgr.destroy_container_cgroup(container_id);
+        assert!(res.is_err());
+        match res {
+            Err(TavikError::Io(msg)) => assert!(msg.contains("simulated io error")),
+            other => panic!("Expected Io error, got: {:?}", other),
+        }
+
+        // Cgroup directory must be preserved
+        assert!(cgroup_dir.exists());
+        assert!(ops.removed_dirs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_cgroup_fallback_unsupported_pidfd_open_preserves_dir() {
+        let (_temp, ops, mgr) = setup_mock_manager();
+        let container_id = "test-unsupported-pidfd-open";
+        let cgroup_dir = mgr.parent_path().join(container_id);
+        std::fs::create_dir_all(&cgroup_dir).unwrap();
+
+        ops.cgroup_kill_supported.store(false, Ordering::SeqCst);
+        ops.read_procs_queue
+            .lock()
+            .unwrap()
+            .push_back(Ok(vec![101]));
+        ops.in_cgroup_pids.lock().unwrap().insert(101);
+        ops.pidfd_open_results.lock().unwrap().insert(
+            101,
+            Err(TavikError::Unsupported(
+                "Safe cgroup process termination requires Linux SYS_pidfd_open support".into(),
+            )),
+        );
+
+        let res = mgr.destroy_container_cgroup(container_id);
+        assert!(matches!(res, Err(TavikError::Unsupported(_))));
+        assert!(cgroup_dir.exists());
+        assert!(ops.removed_dirs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_cgroup_fallback_unsupported_pidfd_send_signal_preserves_dir() {
+        let (_temp, ops, mgr) = setup_mock_manager();
+        let container_id = "test-unsupported-pidfd-signal";
+        let cgroup_dir = mgr.parent_path().join(container_id);
+        std::fs::create_dir_all(&cgroup_dir).unwrap();
+
+        ops.cgroup_kill_supported.store(false, Ordering::SeqCst);
+        ops.read_procs_queue
+            .lock()
+            .unwrap()
+            .push_back(Ok(vec![101]));
+        ops.in_cgroup_pids.lock().unwrap().insert(101);
+        *ops.pidfd_send_signal_err.lock().unwrap() = Some(TavikError::Unsupported(
+            "Safe cgroup process termination requires Linux SYS_pidfd_send_signal support".into(),
+        ));
+
+        let res = mgr.destroy_container_cgroup(container_id);
+        assert!(matches!(res, Err(TavikError::Unsupported(_))));
+        assert!(cgroup_dir.exists());
+        assert!(ops.removed_dirs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_cgroup_fallback_membership_mismatch_skips_unowned_process() {
+        let (_temp, ops, mgr) = setup_mock_manager();
+        let container_id = "test-membership-mismatch";
+        let cgroup_dir = mgr.parent_path().join(container_id);
+        std::fs::create_dir_all(&cgroup_dir).unwrap();
+
+        ops.cgroup_kill_supported.store(false, Ordering::SeqCst);
+        // Initial list has 101 and 102
+        ops.read_procs_queue
+            .lock()
+            .unwrap()
+            .push_back(Ok(vec![101, 102]));
+        // Subsequent poll shows empty
+        ops.read_procs_queue.lock().unwrap().push_back(Ok(vec![]));
+
+        // Only 102 is actually enrolled; 101 migrated out or PID was reused
+        ops.in_cgroup_pids.lock().unwrap().insert(102);
+
+        let res = mgr.destroy_container_cgroup(container_id);
+        assert!(res.is_ok(), "Expected success, got: {:?}", res);
+
+        let opened = ops.opened_pids.lock().unwrap();
+        assert!(
+            !opened.contains(&101),
+            "Unowned PID 101 must not have been opened!"
+        );
+        assert!(opened.contains(&102), "Owned PID 102 must have been opened");
+
+        assert!(!cgroup_dir.exists());
+    }
+
+    #[test]
+    fn test_cgroup_fallback_successful_enumeration_and_termination() {
+        let (_temp, ops, mgr) = setup_mock_manager();
+        let container_id = "test-fallback-success";
+        let cgroup_dir = mgr.parent_path().join(container_id);
+        std::fs::create_dir_all(&cgroup_dir).unwrap();
+
+        ops.cgroup_kill_supported.store(false, Ordering::SeqCst);
+        ops.read_procs_queue
+            .lock()
+            .unwrap()
+            .push_back(Ok(vec![201, 202]));
+        ops.read_procs_queue.lock().unwrap().push_back(Ok(vec![]));
+
+        ops.in_cgroup_pids.lock().unwrap().insert(201);
+        ops.in_cgroup_pids.lock().unwrap().insert(202);
+
+        let res = mgr.destroy_container_cgroup(container_id);
+        assert!(res.is_ok(), "Expected success, got: {:?}", res);
+
+        let signaled = ops.signaled_fds.lock().unwrap();
+        assert_eq!(signaled.len(), 2, "Both processes must be signaled");
+        assert_eq!(signaled[0].1, libc::SIGKILL);
+        assert_eq!(signaled[1].1, libc::SIGKILL);
+
+        assert!(!cgroup_dir.exists());
+    }
+
+    #[test]
+    fn test_cgroup_remaining_processes_verification_fails() {
+        let (_temp, ops, mgr) = setup_mock_manager();
+        let container_id = "test-remaining-procs-fail";
+        let cgroup_dir = mgr.parent_path().join(container_id);
+        std::fs::create_dir_all(&cgroup_dir).unwrap();
+
+        ops.cgroup_kill_supported.store(false, Ordering::SeqCst);
+        // Processes remain active after termination signal
+        for _ in 0..12 {
+            ops.read_procs_queue
+                .lock()
+                .unwrap()
+                .push_back(Ok(vec![301]));
+        }
+        ops.in_cgroup_pids.lock().unwrap().insert(301);
+
+        let res = mgr.destroy_container_cgroup(container_id);
+        assert!(res.is_err());
+        match res {
+            Err(TavikError::Execution(msg)) => {
+                assert!(msg.contains("still contains 1 active process(es)"));
+            }
+            other => panic!("Expected Execution error, got: {:?}", other),
+        }
+
+        assert!(cgroup_dir.exists());
+    }
+}

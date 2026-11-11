@@ -1,6 +1,7 @@
 use crate::resources::{CgroupResources, CgroupStats};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tavik_common::error::{Result, TavikError};
 #[allow(unused_imports)]
 use tracing::{debug, info, warn};
@@ -11,13 +12,196 @@ pub const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
 /// Default TAVIK parent group under the cgroup v2 hierarchy.
 pub const DEFAULT_TAVIK_PARENT: &str = "tavik";
 
+/// Abstraction for low-level system operations on cgroup v2 interface files and process signalling.
+pub trait CgroupSysOps: Send + Sync {
+    /// Checks if atomic `cgroup.kill` is supported/available for this cgroup dir.
+    fn cgroup_kill_available(&self, cgroup_dir: &Path) -> bool;
+
+    /// Writes "1" to `cgroup.kill` to atomically kill all processes in the cgroup.
+    fn kill_cgroup(&self, cgroup_dir: &Path) -> Result<()>;
+
+    /// Reads host PIDs currently enrolled in `cgroup.procs`.
+    fn read_procs(&self, cgroup_dir: &Path) -> Result<Vec<u32>>;
+
+    /// Checks if a process belongs to the expected relative cgroup path.
+    fn is_process_in_cgroup(&self, pid: u32, expected_rel_path: &Path) -> bool;
+
+    /// Opens a pidfd for the process.
+    fn pidfd_open(&self, pid: u32) -> Result<libc::c_int>;
+
+    /// Sends a signal (e.g. SIGKILL) to the pidfd.
+    fn pidfd_send_signal(&self, pidfd: libc::c_int, sig: libc::c_int) -> Result<()>;
+
+    /// Removes the cgroup directory.
+    fn remove_cgroup_dir(&self, cgroup_dir: &Path) -> Result<()>;
+}
+
+/// Default production implementation of `CgroupSysOps` using real Linux kernel control files and syscalls.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DefaultCgroupSysOps;
+
+impl CgroupSysOps for DefaultCgroupSysOps {
+    fn cgroup_kill_available(&self, cgroup_dir: &Path) -> bool {
+        cgroup_dir.join("cgroup.kill").exists()
+    }
+
+    fn kill_cgroup(&self, cgroup_dir: &Path) -> Result<()> {
+        let kill_file = cgroup_dir.join("cgroup.kill");
+        fs::write(&kill_file, "1").map_err(|e| {
+            TavikError::Io(format!(
+                "Failed to write to cgroup.kill at {:?}: {}",
+                kill_file, e
+            ))
+        })
+    }
+
+    fn read_procs(&self, cgroup_dir: &Path) -> Result<Vec<u32>> {
+        let procs_file = cgroup_dir.join("cgroup.procs");
+        if !procs_file.exists() {
+            return Ok(Vec::new());
+        }
+
+        let content = fs::read_to_string(&procs_file)
+            .map_err(|e| TavikError::Io(format!("Failed to read {:?}: {}", procs_file, e)))?;
+
+        let mut pids = Vec::new();
+        for line in content.lines() {
+            if let Ok(pid) = line.trim().parse::<u32>() {
+                pids.push(pid);
+            }
+        }
+        Ok(pids)
+    }
+
+    fn is_process_in_cgroup(&self, pid: u32, expected_rel_path: &Path) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            let proc_cgroup_path = format!("/proc/{}/cgroup", pid);
+            if let Ok(content) = fs::read_to_string(&proc_cgroup_path) {
+                let expected_str = expected_rel_path.to_string_lossy();
+                let expected_trimmed = expected_str.trim_start_matches('/');
+                for line in content.lines() {
+                    if let Some(cgroup_path) = line.strip_prefix("0::") {
+                        let trimmed = cgroup_path.trim_start_matches('/');
+                        if trimmed == expected_trimmed {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (pid, expected_rel_path);
+            false
+        }
+    }
+
+    fn pidfd_open(&self, pid: u32) -> Result<libc::c_int> {
+        #[cfg(target_os = "linux")]
+        {
+            let pfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as libc::c_int };
+            if pfd < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::ESRCH) {
+                    return Err(TavikError::NotFound(format!("Process {} not found", pid)));
+                } else if err.raw_os_error() == Some(libc::ENOSYS) {
+                    return Err(TavikError::Unsupported(
+                        "Safe cgroup process termination requires Linux SYS_pidfd_open support"
+                            .into(),
+                    ));
+                } else {
+                    return Err(TavikError::Io(format!(
+                        "Failed to open pidfd for process {}: {}",
+                        pid, err
+                    )));
+                }
+            }
+            Ok(pfd)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pid;
+            Err(TavikError::Unsupported(
+                "cgroups v2 requires a Linux kernel".to_string(),
+            ))
+        }
+    }
+
+    fn pidfd_send_signal(&self, pidfd: libc::c_int, sig: libc::c_int) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    pidfd,
+                    sig,
+                    std::ptr::null::<libc::c_void>(),
+                    0,
+                )
+            };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::ESRCH) {
+                    return Err(TavikError::NotFound(format!(
+                        "Process for pidfd {} not found",
+                        pidfd
+                    )));
+                } else if err.raw_os_error() == Some(libc::ENOSYS) {
+                    return Err(TavikError::Unsupported(
+                        "Safe cgroup process termination requires Linux SYS_pidfd_send_signal support".into(),
+                    ));
+                } else {
+                    return Err(TavikError::Io(format!(
+                        "Failed to send signal to pidfd {}: {}",
+                        pidfd, err
+                    )));
+                }
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (pidfd, sig);
+            Err(TavikError::Unsupported(
+                "cgroups v2 requires a Linux kernel".to_string(),
+            ))
+        }
+    }
+
+    fn remove_cgroup_dir(&self, cgroup_dir: &Path) -> Result<()> {
+        if let Err(e) = fs::remove_dir(cgroup_dir) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(TavikError::Io(format!(
+                    "Failed to remove container cgroup directory at {:?}: {}",
+                    cgroup_dir, e
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Manager for Linux cgroups v2 resource governance and lifecycle.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CgroupManager {
     /// Root mount point of cgroups v2 (e.g. `/sys/fs/cgroup`).
     cgroup_root: PathBuf,
     /// Dedicated parent cgroup path (e.g. `/sys/fs/cgroup/tavik`).
     parent_path: PathBuf,
+    /// Low-level system operations backend.
+    #[allow(dead_code)]
+    sys_ops: Arc<dyn CgroupSysOps>,
+}
+
+impl std::fmt::Debug for CgroupManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CgroupManager")
+            .field("cgroup_root", &self.cgroup_root)
+            .field("parent_path", &self.parent_path)
+            .finish()
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -32,24 +216,6 @@ impl Drop for FdGuard {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn is_process_in_cgroup(pid: u32, expected_rel_path: &Path) -> bool {
-    let proc_cgroup_path = format!("/proc/{}/cgroup", pid);
-    if let Ok(content) = fs::read_to_string(&proc_cgroup_path) {
-        let expected_str = expected_rel_path.to_string_lossy();
-        let expected_trimmed = expected_str.trim_start_matches('/');
-        for line in content.lines() {
-            if let Some(cgroup_path) = line.strip_prefix("0::") {
-                let trimmed = cgroup_path.trim_start_matches('/');
-                if trimmed == expected_trimmed {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
 impl CgroupManager {
     /// Constructs a CgroupManager pointing to the default `/sys/fs/cgroup/tavik` parent hierarchy.
     pub fn new() -> Result<Self> {
@@ -59,8 +225,17 @@ impl CgroupManager {
         )
     }
 
-    /// Constructs a CgroupManager with customized root and parent paths (useful for tests and custom slices).
+    /// Constructs a CgroupManager with customized root and parent paths.
     pub fn with_paths(cgroup_root: PathBuf, parent_path: PathBuf) -> Result<Self> {
+        Self::with_sys_ops(cgroup_root, parent_path, Arc::new(DefaultCgroupSysOps))
+    }
+
+    /// Constructs a CgroupManager with customized root, parent paths, and low-level system operations backend.
+    pub fn with_sys_ops(
+        cgroup_root: PathBuf,
+        parent_path: PathBuf,
+        sys_ops: Arc<dyn CgroupSysOps>,
+    ) -> Result<Self> {
         // Enforce that parent_path must be a subpath of cgroup_root and NOT the cgroup_root itself!
         if parent_path == cgroup_root {
             return Err(TavikError::Config(
@@ -71,6 +246,7 @@ impl CgroupManager {
         Ok(Self {
             cgroup_root,
             parent_path,
+            sys_ops,
         })
     }
 
@@ -82,6 +258,11 @@ impl CgroupManager {
     /// Returns the root cgroup path.
     pub fn cgroup_root(&self) -> &Path {
         &self.cgroup_root
+    }
+
+    /// Returns the low-level system operations backend.
+    pub fn sys_ops(&self) -> &Arc<dyn CgroupSysOps> {
+        &self.sys_ops
     }
 
     /// Validates that cgroup v2 is enabled and mounted at `cgroup_root`.
@@ -362,27 +543,10 @@ impl CgroupManager {
         #[cfg(target_os = "linux")]
         {
             let dir = self.container_cgroup_dir(container_id)?;
-            if dir.join(".simulate_procs_read_fail").exists() {
-                return Err(TavikError::Io(format!(
-                    "Simulated failure reading cgroup.procs for container '{}'",
-                    container_id
-                )));
-            }
-            let procs_file = dir.join("cgroup.procs");
-            if !procs_file.exists() {
+            if !dir.exists() {
                 return Ok(Vec::new());
             }
-
-            let content = fs::read_to_string(&procs_file)
-                .map_err(|e| TavikError::Io(format!("Failed to read {:?}: {}", procs_file, e)))?;
-
-            let mut pids = Vec::new();
-            for line in content.lines() {
-                if let Ok(pid) = line.trim().parse::<u32>() {
-                    pids.push(pid);
-                }
-            }
-            Ok(pids)
+            self.sys_ops.read_procs(&dir)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -441,86 +605,52 @@ impl CgroupManager {
             }
 
             // 1. Try atomic cgroup.kill (available in Linux 5.14+)
-            let kill_file = dir.join("cgroup.kill");
-            if kill_file.exists() && !dir.join(".simulate_disable_cgroup_kill").exists() {
-                fs::write(&kill_file, "1").map_err(|e| {
-                    TavikError::Io(format!(
-                        "Failed to write to cgroup.kill at {:?}: {}",
-                        kill_file, e
-                    ))
-                })?;
+            if self.sys_ops.cgroup_kill_available(&dir) {
+                self.sys_ops.kill_cgroup(&dir)?;
             } else {
-                // Fallback: enumerate cgroup.procs and send SIGKILL to each using pidfd
+                // Fallback: enumerate cgroup.procs and send SIGKILL to each using pidfd.
+                //
+                // Security & Race Condition Documentation:
+                // Cgroup Migration Race:
+                // While pidfd eliminates the classic PID-reuse race (a signal will never be
+                // delivered to a recycled PID belonging to a different process), checking
+                // `is_process_in_cgroup` before and after pidfd acquisition does NOT make
+                // cgroup membership immutable. In Linux cgroups v2, a privileged process or
+                // the process itself (if permitted) can migrate across cgroups at any time.
+                //
+                // Threat Model Limitation:
+                // This fallback path provides best-effort containment when `cgroup.kill` is
+                // unavailable on older kernels (< 5.14). The membership check ensures that
+                // processes that have already left the cgroup prior to signal dispatch are not
+                // signaled. However, if a process migrates out of the cgroup concurrently
+                // after the final check and before `pidfd_send_signal`, it may still receive
+                // SIGKILL. Full atomic termination without migration races requires Linux 5.14+
+                // `cgroup.kill`.
                 let rel_path = dir.strip_prefix(&self.cgroup_root).unwrap_or(&dir);
-                let pids = self.get_processes(container_id)?;
+                let pids = self.sys_ops.read_procs(&dir)?;
                 for pid in pids {
                     // Pre-verify that the process belongs to target cgroup before acquiring pidfd
-                    if !is_process_in_cgroup(pid, rel_path) {
+                    if !self.sys_ops.is_process_in_cgroup(pid, rel_path) {
                         continue;
                     }
 
-                    if dir.join(".simulate_pidfd_open_fail").exists() {
-                        return Err(TavikError::Unsupported(
-                            "Safe cgroup process termination requires Linux SYS_pidfd_open support"
-                                .into(),
-                        ));
-                    }
-
-                    let pfd_raw =
-                        unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as libc::c_int };
-                    if pfd_raw < 0 {
-                        let err = std::io::Error::last_os_error();
-                        if err.raw_os_error() == Some(libc::ESRCH) {
-                            continue;
-                        } else if err.raw_os_error() == Some(libc::ENOSYS) {
-                            return Err(TavikError::Unsupported(
-                                "Safe cgroup process termination requires Linux SYS_pidfd_open support".into(),
-                            ));
-                        } else {
-                            return Err(TavikError::Io(format!(
-                                "Failed to open pidfd for process {} in cgroup '{}': {}",
-                                pid, container_id, err
-                            )));
-                        }
-                    }
+                    let pfd_raw = match self.sys_ops.pidfd_open(pid) {
+                        Ok(fd) => fd,
+                        Err(TavikError::NotFound(_)) => continue,
+                        Err(e) => return Err(e),
+                    };
 
                     let pfd = FdGuard(pfd_raw);
 
                     // Re-verify while holding pidfd to avoid race condition where process exited and PID was reused
-                    if !is_process_in_cgroup(pid, rel_path) {
+                    if !self.sys_ops.is_process_in_cgroup(pid, rel_path) {
                         continue;
                     }
 
-                    if dir.join(".simulate_pidfd_send_signal_fail").exists() {
-                        return Err(TavikError::Unsupported(
-                            "Safe cgroup process termination requires Linux SYS_pidfd_send_signal support".into(),
-                        ));
-                    }
-
-                    let sig_ret = unsafe {
-                        libc::syscall(
-                            libc::SYS_pidfd_send_signal,
-                            pfd.0,
-                            libc::SIGKILL,
-                            std::ptr::null::<libc::c_void>(),
-                            0,
-                        )
-                    };
-
-                    if sig_ret != 0 {
-                        let err = std::io::Error::last_os_error();
-                        if err.raw_os_error() == Some(libc::ESRCH) {
-                            continue;
-                        } else if err.raw_os_error() == Some(libc::ENOSYS) {
-                            return Err(TavikError::Unsupported(
-                                "Safe cgroup process termination requires Linux SYS_pidfd_send_signal support".into(),
-                            ));
-                        } else {
-                            return Err(TavikError::Io(format!(
-                                "Failed to send SIGKILL to pidfd for process {} in cgroup '{}': {}",
-                                pid, container_id, err
-                            )));
-                        }
+                    match self.sys_ops.pidfd_send_signal(pfd.0, libc::SIGKILL) {
+                        Ok(()) => {}
+                        Err(TavikError::NotFound(_)) => continue,
+                        Err(e) => return Err(e),
                     }
                 }
             }
@@ -528,7 +658,7 @@ impl CgroupManager {
             // 2. Poll briefly (up to 500ms) for processes to exit before removing the directory
             let mut last_procs = Vec::new();
             for _ in 0..10 {
-                last_procs = self.get_processes(container_id)?;
+                last_procs = self.sys_ops.read_procs(&dir)?;
                 if last_procs.is_empty() {
                     break;
                 }
@@ -546,14 +676,7 @@ impl CgroupManager {
             }
 
             // 3. Remove the container cgroup directory
-            if let Err(e) = fs::remove_dir(&dir) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    return Err(TavikError::Io(format!(
-                        "Failed to remove container cgroup directory at {:?}: {}",
-                        dir, e
-                    )));
-                }
-            }
+            self.sys_ops.remove_cgroup_dir(&dir)?;
 
             debug!("Destroyed container cgroup at {:?}", dir);
             Ok(())

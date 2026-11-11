@@ -10,7 +10,7 @@ publish = false
 tavik-common.workspace = true
 tavik-core.workspace = true
 tavik-daemon.workspace = true
-tavik-runtime.workspace = true
+tavik-runtime = { workspace = true, features = ["test-hooks"] }
 tavik-cgroups.workspace = true
 tavik-security.workspace = true
 tavik-cli = { path = "../../crates/tavik-cli" }

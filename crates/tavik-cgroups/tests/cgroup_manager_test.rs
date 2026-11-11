@@ -177,12 +177,17 @@ mod mock_tests {
                     TavikError::Io(format!("Failed to open /dev/null for mock pidfd: {}", e))
                 })?;
                 let raw_fd = file.into_raw_fd();
-                // Move to a high reserved descriptor to prevent concurrent thread allocation races
-                let target_fd = 9800 + (self.allocated_fds.lock().unwrap().len() as libc::c_int);
+                // Move to a reserved descriptor in range 500-600 (well within default 1024 rlimit
+                // but far above low fds like 3-10) to prevent concurrent thread allocation races.
+                let target_fd = 500 + (self.allocated_fds.lock().unwrap().len() as libc::c_int);
                 let moved_fd = unsafe { libc::dup2(raw_fd, target_fd) };
                 unsafe { libc::close(raw_fd) };
                 if moved_fd != target_fd {
-                    return Err(TavikError::Io("dup2 to high descriptor failed".to_string()));
+                    return Err(TavikError::Io(format!(
+                        "dup2 to target descriptor {} failed: {}",
+                        target_fd,
+                        std::io::Error::last_os_error()
+                    )));
                 }
                 self.allocated_fds.lock().unwrap().push(target_fd);
                 Ok(target_fd)

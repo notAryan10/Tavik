@@ -1474,6 +1474,10 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "Requires rootful PID namespace creation (unshare(CLONE_NEWPID)); executed by rootful test runner"
+    )]
     fn test_executor_create_state_and_delete() {
         let temp = tempdir().unwrap();
         let state_dir = temp.path().join("state");

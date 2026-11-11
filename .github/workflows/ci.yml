@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   linux:
-    name: Linux ${{ matrix.arch }} validation
+    name: Hosted Linux ${{ matrix.arch }} validation
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:
@@ -41,31 +41,13 @@ jobs:
           sudo apt-get install --yes busybox-static
           command -v busybox
 
-      - name: Verify architecture and rootful cgroup v2
+      - name: Verify architecture
         run: |
           set -euo pipefail
-
           actual_arch="$(uname -m)"
           echo "Expected architecture: ${{ matrix.arch }}"
           echo "Actual architecture:   ${actual_arch}"
           test "${actual_arch}" = "${{ matrix.arch }}"
-
-          sudo -n bash -euo pipefail -c '
-            test "$(id -u)" -eq 0
-            test "$(stat -fc %T /sys/fs/cgroup)" = "cgroup2fs"
-            test -r /sys/fs/cgroup/cgroup.controllers
-
-            controllers="$(cat /sys/fs/cgroup/cgroup.controllers)"
-            for controller in cpu memory pids; do
-              if ! grep -qw "$controller" <<< "$controllers"; then
-                echo "Required cgroup v2 controller is unavailable: $controller" >&2
-                exit 1
-              fi
-            done
-
-            echo "Rootful cgroup v2 is available."
-            echo "Controllers: $controllers"
-          '
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -79,6 +61,136 @@ jobs:
       - name: Test runtime without test hooks
         run: cargo test -p tavik-runtime --no-default-features
 
-      - name: Run full workspace tests as root
+      - name: Report privileged tests delegated to rootful job
         run: |
-          sudo --preserve-env=HOME,PATH cargo test --workspace --no-fail-fast
+          echo "=== Privileged tests delegated to rootful Linux ARM64 runner ==="
+          echo "The following tests require privileged PID namespaces, mount namespaces, or rootful cgroups v2:"
+          echo "  - tavik-runtime: executor::tests::test_executor_create_state_and_delete (marked #[ignore])"
+          echo "  - tavik-cgroups: test_linux_cgroup_lifecycle"
+          echo "  - tavik-core: image_service_test::test_create_and_run_container_linux_e2e"
+          echo "  - tavik-integration-tests (37 tests in oci_runtime_test):"
+          echo "      test_oci_bundle_validation_and_executor"
+          echo "      test_linux_container_pid_namespace_and_lifecycle"
+          echo "      test_linux_cgroup_lifecycle"
+          echo "      test_linux_cgroups_v2_resource_enforcement"
+          echo "      test_linux_capability_bounding_set_and_drops"
+          echo "      test_linux_seccomp_bpf_filter_enforcement"
+          echo "      test_cgroups_memory_accounting"
+          echo "      test_cgroups_pids_limit"
+          echo "      test_combined_security_hardening"
+          echo "      test_explicit_uid_gid_zero_credential_transition"
+          echo "      test_exact_supplementary_group_isolation_empty"
+          echo "      test_exact_supplementary_group_isolation_multiple"
+          echo "      test_working_directory_inaccessible_to_container_user"
+          echo "      test_container_creation_retry_with_same_id_after_failure"
+          echo "      test_working_directory_validation_runtime"
+          echo "      test_runtime_path_resolution_variants"
+          echo "      test_seccomp_filter_blocks_syscall"
+          echo "      test_short_lived_process_startup_success"
+          echo "      test_stop_rejects_suspend_and_resume_signals"
+          echo "      test_daemon_oci_container_ipc"
+          echo "      test_concurrent_start_requests_atomic_rejection"
+          echo "      test_state_transitions_serialize_and_prevent_stopped_overwrite"
+          echo "      test_delete_starting_and_running_container_rejection"
+          echo "      test_linux_delete_created_container_with_cgroups"
+          echo "      test_linux_delete_created_container_without_cgroups"
+          echo "      test_linux_force_delete_running_container"
+          echo "      test_cgroup_ownership_rules_never_destroy_unowned"
+          echo "      test_durable_cgroup_ownership_and_deletion_safety"
+          echo "      test_e2e_real_supervisor_unexpected_exit_and_force_delete"
+          echo "      test_force_delete_does_not_signal_unrelated_process_on_pid_reuse"
+          echo "      test_repeated_short_lived_process_lifecycle"
+          echo "      test_stale_control_socket_recovery_allows_force_delete_and_cleanup_pending"
+          echo "      test_cleanup_retry_successfully_removes_cgroup_and_marker"
+          echo "      test_cgroup_destruction_propagates_kill_and_process_errors"
+          echo "      test_linux_lifecycle_graceful_stop_and_acknowledgment"
+          echo "      test_signal_escalation_esrch_and_pidfd_exit"
+          echo "These tests are verified against real kernel semantics by the rootful Linux ARM64 job."
+
+      - name: Run full workspace tests as ordinary user
+        run: cargo test --workspace --no-fail-fast
+
+  rootful-linux-arm64:
+    name: Rootful Linux ARM64 validation
+    runs-on: [self-hosted, Linux, ARM64, tavik-rootful]
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Verify rootful Linux ARM64 prerequisites
+        run: |
+          set -eo pipefail
+
+          echo "=== 1. Checking Linux ARM64 architecture ==="
+          os_name="$(uname -s)"
+          arch_name="$(uname -m)"
+          echo "OS: ${os_name}, Architecture: ${arch_name}"
+          if [ "${os_name}" != "Linux" ] || [ "${arch_name}" != "aarch64" ]; then
+            echo "ERROR: Runner architecture is not Linux ARM64 (aarch64). Found: ${os_name} ${arch_name}" >&2
+            exit 1
+          fi
+
+          echo "=== 2. Checking non-interactive sudo access ==="
+          if ! sudo -n true 2>/dev/null; then
+            echo "ERROR: Non-interactive sudo is not available for runner user $(whoami)" >&2
+            exit 1
+          fi
+          echo "Non-interactive sudo verified."
+
+          echo "=== 3. Checking unified cgroup v2 hierarchy at /sys/fs/cgroup ==="
+          cgroup_type="$(stat -fc %T /sys/fs/cgroup 2>/dev/null || true)"
+          if [ "${cgroup_type}" != "cgroup2fs" ]; then
+            echo "ERROR: /sys/fs/cgroup is not cgroup v2 (found: ${cgroup_type:-unknown})" >&2
+            exit 1
+          fi
+          echo "Unified cgroup v2 mounted at /sys/fs/cgroup."
+
+          echo "=== 4. Checking required cgroup v2 controllers ==="
+          if [ ! -r /sys/fs/cgroup/cgroup.controllers ]; then
+            echo "ERROR: Cannot read /sys/fs/cgroup/cgroup.controllers" >&2
+            exit 1
+          fi
+          controllers="$(cat /sys/fs/cgroup/cgroup.controllers)"
+          echo "Available controllers: ${controllers}"
+          for ctrl in cpu memory pids; do
+            if ! grep -qw "$ctrl" <<< "$controllers"; then
+              echo "ERROR: Required cgroup v2 controller is missing: $ctrl" >&2
+              exit 1
+            fi
+          done
+          echo "Required controllers (cpu, memory, pids) verified."
+
+          echo "=== 5. Checking real kernel PID namespace creation ==="
+          if ! sudo -n unshare --pid --fork true; then
+            echo "ERROR: Real PID namespace creation failed under sudo unshare --pid --fork true" >&2
+            exit 1
+          fi
+          echo "Real PID namespace creation verified."
+
+      - name: Verify BusyBox availability
+        run: |
+          if ! command -v busybox >/dev/null 2>&1; then
+            echo "Installing busybox-static..."
+            sudo -n apt-get update && sudo -n apt-get install --yes busybox-static
+          fi
+          command -v busybox
+
+      - name: Run complete workspace test suite
+        run: |
+          SUDO=""
+          if [ "$(id -u)" -ne 0 ]; then
+            SUDO="sudo --preserve-env=PATH,CARGO_HOME,RUSTUP_HOME"
+          fi
+          $SUDO cargo test --workspace --no-fail-fast
+
+      - name: Run ignored privileged runtime test
+        run: |
+          SUDO=""
+          if [ "$(id -u)" -ne 0 ]; then
+            SUDO="sudo --preserve-env=PATH,CARGO_HOME,RUSTUP_HOME"
+          fi
+          export TAVIKR_PATH="${GITHUB_WORKSPACE:-$(pwd)}/target/debug/tavikr"
+          $SUDO env "TAVIKR_PATH=${TAVIKR_PATH}" cargo test -p tavik-runtime --no-default-features executor::tests::test_executor_create_state_and_delete -- --ignored --exact

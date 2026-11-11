@@ -177,20 +177,29 @@ mod mock_tests {
                     TavikError::Io(format!("Failed to open /dev/null for mock pidfd: {}", e))
                 })?;
                 let raw_fd = file.into_raw_fd();
-                // Move to a reserved descriptor in range 500-600 (well within default 1024 rlimit
-                // but far above low fds like 3-10) to prevent concurrent thread allocation races.
-                let target_fd = 500 + (self.allocated_fds.lock().unwrap().len() as libc::c_int);
-                let moved_fd = unsafe { libc::dup2(raw_fd, target_fd) };
-                unsafe { libc::close(raw_fd) };
-                if moved_fd != target_fd {
+
+                // Allocate an available descriptor at or above 500 without overwriting any existing descriptor.
+                let dup_fd = unsafe { libc::fcntl(raw_fd, libc::F_DUPFD_CLOEXEC, 500) };
+                let dup_err = if dup_fd == -1 {
+                    Some(std::io::Error::last_os_error())
+                } else {
+                    None
+                };
+
+                // Close original raw_fd whether duplication succeeded or failed
+                unsafe {
+                    libc::close(raw_fd);
+                };
+
+                if let Some(err) = dup_err {
                     return Err(TavikError::Io(format!(
-                        "dup2 to target descriptor {} failed: {}",
-                        target_fd,
-                        std::io::Error::last_os_error()
+                        "F_DUPFD_CLOEXEC for mock pidfd failed: {}",
+                        err
                     )));
                 }
-                self.allocated_fds.lock().unwrap().push(target_fd);
-                Ok(target_fd)
+
+                self.allocated_fds.lock().unwrap().push(dup_fd);
+                Ok(dup_fd)
             }
         }
 
@@ -398,59 +407,75 @@ mod mock_tests {
 
     #[test]
     fn test_cgroup_mock_pidfd_ownership_and_closure() {
-        use std::os::unix::io::IntoRawFd;
-        let (_temp, ops, mgr) = setup_mock_manager();
-        let container_id = "test-mock-pidfd-closure";
-        let cgroup_dir = mgr.parent_path().join(container_id);
-        std::fs::create_dir_all(&cgroup_dir).unwrap();
+        // Fork child process to isolate descriptor assertions from concurrent test runner threads
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            use std::os::unix::io::IntoRawFd;
+            let (_temp, ops, mgr) = setup_mock_manager();
+            let container_id = "test-mock-pidfd-closure";
+            let cgroup_dir = mgr.parent_path().join(container_id);
+            std::fs::create_dir_all(&cgroup_dir).unwrap();
 
-        // Open an unrelated canary fd prior to test
-        let canary_file = std::fs::File::open("/dev/null").expect("Failed to open canary file");
-        let canary_fd = canary_file.into_raw_fd();
+            // Open an unrelated canary fd prior to test
+            let canary_file = std::fs::File::open("/dev/null").expect("Failed to open canary file");
+            let canary_fd = canary_file.into_raw_fd();
 
-        ops.cgroup_kill_supported.store(false, Ordering::SeqCst);
-        ops.read_procs_queue
-            .lock()
-            .unwrap()
-            .push_back(Ok(vec![201, 202]));
-        ops.read_procs_queue
-            .lock()
-            .unwrap()
-            .push_back(Ok(Vec::new())); // second read after kill shows empty
-        ops.in_cgroup_pids.lock().unwrap().insert(201);
-        ops.in_cgroup_pids.lock().unwrap().insert(202);
+            ops.cgroup_kill_supported.store(false, Ordering::SeqCst);
+            ops.read_procs_queue
+                .lock()
+                .unwrap()
+                .push_back(Ok(vec![201, 202]));
+            ops.read_procs_queue
+                .lock()
+                .unwrap()
+                .push_back(Ok(Vec::new())); // second read after kill shows empty
+            ops.in_cgroup_pids.lock().unwrap().insert(201);
+            ops.in_cgroup_pids.lock().unwrap().insert(202);
 
-        let res = mgr.destroy_container_cgroup(container_id);
-        assert!(
-            res.is_ok(),
-            "destroy_container_cgroup must succeed: {:?}",
-            res
-        );
-
-        let allocated = ops.allocated_fds.lock().unwrap().clone();
-        assert_eq!(allocated.len(), 2, "Expected 2 allocated mock pidfds");
-
-        // Assert all allocated descriptors have been closed by FdGuard
-        for fd in allocated {
-            let ret = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-            assert_eq!(ret, -1, "Allocated fd {} must be closed by FdGuard", fd);
-            assert_eq!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(libc::EBADF),
-                "fcntl on closed fd {} must fail with EBADF",
-                fd
+            let res = mgr.destroy_container_cgroup(container_id);
+            assert!(
+                res.is_ok(),
+                "destroy_container_cgroup must succeed: {:?}",
+                res
             );
+
+            let allocated = ops.allocated_fds.lock().unwrap().clone();
+            assert_eq!(allocated.len(), 2, "Expected 2 allocated mock pidfds");
+
+            // Assert all allocated descriptors have been closed by FdGuard
+            for fd in allocated {
+                let ret = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+                assert_eq!(ret, -1, "Allocated fd {} must be closed by FdGuard", fd);
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EBADF),
+                    "fcntl on closed fd {} must fail with EBADF",
+                    fd
+                );
+            }
+
+            // Assert unrelated canary fd opened prior to test remains valid
+            let canary_ret = unsafe { libc::fcntl(canary_fd, libc::F_GETFD) };
+            assert_ne!(
+                canary_ret, -1,
+                "Canary fd {} must remain open and valid",
+                canary_fd
+            );
+
+            // Clean up canary fd
+            unsafe { libc::close(canary_fd) };
+
+            std::process::exit(0);
         }
 
-        // Assert unrelated canary fd opened prior to test remains valid
-        let canary_ret = unsafe { libc::fcntl(canary_fd, libc::F_GETFD) };
-        assert_ne!(
-            canary_ret, -1,
-            "Canary fd {} must remain open and valid",
-            canary_fd
+        let mut status = 0;
+        let wres = unsafe { libc::waitpid(child, &mut status, 0) };
+        assert_eq!(wres, child);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "Child process failed with exit status: {}",
+            libc::WEXITSTATUS(status)
         );
-
-        // Clean up canary fd
-        unsafe { libc::close(canary_fd) };
     }
 }

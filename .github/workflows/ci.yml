@@ -1,0 +1,84 @@
+name: Rust CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.arch }} validation
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust stable, rustfmt, and Clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install BusyBox for OCI integration tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes busybox-static
+          command -v busybox
+
+      - name: Verify architecture and rootful cgroup v2
+        run: |
+          set -euo pipefail
+
+          actual_arch="$(uname -m)"
+          echo "Expected architecture: ${{ matrix.arch }}"
+          echo "Actual architecture:   ${actual_arch}"
+          test "${actual_arch}" = "${{ matrix.arch }}"
+
+          sudo -n bash -euo pipefail -c '
+            test "$(id -u)" -eq 0
+            test "$(stat -fc %T /sys/fs/cgroup)" = "cgroup2fs"
+            test -r /sys/fs/cgroup/cgroup.controllers
+
+            controllers="$(cat /sys/fs/cgroup/cgroup.controllers)"
+            for controller in cpu memory pids; do
+              if ! grep -qw "$controller" <<< "$controllers"; then
+                echo "Required cgroup v2 controller is unavailable: $controller" >&2
+                exit 1
+              fi
+            done
+
+            echo "Rootful cgroup v2 is available."
+            echo "Controllers: $controllers"
+          '
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Check runtime without test hooks
+        run: cargo check -p tavik-runtime --no-default-features
+
+      - name: Test runtime without test hooks
+        run: cargo test -p tavik-runtime --no-default-features
+
+      - name: Run full workspace tests as root
+        run: |
+          sudo --preserve-env=HOME,PATH cargo test --workspace --no-fail-fast

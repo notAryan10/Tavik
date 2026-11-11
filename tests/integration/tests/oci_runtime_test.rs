@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::Duration;
 use tavik_cli::client::Client;
 use tavik_daemon::DaemonServer;
-use tavik_runtime::{ContainerExecutor, ContainerStatus, Spec};
+use tavik_runtime::{ContainerExecutor, ContainerState, ContainerStatus, Spec};
 use tempfile::tempdir;
 
 #[test]
@@ -1973,10 +1973,13 @@ fn test_supervisor_finalization_rules_and_error_handling() {
         fs::write(&exec_fifo, b"").unwrap();
 
         let initial_state = ContainerState {
+            oci_version: "1.2.0".to_string(),
             id: "test-finalization-cont".to_string(),
             status: ContainerStatus::Running,
             pid: Some(12345),
             bundle: temp.path().to_path_buf(),
+            annotations: std::collections::HashMap::new(),
+            created_at: chrono::Utc::now(),
         };
         fs::write(
             &state_file,
@@ -2404,10 +2407,13 @@ fn test_finalization_error_handling_and_recovery() {
         fs::write(&exec_fifo, b"").unwrap();
 
         let initial_state = ContainerState {
+            oci_version: "1.2.0".to_string(),
             id: "test-finalization-err-cont".to_string(),
             status: ContainerStatus::Running,
             pid: Some(12345),
             bundle: temp.path().to_path_buf(),
+            annotations: std::collections::HashMap::new(),
+            created_at: chrono::Utc::now(),
         };
         fs::write(
             &state_file,
@@ -2505,10 +2511,13 @@ fn test_signal_escalation_esrch_and_pidfd_exit() {
         fs::create_dir_all(&cont_dir).unwrap();
 
         let initial_state = ContainerState {
+            oci_version: "1.2.0".to_string(),
             id: cont_id.to_string(),
             status: ContainerStatus::Running,
             pid: Some(999999),
             bundle: temp.path().to_path_buf(),
+            annotations: std::collections::HashMap::new(),
+            created_at: chrono::Utc::now(),
         };
         fs::write(
             cont_dir.join("state.json"),
@@ -2688,24 +2697,14 @@ fn test_linux_delete_created_container_with_cgroups() {
             ];
         }
         if let Some(linux) = &mut spec.linux {
-            linux.resources = Some(tavik_runtime::spec::LinuxResources {
-                devices: vec![],
-                memory: Some(tavik_runtime::spec::LinuxMemory {
+            linux.resources = Some(tavik_cgroups::CgroupResources {
+                memory: Some(tavik_cgroups::MemoryResources {
                     limit: Some(64 * 1024 * 1024),
-                    reservation: None,
+                    high: None,
                     swap: None,
-                    kernel: None,
-                    kernel_tcp: None,
-                    swappiness: None,
-                    disable_oom_killer: None,
                 }),
                 cpu: None,
                 pids: None,
-                block_io: None,
-                hugepage_limits: vec![],
-                network: None,
-                rdma: std::collections::HashMap::new(),
-                unified: std::collections::HashMap::new(),
             });
         }
         fs::write(
@@ -2760,7 +2759,7 @@ fn test_failed_cancellation_preserves_metadata() {
         let cont_dir = executor.container_dir(id);
         fs::create_dir_all(&cont_dir).unwrap();
 
-        let mut state = tavik_runtime::ContainerState {
+        let state = ContainerState {
             oci_version: "1.2.0".to_string(),
             id: id.to_string(),
             status: ContainerStatus::Created,
@@ -2795,7 +2794,7 @@ fn test_cgroup_ownership_persisted_immediately_from_creation() {
     let cont_dir = executor.container_dir(id);
     fs::create_dir_all(&cont_dir).unwrap();
 
-    let mut state = tavik_runtime::ContainerState {
+    let mut state = ContainerState {
         oci_version: "1.2.0".to_string(),
         id: id.to_string(),
         status: ContainerStatus::Creating,
@@ -2825,7 +2824,7 @@ fn test_failed_creation_preserves_recovery_metadata_when_cgroup_cleanup_fails() 
     let cont_dir = executor.container_dir(id);
     fs::create_dir_all(&cont_dir).unwrap();
 
-    let mut state = tavik_runtime::ContainerState {
+    let mut state = ContainerState {
         oci_version: "1.2.0".to_string(),
         id: id.to_string(),
         status: ContainerStatus::Creating,
@@ -2855,7 +2854,7 @@ fn test_concurrency_two_simultaneous_deletes() {
     let cont_dir = executor.container_dir(id);
     fs::create_dir_all(&cont_dir).unwrap();
 
-    let state = tavik_runtime::ContainerState {
+    let state = ContainerState {
         oci_version: "1.2.0".to_string(),
         id: id.to_string(),
         status: ContainerStatus::Stopped,
@@ -2895,7 +2894,7 @@ fn test_concurrency_stop_and_delete() {
     let cont_dir = executor.container_dir(id);
     fs::create_dir_all(&cont_dir).unwrap();
 
-    let state = tavik_runtime::ContainerState {
+    let state = ContainerState {
         oci_version: "1.2.0".to_string(),
         id: id.to_string(),
         status: ContainerStatus::Stopped,
@@ -2930,7 +2929,7 @@ fn test_stale_control_socket_recovery_allows_force_delete_and_cleanup_pending() 
     let cont_dir = executor.container_dir(id);
     fs::create_dir_all(&cont_dir).unwrap();
 
-    let mut state = tavik_runtime::ContainerState {
+    let mut state = ContainerState {
         oci_version: "1.2.0".to_string(),
         id: id.to_string(),
         status: ContainerStatus::CleanupPending,
@@ -2983,7 +2982,7 @@ fn test_stale_control_socket_recovery_with_force_delete() {
         .save_to(&cont_dir.join("supervisor.identity"))
         .unwrap();
 
-    let mut state = tavik_runtime::ContainerState {
+    let mut state = ContainerState {
         oci_version: "1.2.0".to_string(),
         id: id.to_string(),
         status: ContainerStatus::Running,
@@ -3046,7 +3045,7 @@ fn test_live_control_socket_is_never_unlinked_as_stale() {
         .unwrap();
     let dummy_pid = dummy_proc.id();
 
-    let mut state = tavik_runtime::ContainerState {
+    let state = ContainerState {
         oci_version: "1.2.0".to_string(),
         id: id.to_string(),
         status: ContainerStatus::Running,
@@ -3100,7 +3099,7 @@ fn test_concurrency_state_reconciliation_racing_with_deletion() {
     let cont_dir = executor.container_dir(id);
     fs::create_dir_all(&cont_dir).unwrap();
 
-    let state = tavik_runtime::ContainerState {
+    let state = ContainerState {
         oci_version: "1.2.0".to_string(),
         id: id.to_string(),
         status: ContainerStatus::Running,
@@ -3163,7 +3162,7 @@ fn test_truthful_deletion_errors_and_save_state_rejection() {
     let cont_dir = executor.container_dir(id);
     fs::create_dir_all(&cont_dir).unwrap();
 
-    let state = tavik_runtime::ContainerState {
+    let state = ContainerState {
         oci_version: "1.2.0".to_string(),
         id: id.to_string(),
         status: ContainerStatus::Stopped,
@@ -3206,7 +3205,7 @@ fn test_failed_cgroup_creation_and_cleanup_preserves_owner_and_state_dir() {
     let cont_dir = executor.container_dir(id);
     fs::create_dir_all(&cont_dir).unwrap();
 
-    let mut state = tavik_runtime::ContainerState {
+    let mut state = ContainerState {
         oci_version: "1.2.0".to_string(),
         id: id.to_string(),
         status: ContainerStatus::Creating,
@@ -3239,7 +3238,7 @@ fn test_cleanup_retry_successfully_removes_cgroup_and_marker() {
     let cont_dir = executor.container_dir(id);
     fs::create_dir_all(&cont_dir).unwrap();
 
-    let mut state = tavik_runtime::ContainerState {
+    let mut state = ContainerState {
         oci_version: "1.2.0".to_string(),
         id: id.to_string(),
         status: ContainerStatus::CleanupPending,
@@ -3301,7 +3300,7 @@ fn test_stale_supervisor_exit_recovery_handles_dead_supervisor_and_init() {
         drop(listener);
     }
 
-    let mut state = tavik_runtime::ContainerState {
+    let mut state = ContainerState {
         oci_version: "1.2.0".to_string(),
         id: id.to_string(),
         status: ContainerStatus::Running,
@@ -3366,7 +3365,7 @@ fn test_force_delete_does_not_signal_unrelated_process_on_pid_reuse() {
         .save_to(&cont_dir.join("container.identity"))
         .unwrap();
 
-    let mut state = tavik_runtime::ContainerState {
+    let mut state = ContainerState {
         oci_version: "1.2.0".to_string(),
         id: id.to_string(),
         status: ContainerStatus::Running,
@@ -3425,7 +3424,7 @@ fn test_finalization_fails_when_persisting_cleanup_pending_fails() {
     let cont_dir = state_dir.join(id);
     fs::create_dir_all(&cont_dir).unwrap();
 
-    let mut state = tavik_runtime::ContainerState {
+    let state = ContainerState {
         oci_version: "1.2.0".to_string(),
         id: id.to_string(),
         status: ContainerStatus::Running,
@@ -3483,7 +3482,7 @@ fn test_cgroup_destruction_propagates_kill_and_process_errors() {
     let cont_dir = executor.container_dir(id);
     fs::create_dir_all(&cont_dir).unwrap();
 
-    let mut state = tavik_runtime::ContainerState {
+    let mut state = ContainerState {
         oci_version: "1.2.0".to_string(),
         id: id.to_string(),
         status: ContainerStatus::Stopped,
@@ -3547,7 +3546,7 @@ fn test_missing_socket_with_live_supervisor_rejects_unforced_and_terminates_on_f
         .save_to(&cont_dir.join("container.identity"))
         .unwrap();
 
-    let mut state = tavik_runtime::ContainerState {
+    let mut state = ContainerState {
         oci_version: "1.2.0".to_string(),
         id: id.to_string(),
         status: ContainerStatus::Running,
@@ -3623,7 +3622,7 @@ fn test_missing_socket_with_dead_supervisor_and_live_init() {
         .save_to(&cont_dir.join("container.identity"))
         .unwrap();
 
-    let mut state = tavik_runtime::ContainerState {
+    let mut state = ContainerState {
         oci_version: "1.2.0".to_string(),
         id: id.to_string(),
         status: ContainerStatus::Running,
@@ -3686,7 +3685,7 @@ fn test_missing_socket_with_unverifiable_supervisor_identity_fails_closed() {
         .save_to(&cont_dir.join("container.identity"))
         .unwrap();
 
-    let mut state = tavik_runtime::ContainerState {
+    let mut state = ContainerState {
         oci_version: "1.2.0".to_string(),
         id: id.to_string(),
         status: ContainerStatus::Running,
@@ -3737,7 +3736,7 @@ fn test_missing_socket_with_unverifiable_init_identity_fails_closed() {
     // Corrupted container identity file
     fs::write(cont_dir.join("container.identity"), b"not-a-valid-json").unwrap();
 
-    let mut state = tavik_runtime::ContainerState {
+    let mut state = ContainerState {
         oci_version: "1.2.0".to_string(),
         id: id.to_string(),
         status: ContainerStatus::Running,
@@ -3790,7 +3789,7 @@ fn test_contradictory_identities_fail_closed() {
         .save_to(&cont_dir.join("container.identity"))
         .unwrap();
 
-    let mut state = tavik_runtime::ContainerState {
+    let mut state = ContainerState {
         oci_version: "1.2.0".to_string(),
         id: id.to_string(),
         status: ContainerStatus::Running,
@@ -3836,7 +3835,7 @@ fn test_active_container_missing_init_identity_fails_closed() {
     let cont_dir = executor.container_dir(id);
     fs::create_dir_all(&cont_dir).unwrap();
 
-    let state = tavik_runtime::ContainerState {
+    let state = ContainerState {
         oci_version: "1.2.0".to_string(),
         id: id.to_string(),
         status: ContainerStatus::Created,
@@ -4140,7 +4139,7 @@ fn test_force_delete_with_pidfd_open_failure_retains_metadata_and_fails_unsuppor
         .save_to(&cont_dir.join("container.identity"))
         .unwrap();
 
-    let mut state = tavik_runtime::ContainerState {
+    let mut state = ContainerState {
         oci_version: "1.2.0".to_string(),
         id: id.to_string(),
         status: ContainerStatus::Running,
@@ -4211,22 +4210,26 @@ fn test_cgroup_fallback_enumeration_and_membership_filtering() {
             fn cgroup_kill_available(&self, _cgroup_dir: &Path) -> bool {
                 false
             }
-            fn kill_cgroup(&self, cgroup_dir: &Path) -> Result<()> {
+            fn kill_cgroup(&self, cgroup_dir: &Path) -> tavik_common::error::Result<()> {
                 self.0.kill_cgroup(cgroup_dir)
             }
-            fn read_procs(&self, cgroup_dir: &Path) -> Result<Vec<u32>> {
+            fn read_procs(&self, cgroup_dir: &Path) -> tavik_common::error::Result<Vec<u32>> {
                 self.0.read_procs(cgroup_dir)
             }
             fn is_process_in_cgroup(&self, pid: u32, expected_rel_path: &Path) -> bool {
                 self.0.is_process_in_cgroup(pid, expected_rel_path)
             }
-            fn pidfd_open(&self, pid: u32) -> Result<libc::c_int> {
+            fn pidfd_open(&self, pid: u32) -> tavik_common::error::Result<libc::c_int> {
                 self.0.pidfd_open(pid)
             }
-            fn pidfd_send_signal(&self, pidfd: libc::c_int, sig: libc::c_int) -> Result<()> {
+            fn pidfd_send_signal(
+                &self,
+                pidfd: libc::c_int,
+                sig: libc::c_int,
+            ) -> tavik_common::error::Result<()> {
                 self.0.pidfd_send_signal(pidfd, sig)
             }
-            fn remove_cgroup_dir(&self, cgroup_dir: &Path) -> Result<()> {
+            fn remove_cgroup_dir(&self, cgroup_dir: &Path) -> tavik_common::error::Result<()> {
                 self.0.remove_cgroup_dir(cgroup_dir)
             }
         }

@@ -91,6 +91,7 @@ pub mod test_hooks {
     pub struct MockSyscalls {
         pub pidfd_open_errno: i32,
         pub pidfd_send_signal_errno: i32,
+        pub simulate_send_signal_noop: bool,
         pub poll_revents: Option<i16>,
         pub poll_return: Option<i32>,
         pub poll_errno: i32,
@@ -302,13 +303,17 @@ impl ProcessIdentity {
             }
 
             #[cfg(feature = "test-hooks")]
-            let sim_sig = test_hooks::with_mocks(|m| m.pidfd_send_signal_errno);
+            let (sim_sig, sim_noop) = test_hooks::with_mocks(|m| {
+                (m.pidfd_send_signal_errno, m.simulate_send_signal_noop)
+            });
             #[cfg(not(feature = "test-hooks"))]
-            let sim_sig = 0;
+            let (sim_sig, sim_noop) = (0, false);
 
             let sig_ret = if sim_sig != 0 {
                 unsafe { *libc::__errno_location() = sim_sig };
                 -1
+            } else if sim_noop {
+                0
             } else {
                 unsafe {
                     libc::syscall(
@@ -447,8 +452,8 @@ impl ProcessIdentity {
         #[cfg(not(target_os = "linux"))]
         {
             #[cfg(feature = "test-hooks")]
-            {
-                let (sim_open, sim_sig, sim_revents, sim_ret, sim_errno, eintr_remaining) =
+            let sim_noop = {
+                let (sim_open, sim_sig, sim_noop, sim_revents, sim_ret, sim_errno, eintr_remaining) =
                     test_hooks::with_mocks(|m| {
                         let eintr = if m.poll_eintr_count > 0 {
                             m.poll_eintr_count -= 1;
@@ -459,6 +464,7 @@ impl ProcessIdentity {
                         (
                             m.pidfd_open_errno,
                             m.pidfd_send_signal_errno,
+                            m.simulate_send_signal_noop,
                             m.poll_revents,
                             m.poll_return,
                             m.poll_errno,
@@ -497,7 +503,7 @@ impl ProcessIdentity {
                 if eintr_remaining {
                     // simulated EINTR retry
                 } else if let Some(ret) = sim_ret {
-                    if ret == 0 {
+                    if ret == 0 && !sim_noop {
                         return Err(TavikError::Execution(format!(
                             "Timed out waiting for process {} to terminate",
                             self.pid
@@ -510,16 +516,21 @@ impl ProcessIdentity {
                         )));
                     }
                 }
-            }
+                sim_noop
+            };
+            #[cfg(not(feature = "test-hooks"))]
+            let sim_noop = false;
 
-            let ret = unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGKILL) };
-            if ret != 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::ESRCH) {
-                    return Err(TavikError::Io(format!(
-                        "Failed to send SIGKILL to PID {}: {}",
-                        self.pid, err
-                    )));
+            if !sim_noop {
+                let ret = unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGKILL) };
+                if ret != 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() != Some(libc::ESRCH) {
+                        return Err(TavikError::Io(format!(
+                            "Failed to send SIGKILL to PID {}: {}",
+                            self.pid, err
+                        )));
+                    }
                 }
             }
 
@@ -560,12 +571,22 @@ impl ProcessIdentity {
 #[cfg(test)]
 mod tests {
     #[test]
+    #[cfg(not(feature = "test-hooks"))]
+    #[allow(clippy::assertions_on_constants)]
     fn test_production_build_has_no_active_test_hooks() {
-        // When compiled without the `test-hooks` feature (default production build),
-        // test-hooks feature is not active.
-        #[cfg(not(feature = "test-hooks"))]
-        {
-            assert!(!cfg!(feature = "test-hooks"));
-        }
+        assert!(
+            !cfg!(feature = "test-hooks"),
+            "test-hooks feature must NOT be enabled in default production build"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "test-hooks")]
+    #[allow(clippy::assertions_on_constants)]
+    fn test_test_hooks_feature_active_when_explicitly_enabled() {
+        assert!(
+            cfg!(feature = "test-hooks"),
+            "test-hooks feature must be active when explicitly enabled"
+        );
     }
 }

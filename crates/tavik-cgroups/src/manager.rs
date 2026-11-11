@@ -27,6 +27,13 @@ pub trait CgroupSysOps: Send + Sync {
     fn is_process_in_cgroup(&self, pid: u32, expected_rel_path: &Path) -> bool;
 
     /// Opens a pidfd for the process.
+    ///
+    /// # Descriptor Ownership Contract
+    /// Must return a valid, uniquely allocated, owned file descriptor on success.
+    /// The caller takes exclusive ownership of the returned descriptor, wraps it in an RAII
+    /// `FdGuard`, and closes it via `libc::close`.
+    /// Implementations (including mocks) MUST NOT return synthetic, unallocated integers or
+    /// descriptors borrowed from other subsystems, because the caller will close the descriptor.
     fn pidfd_open(&self, pid: u32) -> Result<libc::c_int>;
 
     /// Sends a signal (e.g. SIGKILL) to the pidfd.

@@ -134,6 +134,7 @@ mod mock_tests {
         opened_pids: Mutex<Vec<u32>>,
         signaled_fds: Mutex<Vec<(libc::c_int, libc::c_int)>>,
         removed_dirs: Mutex<Vec<PathBuf>>,
+        allocated_fds: Mutex<Vec<libc::c_int>>,
     }
 
     impl CgroupSysOps for MockCgroupSysOps {
@@ -162,11 +163,22 @@ mod mock_tests {
         }
 
         fn pidfd_open(&self, pid: u32) -> Result<libc::c_int> {
+            use std::os::unix::io::IntoRawFd;
             self.opened_pids.lock().unwrap().push(pid);
             if let Some(res) = self.pidfd_open_results.lock().unwrap().remove(&pid) {
-                res
+                if let Ok(fd) = res {
+                    self.allocated_fds.lock().unwrap().push(fd);
+                    Ok(fd)
+                } else {
+                    res
+                }
             } else {
-                Ok(100 + pid as libc::c_int)
+                let file = std::fs::File::open("/dev/null").map_err(|e| {
+                    TavikError::Io(format!("Failed to open /dev/null for mock pidfd: {}", e))
+                })?;
+                let raw_fd = file.into_raw_fd();
+                self.allocated_fds.lock().unwrap().push(raw_fd);
+                Ok(raw_fd)
             }
         }
 
@@ -370,5 +382,63 @@ mod mock_tests {
         }
 
         assert!(cgroup_dir.exists());
+    }
+
+    #[test]
+    fn test_cgroup_mock_pidfd_ownership_and_closure() {
+        use std::os::unix::io::IntoRawFd;
+        let (_temp, ops, mgr) = setup_mock_manager();
+        let container_id = "test-mock-pidfd-closure";
+        let cgroup_dir = mgr.parent_path().join(container_id);
+        std::fs::create_dir_all(&cgroup_dir).unwrap();
+
+        // Open an unrelated canary fd prior to test
+        let canary_file = std::fs::File::open("/dev/null").expect("Failed to open canary file");
+        let canary_fd = canary_file.into_raw_fd();
+
+        ops.cgroup_kill_supported.store(false, Ordering::SeqCst);
+        ops.read_procs_queue
+            .lock()
+            .unwrap()
+            .push_back(Ok(vec![201, 202]));
+        ops.read_procs_queue
+            .lock()
+            .unwrap()
+            .push_back(Ok(Vec::new())); // second read after kill shows empty
+        ops.in_cgroup_pids.lock().unwrap().insert(201);
+        ops.in_cgroup_pids.lock().unwrap().insert(202);
+
+        let res = mgr.destroy_container_cgroup(container_id);
+        assert!(
+            res.is_ok(),
+            "destroy_container_cgroup must succeed: {:?}",
+            res
+        );
+
+        let allocated = ops.allocated_fds.lock().unwrap().clone();
+        assert_eq!(allocated.len(), 2, "Expected 2 allocated mock pidfds");
+
+        // Assert all allocated descriptors have been closed by FdGuard
+        for fd in allocated {
+            let ret = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert_eq!(ret, -1, "Allocated fd {} must be closed by FdGuard", fd);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EBADF),
+                "fcntl on closed fd {} must fail with EBADF",
+                fd
+            );
+        }
+
+        // Assert unrelated canary fd opened prior to test remains valid
+        let canary_ret = unsafe { libc::fcntl(canary_fd, libc::F_GETFD) };
+        assert_ne!(
+            canary_ret, -1,
+            "Canary fd {} must remain open and valid",
+            canary_fd
+        );
+
+        // Clean up canary fd
+        unsafe { libc::close(canary_fd) };
     }
 }

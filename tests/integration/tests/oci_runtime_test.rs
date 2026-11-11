@@ -4060,7 +4060,12 @@ fn test_pidfd_poll_terminal_events_and_unexpected_conditions() {
     {
         let child = ChildGuard::spawn_sleep();
         let ident = tavik_runtime::ProcessIdentity::from_pid(child.pid()).unwrap();
+        assert!(
+            ident.is_alive().unwrap(),
+            "Process must be alive before timeout test"
+        );
         let _mock = ScopedMockSyscalls::set(MockSyscalls {
+            simulate_send_signal_noop: true,
             poll_return: Some(0),
             ..Default::default()
         });
@@ -4069,11 +4074,17 @@ fn test_pidfd_poll_terminal_events_and_unexpected_conditions() {
             Err(tavik_common::error::TavikError::Execution(msg)) => {
                 assert!(
                     msg.contains("failed to terminate within timeout")
-                        || msg.contains("Timed out waiting for process")
+                        || msg.contains("Timed out waiting for process"),
+                    "Unexpected error message: {}",
+                    msg
                 );
             }
             other => panic!("Expected timeout Execution error, got: {:?}", other),
         }
+        assert!(
+            ident.is_alive().unwrap(),
+            "Process must remain alive throughout and after timeout test because signal was simulated no-op"
+        );
     }
 
     // 7. Interrupted poll (EINTR retry)
@@ -4323,23 +4334,69 @@ fn test_e2e_real_supervisor_unexpected_exit_and_force_delete() {
         let sup_ident =
             tavik_runtime::ProcessIdentity::load_from(&cont_dir.join("supervisor.identity"))
                 .expect("Supervisor identity must exist");
-        let sup_pid = sup_ident.pid;
 
-        // Verify both supervisor and init are alive via ProcessIdentity
+        // Verify persisted init identity from container.identity and validate against state annotations
+        let init_persisted =
+            tavik_runtime::ProcessIdentity::load_from(&cont_dir.join("container.identity"))
+                .expect("Persisted container.identity must exist");
+        assert_eq!(
+            init_persisted.pid, init_pid,
+            "Persisted init PID must match running state PID"
+        );
+        let expected_start_time = started
+            .annotations
+            .get("io.tavik.init.start_time")
+            .expect("Running state must contain io.tavik.init.start_time annotation");
+        assert_eq!(
+            init_persisted.start_time.to_string(),
+            *expected_start_time,
+            "Persisted init start_time must match state annotation"
+        );
+
+        // Verify both supervisor and init are alive via ProcessIdentity (fail closed)
         let init_ident = tavik_runtime::ProcessIdentity::from_pid(init_pid)
             .expect("Init identity must be resolvable");
-        assert!(sup_ident.is_alive().unwrap_or(false));
-        assert!(init_ident.is_alive().unwrap_or(false));
+        assert!(
+            sup_ident
+                .is_alive()
+                .expect("Supervisor liveness check must succeed"),
+            "Supervisor must be alive before termination"
+        );
+        assert!(
+            init_ident
+                .is_alive()
+                .expect("Init liveness check must succeed"),
+            "Init process must be alive before termination"
+        );
 
-        // Unexpectedly terminate the supervisor with SIGKILL
-        let kill_ret = unsafe { libc::kill(sup_pid as libc::pid_t, libc::SIGKILL) };
-        assert_eq!(kill_ret, 0, "SIGKILL supervisor must succeed");
+        // Verify cgroup contains init process before deletion
+        let cgroup_mgr = tavik_cgroups::CgroupManager::new().unwrap();
+        let cgroup_dir = cgroup_mgr
+            .container_cgroup_dir(id)
+            .expect("Cgroup dir resolution must succeed");
+        let running_procs = cgroup_mgr
+            .get_processes(id)
+            .expect("Cgroup procs retrieval must succeed while running");
+        assert!(
+            running_procs.contains(&init_pid),
+            "Cgroup must contain init PID {} before deletion: {:?}",
+            init_pid,
+            running_procs
+        );
 
-        // Dynamically poll until supervisor identity is confirmed dead
+        // Terminate the supervisor using identity-safe kill_safe
+        sup_ident
+            .kill_safe()
+            .expect("Identity-safe termination of supervisor must succeed");
+
+        // Dynamically poll until supervisor identity is confirmed dead (fail closed)
         let sup_dead_deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
         let mut sup_is_dead = false;
         while std::time::Instant::now() < sup_dead_deadline {
-            if !sup_ident.is_alive().unwrap_or(false) {
+            if !sup_ident
+                .is_alive()
+                .expect("Supervisor liveness check must succeed")
+            {
                 sup_is_dead = true;
                 break;
             }
@@ -4359,19 +4416,19 @@ fn test_e2e_real_supervisor_unexpected_exit_and_force_delete() {
             del_res.err()
         );
 
-        // Verify init identity is confirmed terminated (using ProcessIdentity::is_alive())
+        // Verify init identity is confirmed terminated (using ProcessIdentity::is_alive() fail closed)
         assert!(
-            !init_ident.is_alive().unwrap_or(false),
+            !init_ident
+                .is_alive()
+                .expect("Init liveness check must succeed"),
             "Init process must be confirmed terminated by ProcessIdentity"
         );
 
-        // Verify cgroup has no remaining processes
-        let cgroup_mgr = tavik_cgroups::CgroupManager::new().unwrap();
-        let remaining_procs = cgroup_mgr.get_processes(id).unwrap_or_default();
+        // Verify cgroup directory is removed after deletion
         assert!(
-            remaining_procs.is_empty(),
-            "Cgroup must contain no remaining processes: {:?}",
-            remaining_procs
+            !cgroup_dir.exists(),
+            "Cgroup directory {:?} must be removed after deletion",
+            cgroup_dir
         );
 
         // Verify container state directory is retired

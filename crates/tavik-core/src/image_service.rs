@@ -551,10 +551,10 @@ fn atomic_rename_noreplace(src: &Path, dst: &Path) -> Result<(), ImageServiceErr
         }
 
         // Fail closed! Never fall back to ordinary fs::rename
-        return Err(ImageServiceError::Unsupported(format!(
+        Err(ImageServiceError::Unsupported(format!(
             "Atomic no-replace rename failed or is unsupported on this filesystem: {}",
             err
-        )));
+        )))
     }
 
     #[cfg(target_os = "macos")]

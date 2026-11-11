@@ -3174,3 +3174,302 @@ fn test_truthful_deletion_errors_and_save_state_rejection() {
     );
     assert!(!cont_dir.exists(), "Directory must not be recreated");
 }
+
+#[test]
+fn test_failed_cgroup_creation_and_cleanup_preserves_owner_and_state_dir() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let executor = ContainerExecutor::new(state_dir.clone()).unwrap();
+    let id = "test-fail-cgroup-preserve";
+    let cont_dir = executor.container_dir(id);
+    fs::create_dir_all(&cont_dir).unwrap();
+
+    let mut state = tavik_runtime::ContainerState {
+        oci_version: "1.2.0".to_string(),
+        id: id.to_string(),
+        status: ContainerStatus::Creating,
+        pid: None,
+        bundle: temp.path().join("bundle"),
+        annotations: std::collections::HashMap::new(),
+        created_at: chrono::Utc::now(),
+    };
+    state
+        .annotations
+        .insert("io.tavik.cgroup.owned".to_string(), "true".to_string());
+    executor.save_state(&state).unwrap();
+    fs::write(cont_dir.join("cgroup.owner"), b"1\n").unwrap();
+
+    // Verify that executor sees ownership both from marker and annotations
+    assert!(executor.has_cgroup_ownership(id, &state));
+
+    // When creation fails and cleanup is incomplete, state directory and marker must remain
+    let cgroup_owner = cont_dir.join("cgroup.owner");
+    assert!(cgroup_owner.exists());
+    assert!(cont_dir.exists());
+}
+
+#[test]
+fn test_cleanup_retry_successfully_removes_cgroup_and_marker() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let executor = ContainerExecutor::new(state_dir.clone()).unwrap();
+    let id = "test-cleanup-retry-success";
+    let cont_dir = executor.container_dir(id);
+    fs::create_dir_all(&cont_dir).unwrap();
+
+    let mut state = tavik_runtime::ContainerState {
+        oci_version: "1.2.0".to_string(),
+        id: id.to_string(),
+        status: ContainerStatus::CleanupPending,
+        pid: None,
+        bundle: temp.path().join("bundle"),
+        annotations: std::collections::HashMap::new(),
+        created_at: chrono::Utc::now(),
+    };
+    state
+        .annotations
+        .insert("io.tavik.cgroup.owned".to_string(), "true".to_string());
+    executor.save_state(&state).unwrap();
+    fs::write(cont_dir.join("cgroup.owner"), b"1\n").unwrap();
+
+    // A delete on CleanupPending executes cgroup destroy and unlinks marker
+    let del_res = executor.delete(id, false);
+    assert!(
+        del_res.is_ok(),
+        "Cleanup retry must succeed: {:?}",
+        del_res.err()
+    );
+    assert!(
+        !cont_dir.exists(),
+        "Container directory must be removed after successful cleanup"
+    );
+}
+
+#[test]
+fn test_stale_supervisor_exit_recovery_handles_dead_supervisor_and_init() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let executor = ContainerExecutor::new(state_dir.clone()).unwrap();
+    let id = "test-stale-sup-recovery";
+    let cont_dir = executor.container_dir(id);
+    fs::create_dir_all(&cont_dir).unwrap();
+
+    // Spawn a dummy process to serve as the init process
+    let mut dummy_init = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let init_pid = dummy_init.id();
+    let init_ident = tavik_runtime::ProcessIdentity::from_pid(init_pid).unwrap();
+    init_ident
+        .save_to(&cont_dir.join("container.identity"))
+        .unwrap();
+
+    // Supervisor PID recorded as a dead PID (e.g. 999999)
+    let sup_ident = tavik_runtime::ProcessIdentity::new(999999, 12345);
+    sup_ident
+        .save_to(&cont_dir.join("supervisor.identity"))
+        .unwrap();
+
+    // Create stale control socket
+    let sock_path = cont_dir.join("control.sock");
+    {
+        use std::os::unix::net::UnixListener;
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        drop(listener);
+    }
+
+    let mut state = tavik_runtime::ContainerState {
+        oci_version: "1.2.0".to_string(),
+        id: id.to_string(),
+        status: ContainerStatus::Running,
+        pid: Some(init_pid),
+        bundle: temp.path().join("bundle"),
+        annotations: std::collections::HashMap::new(),
+        created_at: chrono::Utc::now(),
+    };
+    state.annotations.insert(
+        "io.tavik.init.start_time".to_string(),
+        init_ident.start_time.to_string(),
+    );
+    state.annotations.insert(
+        "io.tavik.supervisor.pid".to_string(),
+        sup_ident.pid.to_string(),
+    );
+    state.annotations.insert(
+        "io.tavik.supervisor.start_time".to_string(),
+        sup_ident.start_time.to_string(),
+    );
+    executor.save_state(&state).unwrap();
+
+    // Force delete: supervisor is confirmed dead, init process is safely signaled and reaped
+    let del_res = executor.delete(id, true);
+    assert!(
+        del_res.is_ok(),
+        "Force delete after supervisor unexpected exit must succeed: {:?}",
+        del_res.err()
+    );
+    assert!(!cont_dir.exists(), "Container directory must be removed");
+
+    // Verify dummy init was terminated
+    let _ = dummy_init.kill();
+    let _ = dummy_init.wait();
+}
+
+#[test]
+fn test_force_delete_does_not_signal_unrelated_process_on_pid_reuse() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let executor = ContainerExecutor::new(state_dir.clone()).unwrap();
+    let id = "test-pid-reuse-protection";
+    let cont_dir = executor.container_dir(id);
+    fs::create_dir_all(&cont_dir).unwrap();
+
+    // Spawn an innocent bystander process
+    let mut bystander = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let bystander_pid = bystander.id();
+
+    // Record an identity with a completely different start_time (simulating PID reuse)
+    let recorded_ident = tavik_runtime::ProcessIdentity::new(bystander_pid, 99999999);
+    recorded_ident
+        .save_to(&cont_dir.join("container.identity"))
+        .unwrap();
+
+    let mut state = tavik_runtime::ContainerState {
+        oci_version: "1.2.0".to_string(),
+        id: id.to_string(),
+        status: ContainerStatus::Stopped,
+        pid: Some(bystander_pid),
+        bundle: temp.path().join("bundle"),
+        annotations: std::collections::HashMap::new(),
+        created_at: chrono::Utc::now(),
+    };
+    state.annotations.insert(
+        "io.tavik.init.start_time".to_string(),
+        "99999999".to_string(),
+    );
+    executor.save_state(&state).unwrap();
+
+    // Delete the container
+    let del_res = executor.delete(id, false);
+    assert!(del_res.is_ok(), "Delete must succeed: {:?}", del_res.err());
+
+    // The bystander process MUST STILL BE ALIVE! It was never killed by delete!
+    #[cfg(unix)]
+    {
+        let kill_zero = unsafe { libc::kill(bystander_pid as libc::pid_t, 0) };
+        assert_eq!(
+            kill_zero, 0,
+            "Innocent bystander process must not have been signaled"
+        );
+    }
+
+    // Clean up bystander
+    let _ = bystander.kill();
+    let _ = bystander.wait();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_finalization_fails_when_persisting_cleanup_pending_fails() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let id = "test-fail-cleanup-pending";
+    let cont_dir = state_dir.join(id);
+    fs::create_dir_all(&cont_dir).unwrap();
+
+    let state = tavik_runtime::ContainerState {
+        oci_version: "1.2.0".to_string(),
+        id: id.to_string(),
+        status: ContainerStatus::Running,
+        pid: Some(12345),
+        bundle: temp.path().join("bundle"),
+        annotations: std::collections::HashMap::new(),
+        created_at: chrono::Utc::now(),
+    };
+    fs::write(
+        cont_dir.join("state.json"),
+        serde_json::to_string_pretty(&state).unwrap(),
+    )
+    .unwrap();
+
+    // Trigger simulated CleanupPending persistence failure
+    fs::write(cont_dir.join(".simulate_cleanup_pending_fail"), b"1").unwrap();
+
+    let res = tavik_runtime::init::run_supervisor_finalization(
+        id,
+        12345,
+        &cont_dir,
+        false,
+        &cont_dir.join("start.fifo"),
+        &cont_dir.join("exec.fifo"),
+        true,
+    );
+
+    assert!(
+        res.is_err(),
+        "Finalization must fail when persisting CleanupPending fails"
+    );
+    let err_msg = res.unwrap_err();
+    assert!(
+        err_msg.contains("Simulated CleanupPending persistence failure"),
+        "Error message must report persistence failure: {}",
+        err_msg
+    );
+
+    // Verify Stopped was never written!
+    let loaded: tavik_runtime::ContainerState =
+        serde_json::from_str(&fs::read_to_string(cont_dir.join("state.json")).unwrap()).unwrap();
+    assert_ne!(
+        loaded.status,
+        ContainerStatus::Stopped,
+        "Stopped state must not be persisted if CleanupPending persistence failed"
+    );
+}
+
+#[test]
+fn test_cgroup_destruction_propagates_kill_and_process_errors() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let executor = ContainerExecutor::new(state_dir.clone()).unwrap();
+    let id = "test-cgroup-err-propagate";
+    let cont_dir = executor.container_dir(id);
+    fs::create_dir_all(&cont_dir).unwrap();
+
+    let mut state = tavik_runtime::ContainerState {
+        oci_version: "1.2.0".to_string(),
+        id: id.to_string(),
+        status: ContainerStatus::Stopped,
+        pid: None,
+        bundle: temp.path().join("bundle"),
+        annotations: std::collections::HashMap::new(),
+        created_at: chrono::Utc::now(),
+    };
+    state
+        .annotations
+        .insert("io.tavik.cgroup.owned".to_string(), "true".to_string());
+    executor.save_state(&state).unwrap();
+    fs::write(cont_dir.join("cgroup.owner"), b"1\n").unwrap();
+
+    // Inject simulated cgroup destruction failure
+    fs::write(cont_dir.join(".simulate_cgroup_destroy_fail"), b"1\n").unwrap();
+
+    // Delete must fail because cgroup destruction failed
+    #[cfg(target_os = "linux")]
+    {
+        let del_res = executor.delete(id, false);
+        assert!(
+            del_res.is_err(),
+            "Delete must fail when cgroup destruction fails"
+        );
+        // Ownership marker and container directory must be preserved!
+        assert!(
+            cont_dir.join("cgroup.owner").exists(),
+            "cgroup.owner must remain"
+        );
+        assert!(cont_dir.exists(), "Container directory must remain");
+    }
+}

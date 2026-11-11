@@ -1,4 +1,5 @@
 use crate::spec::{ContainerState, ContainerStatus, Spec};
+use crate::ProcessIdentity;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tavik_common::error::{Result, TavikError};
@@ -331,11 +332,23 @@ impl ContainerExecutor {
         self.save_state(&initial_state)?;
 
         // Platform-specific container init creation
-        let _final_state = match self.platform_create(id, &spec, &canonical_bundle, initial_state) {
+        let _final_state = match self.platform_create(
+            id,
+            &spec,
+            &canonical_bundle,
+            initial_state.clone(),
+        ) {
             Ok(s) => s,
             Err(e) => {
+                let current_state = self.load_state_raw(id).unwrap_or(initial_state);
                 let cgroup_owner = container_dir.join("cgroup.owner");
-                if cgroup_owner.exists() {
+                let owns_cgroup = cgroup_owner.exists()
+                    || current_state
+                        .annotations
+                        .get("io.tavik.cgroup.owned")
+                        .map(|v| v == "true")
+                        .unwrap_or(false);
+                if owns_cgroup {
                     warn!(
                         "Container '{}' creation failed but cgroup cleanup was incomplete; preserving recovery metadata at {:?}",
                         id, container_dir
@@ -610,6 +623,43 @@ impl ContainerExecutor {
             .is_some()
     }
 
+    pub fn load_init_identity(&self, id: &str, state: &ContainerState) -> Option<ProcessIdentity> {
+        let container_dir = self.container_dir(id);
+        let identity_file = container_dir.join("container.identity");
+        if let Ok(ident) = ProcessIdentity::load_from(&identity_file) {
+            return Some(ident);
+        }
+        if let Some(pid) = state.pid {
+            if let Some(st_str) = state.annotations.get("io.tavik.init.start_time") {
+                if let Ok(start_time) = st_str.parse::<u64>() {
+                    return Some(ProcessIdentity::new(pid, start_time));
+                }
+            }
+        }
+        None
+    }
+
+    pub fn load_supervisor_identity(
+        &self,
+        id: &str,
+        state: &ContainerState,
+    ) -> Option<ProcessIdentity> {
+        let container_dir = self.container_dir(id);
+        let identity_file = container_dir.join("supervisor.identity");
+        if let Ok(ident) = ProcessIdentity::load_from(&identity_file) {
+            return Some(ident);
+        }
+        if let (Some(pid_str), Some(st_str)) = (
+            state.annotations.get("io.tavik.supervisor.pid"),
+            state.annotations.get("io.tavik.supervisor.start_time"),
+        ) {
+            if let (Ok(pid), Ok(start_time)) = (pid_str.parse::<u32>(), st_str.parse::<u64>()) {
+                return Some(ProcessIdentity::new(pid, start_time));
+            }
+        }
+        None
+    }
+
     /// Deletes a stopped container and its state directory (`delete` command).
     pub fn delete(&self, id: &str, force: bool) -> Result<()> {
         let container_dir = self.container_dir(id);
@@ -686,34 +736,92 @@ impl ContainerExecutor {
                             }
                         }
                         Err(TavikError::DaemonUnreachable(_)) => {
-                            // Supervisor has exited (connection refused on control socket).
+                            // 1. Establish that the original supervisor has actually terminated before treating its socket as stale.
+                            // Do not assume that a connection-refused socket alone proves that the supervisor is dead.
+                            if let Some(sup_ident) = self.load_supervisor_identity(id, &state) {
+                                match sup_ident.is_alive() {
+                                    Ok(true) => {
+                                        if !force {
+                                            return Err(TavikError::Execution(format!(
+                                                "Cannot delete container '{}': supervisor (PID {}) is still running but unreachable on control socket",
+                                                id, sup_ident.pid
+                                            )));
+                                        }
+                                        // For force deletion, safely terminate the unresponsive supervisor first
+                                        sup_ident.kill_safe().map_err(|e| {
+                                            TavikError::Execution(format!(
+                                                "Failed to terminate unresponsive supervisor (PID {}) for container '{}': {}",
+                                                sup_ident.pid, id, e
+                                            ))
+                                        })?;
+                                    }
+                                    Ok(false) => {
+                                        // Supervisor confirmed terminated
+                                    }
+                                    Err(e) => {
+                                        return Err(TavikError::Execution(format!(
+                                            "Cannot verify supervisor termination for container '{}': {}",
+                                            id, e
+                                        )));
+                                    }
+                                }
+                            }
+
                             if state.status == ContainerStatus::Created && !force {
                                 return Err(TavikError::Execution(format!(
                                     "Cannot delete created container '{}': supervisor is unreachable at {:?}",
                                     id, control_sock
                                 )));
                             }
+
+                            // 2. Handle the original container init process safely with PID-reuse protection
                             if let Some(pid) = state.pid {
-                                if is_pid_alive(pid) {
-                                    if !force {
-                                        return Err(TavikError::Execution(format!(
-                                            "Cannot delete container '{}': process {} is still running but supervisor is dead",
-                                            id, pid
-                                        )));
+                                let init_ident = self.load_init_identity(id, &state);
+                                match init_ident {
+                                    Some(ident) => {
+                                        match ident.is_alive() {
+                                            Ok(true) => {
+                                                if !force {
+                                                    return Err(TavikError::Execution(format!(
+                                                        "Cannot delete container '{}': process {} is still running but supervisor is dead",
+                                                        id, pid
+                                                    )));
+                                                }
+                                                // Safely terminate verified process
+                                                ident.kill_safe().map_err(|e| {
+                                                    TavikError::Execution(format!(
+                                                        "Failed to safely terminate process {} for container '{}': {}",
+                                                        pid, id, e
+                                                    ))
+                                                })?;
+                                            }
+                                            Ok(false) => {
+                                                // Original process confirmed terminated (or PID reused by unrelated process)
+                                            }
+                                            Err(e) => {
+                                                return Err(TavikError::Execution(format!(
+                                                    "Cannot verify process termination for container '{}': {}",
+                                                    id, e
+                                                )));
+                                            }
+                                        }
                                     }
-                                    unsafe {
-                                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                                        let mut status = 0;
-                                        libc::waitpid(
-                                            pid as libc::pid_t,
-                                            &mut status,
-                                            libc::WNOHANG,
-                                        );
+                                    None => {
+                                        if is_pid_alive(pid) {
+                                            // Process exists but unverifiable identity -> fail closed!
+                                            return Err(TavikError::Execution(format!(
+                                                "Cannot safely terminate process {} for container '{}': process identity cannot be verified against PID reuse",
+                                                pid, id
+                                            )));
+                                        }
                                     }
                                 }
                             }
-                            // Clean up stale socket so it does not block recovery
+
+                            // Clean up stale socket and identity files so they do not block recovery
                             let _ = fs::remove_file(&control_sock);
+                            let _ = fs::remove_file(container_dir.join("supervisor.identity"));
+                            let _ = fs::remove_file(container_dir.join("container.identity"));
                         }
                         Err(e) => {
                             return Err(TavikError::Execution(format!(
@@ -728,7 +836,14 @@ impl ContainerExecutor {
             #[cfg(all(unix, not(target_os = "linux")))]
             {
                 if let Some(pid) = state.pid {
-                    let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                    if let Some(ident) = self.load_init_identity(id, &state) {
+                        ident.kill_safe()?;
+                    } else if is_pid_alive(pid) {
+                        return Err(TavikError::Execution(format!(
+                            "Cannot safely terminate process {} for container '{}': process identity cannot be verified against PID reuse",
+                            pid, id
+                        )));
+                    }
                 }
             }
         }

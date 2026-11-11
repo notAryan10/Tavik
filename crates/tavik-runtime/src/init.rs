@@ -551,6 +551,12 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
         libc::setsid();
     }
 
+    let sup_pid = unsafe { libc::getpid() as u32 };
+    let sup_identity = crate::ProcessIdentity::from_pid(sup_pid);
+    if let Ok(ref ident) = sup_identity {
+        let _ = ident.save_to(&container_dir.join("supervisor.identity"));
+    }
+
     // 6. Initialize cgroups v2 resource limits with fail-closed RAII cleanup guard
     let cgroup_guard = if let Some(linux) = &spec.linux {
         if linux.resources.is_some() {
@@ -627,10 +633,34 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
             }
 
             if let Err(e) = mgr.create_container_cgroup(id) {
-                let msg = format!("Failed to create cgroup for container '{}': {}", id, e);
+                let mut cleanup_err_msg = None;
+                match mgr.destroy_container_cgroup(id) {
+                    Ok(()) => {
+                        if let Err(remove_err) = fs::remove_file(&cgroup_owner_file) {
+                            if remove_err.kind() != std::io::ErrorKind::NotFound {
+                                cleanup_err_msg = Some(format!(
+                                    "failed to remove cgroup.owner marker: {}",
+                                    remove_err
+                                ));
+                            }
+                        }
+                    }
+                    Err(destroy_err) => {
+                        cleanup_err_msg =
+                            Some(format!("failed to clean up cgroup: {}", destroy_err));
+                    }
+                }
+
+                let msg = if let Some(c_err) = cleanup_err_msg {
+                    format!(
+                        "Failed to create cgroup for container '{}': {}; additionally {}",
+                        id, e, c_err
+                    )
+                } else {
+                    format!("Failed to create cgroup for container '{}': {}", id, e)
+                };
+
                 let _ = unsafe { libc::write(trampoline_pipe[1], msg.as_ptr() as _, msg.len()) };
-                let _ = mgr.destroy_container_cgroup(id);
-                let _ = fs::remove_file(&cgroup_owner_file);
                 unsafe {
                     libc::close(control_listener_fd);
                     let _ = fs::remove_file(&control_sock_path);
@@ -767,6 +797,10 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
 
     // Acquire pidfd immediately while supervisor is guaranteed to own the child
     let child_pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child_pid, 0) as i32 };
+    let init_identity = crate::ProcessIdentity::from_pid(child_pid as u32);
+    if let Ok(ref ident) = init_identity {
+        let _ = ident.save_to(&container_dir.join("container.identity"));
+    }
     if child_pidfd < 0 {
         let msg = format!(
             "Failed to acquire pidfd for child PID {}: {}",
@@ -879,6 +913,21 @@ pub fn run_init_trampoline(state_dir: &Path, id: &str) -> Result<()> {
         let mut updated_state = state;
         updated_state.status = ContainerStatus::Created;
         updated_state.pid = Some(child_pid as u32);
+        if let Ok(ref ident) = init_identity {
+            updated_state.annotations.insert(
+                "io.tavik.init.start_time".to_string(),
+                ident.start_time.to_string(),
+            );
+        }
+        if let Ok(ref ident) = sup_identity {
+            updated_state
+                .annotations
+                .insert("io.tavik.supervisor.pid".to_string(), ident.pid.to_string());
+            updated_state.annotations.insert(
+                "io.tavik.supervisor.start_time".to_string(),
+                ident.start_time.to_string(),
+            );
+        }
         if owns_cgroup {
             updated_state
                 .annotations
@@ -1091,22 +1140,40 @@ pub fn run_supervisor_finalization(
 
     // 1. Mark state as CleanupPending under StateLock so incomplete cleanup is observable
     {
-        if let Ok(_lock) = crate::executor::StateLock::acquire(&lock_path) {
-            if state_file.exists() {
-                if let Ok(content) = fs::read_to_string(&state_file) {
-                    if let Ok(mut st) = serde_json::from_str::<ContainerState>(&content) {
-                        if st.status != ContainerStatus::Stopped {
-                            st.status = ContainerStatus::CleanupPending;
-                            let tmp = container_dir.join("state.json.tmp");
-                            if let Ok(json) = serde_json::to_string_pretty(&st) {
-                                if fs::write(&tmp, json).is_ok() {
-                                    let _ = fs::rename(&tmp, &state_file);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        if container_dir
+            .join(".simulate_cleanup_pending_fail")
+            .exists()
+        {
+            return Err("Simulated CleanupPending persistence failure".to_string());
+        }
+
+        let _lock = crate::executor::StateLock::acquire(&lock_path)
+            .map_err(|e| format!("Failed to acquire state lock for CleanupPending: {}", e))?;
+
+        if !state_file.exists() {
+            return Err(format!(
+                "Cannot persist CleanupPending: state file {:?} does not exist",
+                state_file
+            ));
+        }
+
+        let content = fs::read_to_string(&state_file)
+            .map_err(|e| format!("Failed to read state file for CleanupPending: {}", e))?;
+
+        let mut st = serde_json::from_str::<ContainerState>(&content)
+            .map_err(|e| format!("Failed to parse state JSON for CleanupPending: {}", e))?;
+
+        if st.status != ContainerStatus::Stopped {
+            st.status = ContainerStatus::CleanupPending;
+            let tmp = container_dir.join("state.json.tmp");
+            let json = serde_json::to_string_pretty(&st)
+                .map_err(|e| format!("Failed to serialize CleanupPending state: {}", e))?;
+
+            fs::write(&tmp, json)
+                .map_err(|e| format!("Failed to write tmp state file for CleanupPending: {}", e))?;
+
+            fs::rename(&tmp, &state_file)
+                .map_err(|e| format!("Failed to replace state file for CleanupPending: {}", e))?;
         }
     }
 
@@ -1244,6 +1311,8 @@ pub fn finalize_supervisor(
                 libc::close(child_pidfd);
                 libc::close(control_listener_fd);
             }
+            let _ = fs::remove_file(container_dir.join("supervisor.identity"));
+            let _ = fs::remove_file(container_dir.join("container.identity"));
             let _ = fs::remove_file(control_sock_path);
             unsafe { libc::_exit(0) };
         }

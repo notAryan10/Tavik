@@ -407,34 +407,58 @@ impl CgroupManager {
             // 1. Try atomic cgroup.kill (available in Linux 5.14+)
             let kill_file = dir.join("cgroup.kill");
             if kill_file.exists() {
-                let _ = fs::write(&kill_file, "1");
+                fs::write(&kill_file, "1").map_err(|e| {
+                    TavikError::Io(format!(
+                        "Failed to write to cgroup.kill at {:?}: {}",
+                        kill_file, e
+                    ))
+                })?;
             } else {
                 // Fallback: enumerate cgroup.procs and send SIGKILL to each
-                if let Ok(pids) = self.get_processes(container_id) {
-                    for pid in pids {
-                        unsafe {
-                            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                let pids = self.get_processes(container_id)?;
+                for pid in pids {
+                    let res = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                    if res != 0 {
+                        let err = std::io::Error::last_os_error();
+                        if err.raw_os_error() != Some(libc::ESRCH) {
+                            return Err(TavikError::Io(format!(
+                                "Failed to send SIGKILL to process {} in cgroup '{}': {}",
+                                pid, container_id, err
+                            )));
                         }
                     }
                 }
             }
 
             // 2. Poll briefly (up to 500ms) for processes to exit before removing the directory
+            let mut last_procs = Vec::new();
             for _ in 0..10 {
-                let procs = self.get_processes(container_id).unwrap_or_default();
-                if procs.is_empty() {
+                last_procs = self.get_processes(container_id)?;
+                if last_procs.is_empty() {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
 
+            // Explicitly verify that the cgroup has no remaining processes:
+            if !last_procs.is_empty() {
+                return Err(TavikError::Execution(format!(
+                    "Container cgroup '{}' still contains {} active process(es) ({:?}) after termination wait",
+                    container_id,
+                    last_procs.len(),
+                    last_procs
+                )));
+            }
+
             // 3. Remove the container cgroup directory
-            fs::remove_dir(&dir).map_err(|e| {
-                TavikError::Io(format!(
-                    "Failed to remove container cgroup directory at {:?}: {}",
-                    dir, e
-                ))
-            })?;
+            if let Err(e) = fs::remove_dir(&dir) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(TavikError::Io(format!(
+                        "Failed to remove container cgroup directory at {:?}: {}",
+                        dir, e
+                    )));
+                }
+            }
 
             debug!("Destroyed container cgroup at {:?}", dir);
             Ok(())
